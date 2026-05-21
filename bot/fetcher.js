@@ -87,6 +87,30 @@ async function fetchSolanaTrackerToken(ca) {
   } catch (e) { console.error('[fetchSolanaTrackerToken] error:', e.message); return null; }
 }
 
+// ── SolanaTracker holders (full count + concentration) ──────────────────────
+// /tokens/{ca}/holders returns { total, accounts: [{ percentage }] }
+// Gives both full holder count AND top10/top3 concentration — better than Helius alone.
+
+async function fetchSolanaTrackerHolders(ca) {
+  const key = process.env.SOLANATRACKER_API_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(`${ST_BASE}/tokens/${ca}/holders`, {
+      headers: { 'x-api-key': key, 'Accept': 'application/json' },
+      timeout: 8000,
+    });
+    if (!res.ok) { console.log(`[fetchSolanaTrackerHolders] HTTP ${res.status}`); return null; }
+    const data = await res.json();
+    const total = typeof data?.total === 'number' ? data.total : null;
+    if (!total) return null;
+    const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+    const top10Pct = accounts.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0) || null;
+    const top3Pct  = accounts.slice(0, 3).reduce((s, a)  => s + (a.percentage || 0), 0) || null;
+    console.log(`[fetchSolanaTrackerHolders] total=${total} top10=${top10Pct?.toFixed(1)}% top3=${top3Pct?.toFixed(1)}%`);
+    return { holderCount: total, top10Pct, top3Pct, source: 'solanatracker-holders' };
+  } catch (e) { console.error('[fetchSolanaTrackerHolders] error:', e.message); return null; }
+}
+
 async function fetchSolanaTrackerDeployer(wallet) {
   if (!wallet) return null;
   const key = process.env.SOLANATRACKER_API_KEY;
@@ -726,13 +750,18 @@ async function fetchAll(ca) {
   const [holders, bundle, devStats, devPeak, walletAge, stDeployer] = await Promise.all([
     (async () => {
       // Holder source precedence (richest → cheapest):
-      //   Codex (full count + top10)
-      //   Helius getTokenLargestAccounts (accurate top10, only top-20 wallets)
-      //   → augmented with Birdeye token_overview / PumpPortal full count when possible
-      //   Birdeye-only (count, no concentration)
-      //   PumpPortal-only (count, no concentration)
+      //   1. Codex               — full list, best concentration data
+      //   2. SolanaTracker       — full count + top10/top3 from percentage field
+      //   3. Helius              — accurate top10 concentration, only top-20 wallets
+      //      → augmented with Birdeye/PumpPortal full count when possible
+      //   4. Birdeye-only        — count only, no concentration
+      //   5. PumpPortal-only     — count only, no concentration
       let h = await fetchCodexHolders(ca);
       if (h) { console.log(`[fetchAll] holders: Codex — count=${h.holderCount} top10=${h.top10Pct?.toFixed(1)}%`); return h; }
+
+      // SolanaTracker holders: full count + concentration in one call — use if available
+      const stHolders = await fetchSolanaTrackerHolders(ca);
+      if (stHolders) { console.log(`[fetchAll] holders: SolanaTracker — count=${stHolders.holderCount} top10=${stHolders.top10Pct?.toFixed(1)}%`); return stHolders; }
 
       // Helius (top10) + Birdeye/PumpPortal (full count + wash signals) in parallel
       const [helius, beOverview] = await Promise.all([
@@ -756,10 +785,6 @@ async function fetchAll(ca) {
       if (pump?.holderCount) {
         console.log(`[fetchAll] holders: PumpPortal count=${pump.holderCount} (no concentration)`);
         return { holderCount: pump.holderCount, top10Pct: null, top3Pct: null, source: 'pumpportal' };
-      }
-      if (stToken?.holderCount) {
-        console.log(`[fetchAll] holders: SolanaTracker count=${stToken.holderCount} (no concentration)`);
-        return { holderCount: stToken.holderCount, top10Pct: null, top3Pct: null, source: 'solanatracker' };
       }
 
       console.log('[fetchAll] holders: null — UNVERIFIED');

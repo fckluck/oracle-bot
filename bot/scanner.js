@@ -193,8 +193,9 @@ function scan(data) {
     headlineType = 'LIQUIDITY';
   }
   // 6. (Serial Deployer demoted to DEV TRUST warning — no longer a hard NO_GO)
-  // 7. Moderate bundle without DeFade clean
-  else if (bundleCount > 5 && !isDeFadeClean) {
+  // 7. Moderate bundle without DeFade clean — threshold raised to >7 (6-7/slot is borderline
+  //    on a hot token; real bot clusters are 10+/slot; DeFade runs post-scan on BUY only)
+  else if (bundleCount > 7 && !isDeFadeClean) {
     const ctx = deFadeScore !== null ? `DeFade=${deFadeScore}` : 'DeFade unverified';
     noGoReason   = `UNVERIFIED BUNDLE — ${bundleCount}/slot, ${ctx}`;
     headlineType = 'BUNDLE';
