@@ -1,22 +1,19 @@
 {
-  "name": "workspace",
-  "version": "0.0.0",
-  "license": "MIT",
+  "name": "oracle-bot",
+  "version": "8.2.0",
+  "description": "Solana token scanner Telegram bot",
+  "main": "bot/index.js",
   "scripts": {
-    "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
-    "build": "pnpm run typecheck && pnpm -r --if-present run build",
-    "typecheck:libs": "tsc --build",
-    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
     "start": "cd bot && node index.js",
     "bot": "cd bot && node index.js"
   },
-  "private": true,
-  "devDependencies": {
-    "prettier": "^3.8.3",
-    "typescript": "~5.9.3"
-  },
   "dependencies": {
-    "@replit/connectors-sdk": "^0.4.1"
+    "telegraf": "4.16.3",
+    "node-fetch": "2.7.0",
+    "dotenv": "16.4.5"
   },
-  "packageManager": "pnpm@10.26.1"
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "license": "MIT"
 }
