@@ -210,7 +210,7 @@ bot.on('callback_query', async ctx => {
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 
-bot.launch()
+bot.launch({ dropPendingUpdates: true })
   .then(() => {
     console.log('Oracle Bot started');
     tracker.startTracker(bot);
