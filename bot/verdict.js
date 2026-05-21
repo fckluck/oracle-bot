@@ -39,11 +39,10 @@ function fmtMult(n) {
 
 function tierName(t) {
   switch (t) {
-    case 'SCRIBBLI':        return 'SCRIBBLI (50x+)';
-    case 'PLUTO':           return 'PLUTO CANDIDATE (12x+, DeFade clean)';
-    case 'HIGH_CONVICTION': return 'HIGH CONVICTION (8x+)';
-    case 'BASELINE_ENTRY':  return 'BUY CANDIDATE (5x+)';
-    case 'RISKY_RUNNER':    return 'RISKY RUNNER (vol override)';
+    case 'SCRIBBLI':        return 'SCRIBBLI (50x+ Adjusted)';
+    case 'PLUTO':           return 'PLUTO CANDIDATE (12x+ Adjusted)';
+    case 'HIGH_CONVICTION': return 'HIGH CONVICTION (8x+ Adjusted)';
+    case 'BASELINE_ENTRY':  return 'BUY CANDIDATE (5x+ Adjusted)';
     default:                return '—';
   }
 }
@@ -53,7 +52,6 @@ function tierPositionLabel(entryTier, _positionUnits, slippageWarn) {
     case 'PLUTO':           return '2.0 units';
     case 'HIGH_CONVICTION': return '1.5 units';
     case 'BASELINE_ENTRY':  return '1.0 unit';
-    case 'RISKY_RUNNER':    return '0.5 unit 🟡 half-size';
     default:                return '—';
   }
 }
@@ -68,7 +66,7 @@ function getTpTargets(entryTier, timeWindow) {
            tp2: config.TP2_MC, tp3: config.TP3_MC, slPct: isDead ? 25 : 50 };
 }
 
-// ── Conviction section helpers ────────────────────────────────────────────────
+// ── Section helpers ───────────────────────────────────────────────────────────
 
 function momentumDisplay(momentumStatus, birdeye) {
   const range5m = birdeye?.priceChange5m != null ? ` | 5m: ${fmtChange(birdeye.priceChange5m)}` : '';
@@ -84,10 +82,17 @@ function momentumDisplay(momentumStatus, birdeye) {
 function bundleDisplay(bundle) {
   if (!bundle) return 'N/A';
   if (bundle.sybilDetected) {
-    return `⛔ SYBIL DETECTED (${bundle.uniqueSigners} buyers, ${bundle.fundingSources} parent)`;
+    return `⛔ SYBIL (${bundle.uniqueSigners} buyers, ${bundle.fundingSources} parent)`;
   }
   if (bundle.bundleDetected) return `⛔ BUNDLE (${bundle.maxInSlot}/slot)`;
   return `✅ CLEAN (max ${bundle.maxInSlot}/slot)`;
+}
+
+function parentFundingDisplay(bundle) {
+  if (!bundle) return 'N/A';
+  if (bundle.sybilDetected) return `⛔ SYBIL (${bundle.fundingSources} source → ${bundle.uniqueSigners} wallets)`;
+  if (bundle.tracesResolved >= 3) return `✅ CLEAN (${bundle.tracesResolved} wallets traced, ${bundle.fundingSources} source(s))`;
+  return `⚪ UNRESOLVED (${bundle.tracesResolved ?? 0} traces)`;
 }
 
 function ctoStatusDisplay(ctoBehavior, walletAge) {
@@ -102,21 +107,30 @@ function ctoStatusDisplay(ctoBehavior, walletAge) {
   }
 }
 
-// ── Main formatter (v6.0 — 3-pillar Scorecard) ───────────────────────────────
+function washQualityDisplay(washPct, washVolumeUsd, vol1h) {
+  if (washPct == null) return { qualityLine: '⚪ UNVERIFIED (Birdeye unavailable)', icon: '⚪' };
+  const icon = washPct < 15 ? '✅' : washPct < 35 ? '🟡' : '🔴';
+  const label = washPct < 15 ? 'ORGANIC' : washPct < 35 ? 'MIXED' : 'WASH-HEAVY';
+  const washAmt = washVolumeUsd != null ? ` | ${fmtUsd(washVolumeUsd)} fake` : '';
+  return { qualityLine: `${icon} ${label}${washAmt}`, icon };
+}
+
+// ── Main formatter (v8.4 Anti-Wash Predator) ──────────────────────────────────
 
 function formatVerdict(result, ca) {
   const {
-    verdict, entryTier, noGoReason, watchReason, timeWindow,
+    verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
-    holderVerdictLabel, pressureLabel, momentumStatus, ctoBehavior,
+    pressureLabel, momentumStatus, ctoBehavior,
     devProfile, signals,
   } = result;
 
-  const mc     = signals.marketCap;
-  const volLiq = signals.volLiq;
+  const mc            = signals.marketCap;
+  const adjustedVolLiq= signals.adjustedVolLiq;
+  const rawVolLiq     = signals.rawVolLiq;
   const L = [];
 
-  // ── Time-window informational banner (v6.2 — no longer gates output) ──────
+  // ── Time-window banner ─────────────────────────────────────────────────────
 
   if (timeWindow === 'RESEARCH') {
     L.push(`🌙 ${b('RESEARCH MODE (7PM–2AM ET)')}`);
@@ -124,44 +138,55 @@ function formatVerdict(result, ca) {
     L.push('─────────────────────────────');
   } else if (timeWindow === 'DEAD_ZONE') {
     L.push(`☀️ ${b('DEAD ZONE (12PM–7PM ET)')}`);
-    L.push(`ℹ️ Low-conviction window — stricter thresholds (Min 8x, TP1 $50K).`);
+    L.push(`ℹ️ Low-conviction window — TP1 $50K | SL 25% | Min 8x Adjusted`);
     L.push('─────────────────────────────');
   }
 
-  // ── Header ────────────────────────────────────────────────────────────────
+  // ── Header — kill-shot hierarchy ──────────────────────────────────────────
 
   if (verdict === 'NO_GO') {
     L.push(`🚫 ${b('ORACLE VERDICT: NO-GO')}`);
     L.push(`${esc(noGoReason)}`);
   } else if (verdict === 'AVOID') {
     L.push(`⛔ ${b('ORACLE VERDICT: AVOID')}`);
-    L.push(`Volumetric Distribution — high vol with falling price`);
+    L.push(`Momentum Fail — high vol, falling price (Distribution)`);
+  } else if (verdict === 'WATCH_WASH') {
+    L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Wash Heavy')}`);
+    L.push(`${esc(watchReason)}`);
   } else if (verdict === 'BUY') {
     L.push(`🚀 ${b(`ORACLE VERDICT: ${tierName(entryTier)}`)}`);
     L.push(`${b('BUY CANDIDATE')} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})`);
-  } else if (verdict === 'WATCH_MOMENTUM') {
-    L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Momentum Stalled')}`);
-    L.push(`${esc(watchReason)}`);
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
-    L.push(`${esc(watchReason)}`);
-  } else if (verdict === 'WATCH_HOLDERS') {
-    L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Thin Distribution')}`);
     L.push(`${esc(watchReason)}`);
   } else {
     const minT = timeWindow === 'DEAD_ZONE' ? 8.0 : 5.0;
     L.push(`⬇️ ${b('ORACLE VERDICT: SKIP')}`);
-    L.push(`Vol/Liq ${volLiq.toFixed(2)}x below ${minT}x minimum`);
+    L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below ${minT}x minimum`);
   }
-  L.push(`Mode: ${b(timeWindow)}${timeWindow === 'DEAD_ZONE' ? ' ' + i('(TP1 $50K | SL 25% | Min 8x)') : ''}`);
+  L.push(`Mode: ${b(timeWindow)}${timeWindow === 'DEAD_ZONE' ? ' ' + i('(TP1 $50K | SL 25% | Min 8x Adjusted)') : ''}`);
   L.push('');
 
-  // ── CONVICTION ────────────────────────────────────────────────────────────
+  // ── VOLUME QUALITY ─────────────────────────────────────────────────────────
+
+  const { qualityLine } = washQualityDisplay(signals.washPct, signals.washVolumeUsd, signals.volume1h);
+  L.push(b('── VOLUME QUALITY ──'));
+  L.push(`• ${b('Raw Vol/Liq:')} ${fmt(rawVolLiq, 2)}x`);
+  if (signals.washPct != null) {
+    L.push(`• ${b('Fake Volume:')} ${fmtPct(signals.washPct, 0)}${signals.washVolumeUsd != null ? ' | ' + fmtUsd(signals.washVolumeUsd) : ''}`);
+  } else {
+    L.push(`• ${b('Fake Volume:')} ⚪ UNVERIFIED`);
+  }
+  L.push(`• ${b('Adjusted Vol/Liq:')} ${fmt(adjustedVolLiq, 2)}x`);
+  L.push(`• ${b('Quality:')} ${qualityLine}`);
+  L.push('');
+
+  // ── CONVICTION ─────────────────────────────────────────────────────────────
 
   L.push(b('── CONVICTION ──'));
   L.push(`• ${b('Momentum:')} ${esc(momentumDisplay(momentumStatus, signals.birdeye))}`);
-  L.push(`• ${b('Vol/Liq:')} ${fmt(volLiq)}x`);
   L.push(`• ${b('Bundle:')} ${esc(bundleDisplay(signals.bundle))}`);
+  L.push(`• ${b('Parent Funding:')} ${esc(parentFundingDisplay(signals.bundle))}`);
   L.push('');
 
   // ── DEV TRUST ─────────────────────────────────────────────────────────────
@@ -169,7 +194,6 @@ function formatVerdict(result, ca) {
   const dp = devProfile;
   const walletShort = dp.wallet
     ? code(`${dp.wallet.slice(0,6)}...${dp.wallet.slice(-4)}`) : 'N/A';
-  const ageStr = dp.walletAge?.ageDisplay || 'unknown age';
   const topPerf = dp.topPerformerMultiplier != null
     ? fmtMult(dp.topPerformerMultiplier)
     : (dp.peakAssets != null && dp.peakAssets > 0
@@ -180,31 +204,26 @@ function formatVerdict(result, ca) {
     : 'N/A';
 
   L.push(b('── DEV TRUST ──'));
-  L.push(`• ${b('Wallet:')} ${walletShort} ${esc('(' + ageStr + ')')}`);
-  L.push(`• ${b('Top Performer:')} ${esc(topPerf)}`);
   L.push(`• ${b('Success Rate:')} ${esc(successRate)}`);
+  L.push(`• ${b('Peak Performance:')} ${esc(topPerf)}`);
   L.push(`• ${b('Status:')} ${esc(ctoStatusDisplay(ctoBehavior, dp.walletAge))}`);
   L.push('');
 
   // ── SAFETY ────────────────────────────────────────────────────────────────
 
-  // v8.1: Dynamic Holder Health — always render when we have any holder signal.
-  // Prefer the full count; fall back to topAccountCount (Helius top-20 floor) so
-  // the Health line still surfaces, just marked as a lower bound.
   let holderDisplay;
   const effectiveCount = signals.holderCount ?? signals.topAccountCount ?? null;
   const isFloor = signals.holderCount == null && signals.topAccountCount != null;
 
   if (effectiveCount !== null && mc > 0) {
-    const target   = Math.round((mc / 100000) * 400);
+    const target    = Math.round((mc / 100000) * 400);
     const healthPct = Math.round((effectiveCount / target) * 100);
     let label, icon;
     if (isFloor) {
-      // We only know a floor, so we can only positively confirm INFLATED / PASS-floor.
       if (healthPct >= 200)      { label = 'INFLATED/BOTTED'; icon = '🔴'; }
       else if (healthPct >= 50)  { label = 'PASS (floor)';    icon = '✅'; }
       else                       { label = 'UNVERIFIED';      icon = '⚪'; }
-      holderDisplay = `≥${effectiveCount} | Health: ≥${healthPct}% ${icon} ${esc(label)} (target ~${target}, full count N/A)`;
+      holderDisplay = `≥${effectiveCount} | Health: ≥${healthPct}% ${icon} ${esc(label)} (target ~${target})`;
     } else {
       if (healthPct < 50)        { label = 'LOW ORGANIC';     icon = '🟡'; }
       else if (healthPct > 200)  { label = 'INFLATED/BOTTED'; icon = '🔴'; }
@@ -216,9 +235,15 @@ function formatVerdict(result, ca) {
   } else {
     holderDisplay = 'UNVERIFIED';
   }
-  const top10Display  = signals.top10Pct !== null
-    ? `${fmtPct(signals.top10Pct)} (${esc(pressureLabel)})`
-    : `UNVERIFIED (${esc(pressureLabel)})`;
+
+  const top10Display = signals.top10Pct !== null
+    ? `${fmtPct(signals.top10Pct)} (${esc(
+        signals.top10Pct > 35 ? 'HARD FAIL' :
+        signals.top10Pct > 25 ? 'ELEVATED'  :
+        signals.top10Pct > 15 ? 'MODERATE'  : 'NEUTRAL'
+      )})`
+    : `UNVERIFIED`;
+
   let curveDisplay;
   if (signals.curvePct !== null) {
     curveDisplay = `${fmtPct(signals.curvePct)}${signals.curvePct >= 90 ? ' ⚠️ MIGRATION GAP' : ''}`;
@@ -228,39 +253,26 @@ function formatVerdict(result, ca) {
     curveDisplay = 'N/A';
   }
 
-  // Bundle context — DeFade moved to its own VERIFICATION block below
-  let bundleCtx;
-  if (signals.isMeteora) {
-    bundleCtx = `${signals.bundleCount ?? 0}/slot · 🌊 Meteora pool (auto-clean)`;
-  } else {
-    bundleCtx = `${signals.bundleCount ?? 0}/slot`;
-  }
-
   L.push(b('── SAFETY ──'));
   L.push(`• ${b('Holders:')} ${holderDisplay}`);
   L.push(`• ${b('Top 10:')} ${top10Display}`);
-  L.push(`• ${b('Bundle ctx:')} ${esc(bundleCtx)}`);
   L.push(`• ${b('Curve:')} ${curveDisplay}`);
   L.push('');
 
-  // ── VERIFICATION (DeFade, verification-only) ──────────────────────────────
-  // Only renders when DeFade was consulted (BUY candidates). Action ∈
-  // PASS | FLAG | HARD_SKIP | UNAVAILABLE. HARD_SKIP downgrades verdict to
-  // NO_GO upstream — so by the time we render here, verdict already reflects it.
+  // ── VERIFICATION (DeFade, BUY candidates only) ────────────────────────────
   const dv = result.deFadeVerification;
   if (dv) {
-    const tag = dv.action === 'PASS'        ? '✅ PASS'
-              : dv.action === 'FLAG'        ? '🟡 FLAG'
-              : dv.action === 'HARD_SKIP'   ? '🛑 HARD SKIP'
-              :                               '⚪ UNAVAILABLE';
+    const tag = dv.action === 'PASS'      ? '✅ PASS'
+              : dv.action === 'FLAG'      ? '🟡 FLAG'
+              : dv.action === 'HARD_SKIP' ? '🛑 HARD SKIP'
+              :                             '⚪ UNAVAILABLE';
     L.push(b('── VERIFICATION ──'));
     L.push(`• ${b('DeFade:')} ${tag}`);
     L.push(`• ${b('Reason:')} ${esc(dv.reason || 'n/a')}`);
-    L.push(`• ${b('Source:')} DeFade verification only`);
     L.push('');
   }
 
-  // ── LIVE METRICS (compact footer) ─────────────────────────────────────────
+  // ── LIVE METRICS ──────────────────────────────────────────────────────────
 
   L.push(b('── LIVE METRICS ──'));
   L.push(`• ${b('MC:')} ${fmtUsd(mc)} | ${b('LP:')} ${fmtUsd(signals.lp)} | ${b('Vol 1h:')} ${fmtUsd(signals.volume1h)}`);

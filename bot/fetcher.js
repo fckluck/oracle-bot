@@ -140,11 +140,20 @@ async function fetchBirdeyeOverview(ca) {
                         dd.numberHolders ?? dd.number_holders ?? dd.holderAmount ?? dd.holder_amount ??
                         dd.uniqueHolders ?? dd.unique_holders ?? null;
     if (holderCount == null || isNaN(Number(holderCount))) {
-      console.log(`[fetchBirdeyeOverview] no holder field — available keys: ${Object.keys(dd).join(', ')}`);
-      return null;
+      console.log(`[fetchBirdeyeOverview] no holder field — available keys: ${Object.keys(dd).filter(k => k.toLowerCase().includes('holder')).join(', ') || '(none)'}`);
     }
-    console.log(`[fetchBirdeyeOverview] holders=${holderCount}`);
-    return { holderCount: Number(holderCount) };
+    // Wash-volume signals: unique wallets + trade count in 1h
+    const uniqueWallet1h = dd.uniqueWallet1h ?? null;
+    const trade1h        = dd.trade1h        ?? null;
+    const v1hUSD         = dd.v1hUSD         ?? null;
+    console.log(`[fetchBirdeyeOverview] holders=${holderCount ?? 'null'} uniqueWallet1h=${uniqueWallet1h} trade1h=${trade1h} v1hUSD=${v1hUSD}`);
+    if (holderCount == null && uniqueWallet1h == null) return null;
+    return {
+      holderCount:    holderCount != null ? Number(holderCount) : null,
+      uniqueWallet1h: uniqueWallet1h != null ? Number(uniqueWallet1h) : null,
+      trade1h:        trade1h != null ? Number(trade1h) : null,
+      v1hUSD:         v1hUSD != null ? Number(v1hUSD) : null,
+    };
   } catch (e) { console.error('[fetchBirdeyeOverview] error:', e.message); return null; }
 }
 
@@ -700,6 +709,7 @@ async function fetchAll(ca) {
 
   // NOTE: DeFade is no longer in this parallel block — it's called post-scan
   // as a verification step only on BUY candidates (see verifyWithDeFade).
+  let beOverviewResult = null; // hoisted so fetchAll can include wash signals in return
   const [holders, bundle, devStats, devPeak, walletAge, stDeployer] = await Promise.all([
     (async () => {
       // Holder source precedence (richest → cheapest):
@@ -711,16 +721,17 @@ async function fetchAll(ca) {
       let h = await fetchCodexHolders(ca);
       if (h) { console.log(`[fetchAll] holders: Codex — count=${h.holderCount} top10=${h.top10Pct?.toFixed(1)}%`); return h; }
 
-      // Helius (top10) + Birdeye/PumpPortal (full count) in parallel
+      // Helius (top10) + Birdeye/PumpPortal (full count + wash signals) in parallel
       const [helius, beOverview] = await Promise.all([
         fetchHeliusHolders(ca),
         fetchBirdeyeOverview(ca),
       ]);
+      beOverviewResult = beOverview; // hoist for wash signals
 
       if (helius) {
         // Prefer Birdeye full count over PumpPortal; both override Helius's top-20 floor
         helius.holderCount = beOverview?.holderCount ?? pump?.holderCount ?? helius.holderCount;
-        const src = beOverview ? 'Helius+Birdeye' : pump?.holderCount ? 'Helius+PumpPortal' : 'Helius (floor)';
+        const src = beOverview?.holderCount ? 'Helius+Birdeye' : pump?.holderCount ? 'Helius+PumpPortal' : 'Helius (floor)';
         console.log(`[fetchAll] holders: ${src} — count=${helius.holderCount || `${helius.topAccountCount}+`} top10=${helius.top10Pct.toFixed(1)}%`);
         return helius;
       }
@@ -744,9 +755,24 @@ async function fetchAll(ca) {
     fetchSolanaTrackerDeployer(devWallet),
   ]);
 
+  // Wash signals derived from Birdeye overview (uniqueWallet1h vs trade1h)
+  // organicTrades = uniqueWallet1h * 3 (assume 3 organic txns per wallet per hour)
+  // washPct = max(0, 1 - organicTrades / totalTrades) * 100
+  const beTrade1h       = beOverviewResult?.trade1h        ?? null;
+  const beUnique1h      = beOverviewResult?.uniqueWallet1h ?? null;
+  const beV1hUSD        = beOverviewResult?.v1hUSD         ?? null;
+  let washPct = null, washVolumeUsd = null;
+  if (beTrade1h > 0 && beUnique1h != null) {
+    const organicTrades = beUnique1h * 3;
+    washPct = Math.max(0, Math.min(95, (1 - organicTrades / beTrade1h) * 100));
+    const ref = beV1hUSD ?? codex?.volume1h ?? 0;
+    washVolumeUsd = ref * washPct / 100;
+    console.log(`[fetchAll] wash: trade1h=${beTrade1h} unique1h=${beUnique1h} washPct=${washPct.toFixed(1)}% washVol=$${washVolumeUsd.toFixed(0)}`);
+  }
+
   // deFadeScore stays null pre-scan; verifyWithDeFade is called post-scan
   // only on BUY candidates (respects 100 req/day free-plan quota).
-  return { codex, pump, holders, bundle, devStats, devPeak, walletAge, devWallet, birdeye, deFadeScore: null, stToken, stDeployer };
+  return { codex, pump, holders, bundle, devStats, devPeak, walletAge, devWallet, birdeye, deFadeScore: null, stToken, stDeployer, washPct, washVolumeUsd };
 }
 
 module.exports = { fetchAll, fetchDeFadeVerification };
