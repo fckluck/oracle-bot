@@ -134,8 +134,15 @@ async function fetchBirdeyeOverview(ca) {
     const res = await fetch(`${BIRDEYE_BASE}/defi/token_overview?address=${ca}`, { headers, timeout: 8000 });
     if (!res.ok) { console.log(`[fetchBirdeyeOverview] HTTP ${res.status}`); return null; }
     const data = await res.json();
-    const holderCount = data?.data?.holder ?? data?.data?.holders ?? null;
-    if (!holderCount || isNaN(holderCount)) { console.log('[fetchBirdeyeOverview] no holder field'); return null; }
+    const dd = data?.data ?? {};
+    // Birdeye returns holder counts under inconsistent field names — check them all.
+    const holderCount = dd.holder ?? dd.holders ?? dd.holder_count ?? dd.holderCount ??
+                        dd.numberHolders ?? dd.number_holders ?? dd.holderAmount ?? dd.holder_amount ??
+                        dd.uniqueHolders ?? dd.unique_holders ?? null;
+    if (holderCount == null || isNaN(Number(holderCount))) {
+      console.log(`[fetchBirdeyeOverview] no holder field — available keys: ${Object.keys(dd).join(', ')}`);
+      return null;
+    }
     console.log(`[fetchBirdeyeOverview] holders=${holderCount}`);
     return { holderCount: Number(holderCount) };
   } catch (e) { console.error('[fetchBirdeyeOverview] error:', e.message); return null; }
