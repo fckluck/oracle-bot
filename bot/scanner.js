@@ -124,8 +124,12 @@ function scan(data) {
   const pressureLabel  = pressureFlag(codex?.buyCount, codex?.sellCount);
 
   // ── v8.4 Wash / Adjusted Vol computation ──────────────────────────────────
-  const rawWashPct     = data.washPct     ?? null;
+  const rawWashPct     = data.washPct      ?? null;
   const washVolumeUsd  = data.washVolumeUsd ?? null;
+  const washSource     = data.washSource   ?? null;
+  const snipersPct     = data.snipersPct   ?? null;
+  const insidersPct    = data.insidersPct  ?? null;
+  const stRiskScore    = data.stRiskScore  ?? null;
   const washPct        = rawWashPct != null ? Math.round(rawWashPct * 10) / 10 : null;
   const organicVol     = (washPct != null && vol1h > 0)
     ? vol1h * (1 - washPct / 100) : vol1h;
@@ -255,8 +259,9 @@ function scan(data) {
     signals: {
       lp, ageMinutes: ageMins,
       volume1h:       codex?.volume1h     ?? null,
-      rawVolLiq, adjustedVolLiq, washPct, washVolumeUsd,
+      rawVolLiq, adjustedVolLiq, washPct, washVolumeUsd, washSource,
       washQuality:    washQualityLabel(washPct),
+      snipersPct, insidersPct, stRiskScore,
       marketCap: mc,
       priceUsd:       codex?.priceUsd     ?? null,
       buyCount:       codex?.buyCount     ?? null,

@@ -142,17 +142,27 @@ async function fetchBirdeyeOverview(ca) {
     if (holderCount == null || isNaN(Number(holderCount))) {
       console.log(`[fetchBirdeyeOverview] no holder field — available keys: ${Object.keys(dd).filter(k => k.toLowerCase().includes('holder')).join(', ') || '(none)'}`);
     }
-    // Wash-volume signals: unique wallets + trade count in 1h
-    const uniqueWallet1h = dd.uniqueWallet1h ?? null;
-    const trade1h        = dd.trade1h        ?? null;
-    const v1hUSD         = dd.v1hUSD         ?? null;
-    console.log(`[fetchBirdeyeOverview] holders=${holderCount ?? 'null'} uniqueWallet1h=${uniqueWallet1h} trade1h=${trade1h} v1hUSD=${v1hUSD}`);
-    if (holderCount == null && uniqueWallet1h == null) return null;
+    // Wash-volume signals across multiple time windows (fallback for fresh tokens)
+    // Windows ordered longest→shortest; we pick the best populated one in fetchAll.
+    const n = (v) => (v != null && Number(v) > 0 ? Number(v) : null);
+    const windows = {
+      w1h:  { trade: n(dd.trade1h),   unique: n(dd.uniqueWallet1h),  vUsd: n(dd.v1hUSD),   scale: 1   },
+      w30m: { trade: n(dd.trade30m),  unique: n(dd.uniqueWallet30m), vUsd: n(dd.v30mUSD),  scale: 2   },
+      w5m:  { trade: n(dd.trade5m),   unique: n(dd.uniqueWallet5m),  vUsd: n(dd.v5mUSD),   scale: 12  },
+      w1m:  { trade: n(dd.trade1m),   unique: n(dd.uniqueWallet1m),  vUsd: n(dd.v1mUSD),   scale: 60  },
+    };
+    const bestWindow = Object.entries(windows).find(([, w]) => w.trade && w.unique) ?? null;
+    const bw = bestWindow ? bestWindow[1] : null;
+    const bwLabel = bestWindow ? bestWindow[0] : null;
+    console.log(`[fetchBirdeyeOverview] holders=${holderCount ?? 'null'} bestWindow=${bwLabel ?? 'none'} trade=${bw?.trade ?? 0} unique=${bw?.unique ?? 0}`);
+    if (holderCount == null && !bw) return null;
     return {
-      holderCount:    holderCount != null ? Number(holderCount) : null,
-      uniqueWallet1h: uniqueWallet1h != null ? Number(uniqueWallet1h) : null,
-      trade1h:        trade1h != null ? Number(trade1h) : null,
-      v1hUSD:         v1hUSD != null ? Number(v1hUSD) : null,
+      holderCount: holderCount != null ? Number(holderCount) : null,
+      washWindow:  bwLabel,
+      washTrade:   bw?.trade  ?? null,
+      washUnique:  bw?.unique ?? null,
+      washVUsd:    bw?.vUsd   ?? null,
+      washScale:   bw?.scale  ?? null,
     };
   } catch (e) { console.error('[fetchBirdeyeOverview] error:', e.message); return null; }
 }
@@ -755,24 +765,46 @@ async function fetchAll(ca) {
     fetchSolanaTrackerDeployer(devWallet),
   ]);
 
-  // Wash signals derived from Birdeye overview (uniqueWallet1h vs trade1h)
-  // organicTrades = uniqueWallet1h * 3 (assume 3 organic txns per wallet per hour)
-  // washPct = max(0, 1 - organicTrades / totalTrades) * 100
-  const beTrade1h       = beOverviewResult?.trade1h        ?? null;
-  const beUnique1h      = beOverviewResult?.uniqueWallet1h ?? null;
-  const beV1hUSD        = beOverviewResult?.v1hUSD         ?? null;
-  let washPct = null, washVolumeUsd = null;
-  if (beTrade1h > 0 && beUnique1h != null) {
-    const organicTrades = beUnique1h * 3;
-    washPct = Math.max(0, Math.min(95, (1 - organicTrades / beTrade1h) * 100));
-    const ref = beV1hUSD ?? codex?.volume1h ?? 0;
+  // ── Wash signals ──────────────────────────────────────────────────────────
+  // Primary: Birdeye multi-window (best populated window, scaled to 1h equivalent)
+  // organicTrades = uniqueWallets * 3 (≈3 organic txns/wallet/hour)
+  // washPct = max(0, 1 - organicTrades/totalTrades) * 100
+  // Secondary fallback: SolanaTracker snipers + insiders % (already fetched)
+  let washPct = null, washVolumeUsd = null, washSource = null;
+
+  const bw = beOverviewResult;
+  if (bw?.washTrade && bw?.washUnique) {
+    const scale = bw.washScale ?? 1;
+    const scaledTrades  = bw.washTrade  * scale;  // extrapolate to 1h
+    const scaledUnique  = bw.washUnique * scale;
+    const organicTrades = scaledUnique  * 3;
+    washPct = Math.max(0, Math.min(95, (1 - organicTrades / scaledTrades) * 100));
+    const ref = (bw.washVUsd != null ? bw.washVUsd * scale : null) ?? codex?.volume1h ?? 0;
     washVolumeUsd = ref * washPct / 100;
-    console.log(`[fetchAll] wash: trade1h=${beTrade1h} unique1h=${beUnique1h} washPct=${washPct.toFixed(1)}% washVol=$${washVolumeUsd.toFixed(0)}`);
+    washSource = `birdeye-${bw.washWindow}`;
+    console.log(`[fetchAll] wash(${bw.washWindow}): trade=${bw.washTrade}(×${scale}) unique=${bw.washUnique} washPct=${washPct.toFixed(1)}% washVol=$${washVolumeUsd.toFixed(0)}`);
+  } else {
+    // Fallback: SolanaTracker sniper + insider % → conservative wash estimate
+    const sniperPct  = stToken?.snipersPct  ?? null;
+    const insiderPct = stToken?.insidersPct ?? null;
+    if (sniperPct != null || insiderPct != null) {
+      washPct       = Math.min(95, (sniperPct ?? 0) + (insiderPct ?? 0));
+      washVolumeUsd = (codex?.volume1h ?? 0) * washPct / 100;
+      washSource    = 'solanatracker-risk';
+      console.log(`[fetchAll] wash(ST risk): sniper=${sniperPct}% insider=${insiderPct}% washPct=${washPct.toFixed(1)}%`);
+    } else {
+      console.log('[fetchAll] wash: no signal available');
+    }
   }
+
+  // Surface sniper/insider signals for display even when we have Birdeye wash
+  const snipersPct  = stToken?.snipersPct  ?? null;
+  const insidersPct = stToken?.insidersPct ?? null;
+  const stRiskScore = stToken?.riskScore   ?? null;
 
   // deFadeScore stays null pre-scan; verifyWithDeFade is called post-scan
   // only on BUY candidates (respects 100 req/day free-plan quota).
-  return { codex, pump, holders, bundle, devStats, devPeak, walletAge, devWallet, birdeye, deFadeScore: null, stToken, stDeployer, washPct, washVolumeUsd };
+  return { codex, pump, holders, bundle, devStats, devPeak, walletAge, devWallet, birdeye, deFadeScore: null, stToken, stDeployer, washPct, washVolumeUsd, washSource, snipersPct, insidersPct, stRiskScore };
 }
 
 module.exports = { fetchAll, fetchDeFadeVerification };

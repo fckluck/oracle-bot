@@ -107,12 +107,11 @@ function ctoStatusDisplay(ctoBehavior, walletAge) {
   }
 }
 
-function washQualityDisplay(washPct, washVolumeUsd, vol1h) {
-  if (washPct == null) return { qualityLine: '⚪ UNVERIFIED (Birdeye unavailable)', icon: '⚪' };
-  const icon = washPct < 15 ? '✅' : washPct < 35 ? '🟡' : '🔴';
+function washQualityDisplay(washPct) {
+  if (washPct == null) return { qualityLine: '⚪ UNVERIFIED', icon: '⚪' };
+  const icon  = washPct < 15 ? '✅' : washPct < 35 ? '🟡' : '🔴';
   const label = washPct < 15 ? 'ORGANIC' : washPct < 35 ? 'MIXED' : 'WASH-HEAVY';
-  const washAmt = washVolumeUsd != null ? ` | ${fmtUsd(washVolumeUsd)} fake` : '';
-  return { qualityLine: `${icon} ${label}${washAmt}`, icon };
+  return { qualityLine: `${icon} ${label}`, icon };
 }
 
 // ── Main formatter (v8.4 Anti-Wash Predator) ──────────────────────────────────
@@ -169,16 +168,29 @@ function formatVerdict(result, ca) {
 
   // ── VOLUME QUALITY ─────────────────────────────────────────────────────────
 
-  const { qualityLine } = washQualityDisplay(signals.washPct, signals.washVolumeUsd, signals.volume1h);
+  const { qualityLine } = washQualityDisplay(signals.washPct);
+  const washSrcLabel = signals.washSource
+    ? (signals.washSource.startsWith('birdeye') ? `Birdeye ${signals.washSource.replace('birdeye-', '')} window` : 'SolanaTracker risk')
+    : null;
   L.push(b('── VOLUME QUALITY ──'));
   L.push(`• ${b('Raw Vol/Liq:')} ${fmt(rawVolLiq, 2)}x`);
   if (signals.washPct != null) {
-    L.push(`• ${b('Fake Volume:')} ${fmtPct(signals.washPct, 0)}${signals.washVolumeUsd != null ? ' | ' + fmtUsd(signals.washVolumeUsd) : ''}`);
+    const srcNote = washSrcLabel ? ` ${i('(' + washSrcLabel + ')')}` : '';
+    L.push(`• ${b('Fake Volume:')} ${fmtPct(signals.washPct, 0)}${signals.washVolumeUsd != null ? ' | ' + fmtUsd(signals.washVolumeUsd) : ''}${srcNote}`);
   } else {
     L.push(`• ${b('Fake Volume:')} ⚪ UNVERIFIED`);
   }
   L.push(`• ${b('Adjusted Vol/Liq:')} ${fmt(adjustedVolLiq, 2)}x`);
   L.push(`• ${b('Quality:')} ${qualityLine}`);
+  // Sniper / insider risk — only show when non-zero (avoids noise on clean tokens)
+  const totalSniperRisk = (signals.snipersPct ?? 0) + (signals.insidersPct ?? 0);
+  if (totalSniperRisk > 0) {
+    const snip = signals.snipersPct > 0 ? `Snipers ${fmtPct(signals.snipersPct, 1)}` : null;
+    const ins  = signals.insidersPct > 0 ? `Insiders ${fmtPct(signals.insidersPct, 1)}` : null;
+    const parts = [snip, ins].filter(Boolean).join(' | ');
+    const riskIcon = totalSniperRisk > 20 ? '🔴' : '🟡';
+    L.push(`• ${b('Sniper Risk:')} ${riskIcon} ${parts}`);
+  }
   L.push('');
 
   // ── CONVICTION ─────────────────────────────────────────────────────────────
