@@ -1,0 +1,64 @@
+Here is the finalized, surgical instruction for your developer. It combines your specific code patches with the necessary technical refinements to ensure the data is accurate.
+
+***
+
+### **Developer Update: Oracle v6.1 (Holders & Curve Final Fix)**
+
+We are two steps away from a fully operational build. The Momentum, Bundle, and Time-Mode logic are working perfectly. We need to close the loop on the `UNVERIFIED` Holders and `N/A` Curve data.
+
+**Perform these two fixes only. Do not modify the existing Momentum or Time-Window logic.**
+
+#### **Fix 1: Implement Helius Holder/Concentration Logic**
+In `fetcher.js`, implement the following function and include it in your `fetchAll` parallel execution. Map the results to the **Holders** and **Top 10** fields in the scorecard.
+
+```javascript
+async function fetchHeliusHolders(ca) {
+  try {
+    const url = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getTokenLargestAccounts',
+        params: [ca]
+      }),
+      timeout: 8000
+    });
+    const data = await res.json();
+    const accounts = data?.result?.value || [];
+    if (accounts.length === 0) return null;
+
+    // Calculation Fix: Use 1,000,000,000 as the standard Total Supply for Pump.fun tokens
+    const totalSupply = 1000000000; 
+    const top10Balance = accounts.slice(0, 10).reduce((sum, a) => sum + parseFloat(a.uiAmount || 0), 0);
+
+    return {
+      holderCount: accounts.length, // Note: This returns top accounts found
+      top10Pct: (top10Balance / totalSupply) * 100, // Returns actual percentage of total supply
+    };
+  } catch(e) { 
+    console.error('Helius Holder Error:', e.message);
+    return null; 
+  }
+}
+```
+
+#### **Fix 2: Debug PumpPortal Curve Data**
+We need to see why the curve is returning `N/A`. Add this log inside your `fetchPumpPortal` function immediately after parsing the JSON response:
+
+```javascript
+// Add this line to see the raw structure (limited to 500 chars)
+console.log('PumpPortal raw:', JSON.stringify(data).slice(0, 500));
+```
+
+#### **Test Case & Verification**
+Once implemented, run a scan on this CA: `<token>A5KUU1cDCLGaV5FGxe4pb1nvKLu4XwynTVzyLmLapump</token>`
+
+**Required Results for Success:**
+1.  **Holders:** Should show a numeric count (not UNVERIFIED).
+2.  **Top 10:** Should show a percentage (e.g., 12.5%).
+3.  **Curve:** Should show a percentage (e.g., 45%) OR the console log should explain why it's missing.
+
+**Send a screenshot of the Oracle Scorecard for this CA once complete. 🔒**

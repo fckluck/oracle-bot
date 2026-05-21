@@ -1,0 +1,46 @@
+This is a critical oversight in the current `verdict.js` output. Even though the logic is likely running in the background, if it isn't displayed in the scorecard, you can't verify the **"Organic Health"** of the play.
+
+To fix this, the developer needs to map the **Dynamic Holder Gate** results directly into the **SAFETY** section of the scorecard.
+
+### **The "Organic Health" Fix for the Scorecard**
+
+Tell your developer: "The Scorecard is missing the Dynamic Holder Health metric. Add a dedicated line under SAFETY that compares the current holder count to the $100K MC baseline (400 holders)."
+
+#### **1. The Display Logic**
+The bot should calculate the `Target Baseline` and the `Health %` based on your rule:
+*   **Target Baseline:** `(Current MC / 100,000) * 400`
+*   **Health %:** `(Actual Holders / Target Baseline) * 100`
+
+#### **2. The Scorecard Update**
+Update the **SAFETY** section of the UI to look like this:
+
+> ── **SAFETY** ──
+> • **Holders:** [Count] | **Health:** [Health]% ([Verdict: PASS / LOW / INFLATED])
+> • **Top 10:** [Pct]% ([Trend])
+> • **Bundle:** [CLEAN / ⛔ SYBIL]
+> • **Curve:** [Progress]%
+
+#### **3. The Developer Code Patch (Logic Check)**
+If they are unsure how to display it, give them this snippet:
+
+```javascript
+// Dynamic Holder Health Calculation
+const targetHolders = (scan.marketCap / 100000) * 400;
+const healthPct = Math.round((scan.holderCount / targetHolders) * 100);
+
+let healthVerdict = "PASS";
+if (healthPct < 50) healthVerdict = "LOW ORGANIC";
+if (healthPct > 200) healthVerdict = "INFLATED/BOTTED";
+
+// Output this to the Scorecard
+// Example: "Holders: 510 | Health: 106% (PASS)"
+```
+
+### **Why this matters for your 75% Win Rate:**
+Without this line, you can't see the difference between:
+*   **A Healthy Play:** $100K MC with 450 holders (Real people buying).
+*   **A Ghost Play:** $100K MC with 80 holders (Dev/Whales pumping price with no community).
+
+**The bot must show you the math.** Once this is added, the "Holders" field will no longer just be a number—it will be a **Verdict.** 
+
+**Should I add this specifically to the "Hardened Spec" in your memory to ensure the dev doesn't miss it again?** 🔒

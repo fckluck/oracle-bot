@@ -1,0 +1,58 @@
+This is the **"Predator Patch" (Oracle v8.1)**. It transforms the bot from a manual CA-paster into a 24/7 automated hunter that catches the "Risky Runners" you were missing.
+
+***
+
+### **Developer Instruction: Oracle v8.1 Predator Patch**
+
+**Goal:** Implement automated hunt-mode and the "Risky Runner" logic. Perform these three updates surgically. Do not add Bloom execution yet.
+
+#### **1. Replace `finalOracleVerdict` in `scanner.js`**
+This logic introduces MC-scaled concentration gates and the "Risky Runner" grade for high-volume plays.
+
+```javascript
+function finalOracleVerdict(scan) {
+  // Meteora Auto-Disable for DeFade Score
+  const isDeFadeClean = scan.isMeteora ? true : (scan.deFadeScore < 20);
+
+  // Hard Stops: Bundle & Concentration
+  if (scan.bundleCount > 10) return "HARD SKIP — MASSIVE BUNDLE";
+  if (scan.bundleCount > 5 && !isDeFadeClean) return "HARD SKIP — UNVERIFIED BUNDLE";
+
+  // Dynamic Concentration Gate (Threshold scales at $100K MC)
+  const maxTop10 = scan.marketCap < 100000 ? 35 : 15;
+  if (scan.top10Pct > maxTop10) return "NO-GO — CONCENTRATION TOO HIGH";
+
+  // Conviction Grading & The "Risky Runner" Buffer
+  if (scan.volLiq >= 8 && (scan.bundleCount > 5 || scan.top10Pct > 15)) {
+    return "🟡 RISKY RUNNER (0.5x Unit) — VOL OVERRIDE";
+  }
+  if (scan.volLiq >= 12 && isDeFadeClean) return "🚀 PLUTO CANDIDATE (2.0x)";
+  if (scan.volLiq >= 8) return "✅ HIGH CONVICTION (1.5x)";
+  if (scan.volLiq >= 5) return "✅ BUY CANDIDATE (1.0x)";
+  
+  return "SKIP";
+}
+```
+
+#### **2. Implement Automated Hunt-Mode in `fetcher.js`**
+The bot must now listen for new launches 24/7.
+*   **Source:** Open a persistent connection to `wss://pumpportal.fun/api/data`.
+*   **Actions:** Subscribe to `subscribeNewToken` and `subscribeMigration`.
+*   **Processing:** On every event, perform a full Oracle scan in the background.
+*   **Filtering:** Only send the Telegram Scorecard if the token hits **Vol/Liq >= 5x**. Keep the bot silent for low-volume launches.
+
+#### **3. Unrestrict Scorecard Data in `verdict.js`**
+The bot must provide 100% data transparency regardless of the time.
+*   **Time Windows:** `RESEARCH MODE` and `DEAD ZONE` are now **banners only**.
+*   **Display:** Every scan must show the full scorecard: Position sizing, TP/SL levels, Dev Trust, and Safety metrics. **Never hide data or skip the logic scan due to the time window.**
+
+#### **4. Environment Config**
+*   Ensure `DEFADE_API_KEY` is present.
+*   Ensure `isMeteora` flag is correctly extracted from the DexScreener `programId`.
+
+***
+
+**Status Update for ChatGPT/System:**
+Memory updated to **Oracle v8.1 Predator Spec**. The bot is now a 24/7 automated filter that captures mid-tier gains while using DeFade context to distinguish between malicious bundles and organic pressure. 
+
+**Push this to the dev now. Oracle is going live.** 🔒

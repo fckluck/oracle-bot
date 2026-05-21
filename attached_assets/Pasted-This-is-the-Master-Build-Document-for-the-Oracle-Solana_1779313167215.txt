@@ -1,0 +1,89 @@
+This is the **Master Build Document** for the **Oracle Solana Bot (Final v5.1)**. This document integrates all previous refinements, the "Data Truth" hierarchy, momentum hardening, and the new real-time Exit Monitoring system.
+
+***
+
+# **Final Build Specification: Oracle Solana Bot (Manual-Assist)**
+
+## **1. Data Hierarchy & API Keys**
+To eliminate "N/A" fields, the bot must utilize these three environment variables:
+*   **`HELIUS_API_KEY` (Truth Tier):** Primary source for `Holders`, `Top 10`, `Parent Funding Trail`, and `Dev History`.
+*   **`BIRDEYE_API_KEY` (Alpha Tier):** Primary source for `Peak MC (Historical)`, `OHLCV (Momentum)`, and `Range Position`.
+*   **`PUMPPORTAL_API_KEY` (Launch Tier):** Primary source for `Bonding Curve %`, `Migration Stats`, and `Initial Metadata`.
+
+---
+
+## **2. The Hardened Logic Gates**
+
+### **Gate 3: Momentum & Vol/Liq (The Hardened Rule)**
+The bot must never issue a **PLUTO** or **BUY** based on Vol/Liq alone. 
+*   **Rule:** If `PriceChange5m < 0` AND `VolLiq >= 8`, return: `VOLUMETRIC DISTRIBUTION — AVOID`.
+*   **Rule:** Token must be in the **Top 25% of its 1H Range**.
+    *   *Calculation:* `(CurrentPrice - Low1h) / (High1h - Low1h) >= 0.75`.
+
+### **Gate 8: The 3-Part CTO Check**
+*   **1. Dev Inactive:** Dev wallet quiet for 30+ minutes (Helius `getSignatures`).
+*   **2. Concentration:** Top 10 concentration is Flat or Decreasing (Rising = NOT a CTO).
+*   **3. Metadata:** Social links must be present in the PumpPortal metadata object.
+
+### **The Bundle funding Check**
+*   If 3+ same-slot buys share a **Parent Funding Source** (traced via Helius Enhanced TXs) = **HARD SKIP**.
+*   If 3+ same-slot buys have unique funding = **HIGH ORGANIC PRESSURE**.
+
+---
+
+## **3. Entry Optimization (Wait/Pending Logic)**
+Instead of a binary Buy/Skip, implement "Yellow Light" states:
+*   **Wait for Volume:** If Health is 🟢 but `Vol/Liq < 5x`.
+    *   *Verdict:* `🟡 WATCH: Health is good. Wait for Vol/Liq > 5x before entry.`
+*   **Wait for Distribution:** If Vol/Liq is 🟢 but `Holders < 50% of Dynamic Floor`.
+    *   *Verdict:* `🟡 WATCH: Volume high, but distribution is thin. Wait for [Target] holders.`
+
+---
+
+## **4. Real-Time Exit Alerts (The "Guardian" System)**
+Implement a **[ ➕ TRACK POSITION ]** button on every scan. When clicked, the bot monitors the CA every 60s and alerts on:
+*   **Vol/Liq Decay:** Alert if ratio drops below 2.0x.
+*   **Holder Stagnation:** Alert if Holder growth < 1% over 10m at local ATH.
+*   **Liquidity Floor:** Alert if LP drops below $5,000.
+*   **Concentration Spike:** Alert if Top 10 % increases while price is sideways.
+
+---
+
+## **5. Final Scorecard UI Layout**
+```text
+🚀 ORACLE SCORECARD: [GRADE] ([Vol/Liq]x)
+Verdict: [BUY CANDIDATE / WATCH / AVOID]
+
+── CONVICTION LEVERS ──
+• Momentum: [🟢 TOP 25% RANGE / 🔴 DISTRIBUTION]
+• Holders: [Count] ([Range Verdict: Pass/Low/Inflated])
+• Top 10: [%] ([↗ Rising / ↘ Dropping])
+• Bundle: [CLEAN / BUNDLE DETECTED]
+• Parent Funding: [CLEAN / SYBIL DETECTED]
+
+── DEV ALPHA ──
+• Profile: [Launches] Launches | [Migrated] Migrated
+• Top Performance: [Multiplier]x ($[Peak MC])
+• Status: [CTO CONFIRMED / DEV ACTIVE]
+
+── LIVE METRICS ──
+• MC: $[Current] | LP: $[Current]
+• Curve: [Progress]% ([STABLE / MIGRATION GAP])
+• Time Mode: [DISCOVERY / DEAD ZONE / RESEARCH]
+
+CA: <token>[CA]</token> (Tap to Copy)
+
+[ ➕ TRACK POSITION ] | [ 📈 CHART ] | [ 🐦 X SEARCH ]
+```
+
+---
+
+## **6. Developer Checklist for "Flawless" Build**
+1.  **Helius DAS:** Use `getAssetsByOwner` to calculate `Peak MC / Initial MC` for Dev History.
+2.  **Momentum Logic:** Implement the `momentumGate` function to prevent buying red candles.
+3.  **Adaptive SL:** During **Dead Zone (12PM-7PM ET)**, tighten the Stop Loss alert to 25% retracement.
+4.  **No N/A:** If a field is N/A, the bot must retry the secondary API (e.g., if Helius is lagging, check Birdeye) before displaying.
+
+***
+
+**I have archived this v5.1 Final Spec.** This system is now airtight, data-driven, and designed for high-conviction manual execution. You are ready to launch **Oracle**. Good hunting!

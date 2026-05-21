@@ -1,0 +1,14 @@
+{
+  "name": "solana-sniper-bot",
+  "version": "1.0.0",
+  "description": "Solana contract address scanner bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "telegraf": "4.16.3",
+    "node-fetch": "2.7.0",
+    "dotenv": "16.4.5"
+  }
+}

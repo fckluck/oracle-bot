@@ -1,0 +1,62 @@
+This is the finalized technical specification for the **Sure Shot CTO System (v2.1)**. You can send this directly to your development team to ensure the bot is rebuilt to your exact standards.
+
+***
+
+# **Technical Specification: Sure Shot CTO System v2.1**
+
+### **1. Entry Grade & Position Sizing Logic**
+The bot must evaluate the **Volume-to-Liquidity (Vol/Liq) Ratio** as the primary conviction trigger.
+*   **BASELINE ENTRY (5x - 7.9x Vol/Liq):** Recommend **1x Standard Unit**.
+*   **HIGH CONVICTION (8x - 11.9x Vol/Liq):** Recommend **1.5x Standard Unit**.
+*   **GOD TIER (12x+ Vol/Liq):** Recommend **2x Standard Unit**.
+
+### **2. Dynamic Holder Gate (Market Cap Scaled)**
+Instead of a static holder count, use a dynamic baseline of **400 holders per $100K Market Cap**.
+*   **Calculation:** `(Current MC / 100,000) * 400` = Target Baseline.
+*   **The Safety Range:**
+    *   **Floor (50% of Baseline):** If holders are below this, flag `LOW ORGANIC REACH`.
+    *   **Ceiling (200% of Baseline):** If holders are above this, flag `INFLATED WALLETS`.
+*   **Exception:** If holder data is unavailable, flag as `UNVERIFIED` (Do not auto-skip; let the human decide).
+
+### **3. Transaction Pressure Context**
+Display these flags based on the ratio of Buys vs. Sells in the last 5-15 minutes:
+*   **AGGRESSIVE BUY PRESSURE:** If Buys are **> 85%** of total transactions.
+*   **SELL PRESSURE WARNING:** If Buys are **< 40%** of total transactions.
+
+### **4. Mandatory Hard Filters**
+The bot must **SKIP** or **AUTO-FAIL** any token meeting these conditions:
+*   **Serial Deployer:** Developer has launched **> 10 tokens**.
+*   **Low Liquidity:** Total LP is **< $10,000**.
+*   **CTO Status:** No verified Community Takeover (CTO) flag detected via DexScreener/Socials.
+
+### **5. The "Dead Zone" Filter (Time-Based)**
+Between **12 PM – 7 PM (Local/Standard Time)**:
+*   Scale all Market Cap targets down by **30%**.
+*   Require a minimum of **8x Vol/Liq** for any "Entry" signal.
+
+### **6. Automated Exit Strategy**
+Once a trade is live, the bot must monitor for the following "Trim" and "Exit" signals:
+*   **The 75% Trim (Sell 75%):** Trigger if **Vol/Liq falls below 2x** OR **Holder growth is < 1% over 10m**.
+*   **The Moon Bag (Hold 25%):**
+    *   Set a Hard Stop Loss at **50% Market Cap retracement** from the local All-Time High (ATH).
+
+---
+
+### **Desired Bot Output Format**
+> 🚀 **SURE SHOT ENTRY DETECTED**
+> **Token:** [CA]
+> **Conviction:** [Grade] ([Vol/Liq Ratio]x)
+> **Action:** [Position Size]
+> 
+> **Market Health:**
+> • **Holders:** [Count] ([Verdict: Pass/Low/Inflated])
+> • **Pressure:** [Aggressive Buy / Sell Warning / Neutral]
+> • **LP:** [Amount] | **CTO:** [Yes/No]
+> 
+> **Exit Plan:**
+> • Trim 75% if Vol/Liq < 2x.
+> • Moon Bag SL: [MC Amount at 50% retracement].
+
+***
+
+**I have also saved these specific rules to your memory so I can audit any future trades you share against this "Flawless" standard.** Is there anything else you want to add before you send this off?

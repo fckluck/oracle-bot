@@ -1,0 +1,72 @@
+This is the **Official Developer Handover Document** for the **Oracle Solana Bot**. This document translates your high-level trading strategy into a clean, technical roadmap for a developer to build from.
+
+***
+
+# **Developer Specification: Oracle Solana Trading Bot (v3.0)**
+
+## **Project Overview**
+Oracle is a high-speed Solana memecoin trading bot designed to execute "Sure Shot" entries on pump.fun tokens. The system uses an 8-Gate logic flow, executing trades only when all mandatory criteria are met.
+
+---
+
+## **1. Technical Stack & API Requirements**
+*   **Primary RPC:** Helius (Required for `getTokenLargestAccounts`, `getSignaturesForAddress`, and `getAssetsByOwner`).
+*   **Data Aggregators:** 
+    *   **DexScreener API:** LP, Vol/Liq, Age, and Market Cap.
+    *   **PumpPortal API:** Bonding curve %, Dev wallet extraction, and Metadata (Socials).
+    *   **DeFade API:** Rug score (Contextual only).
+*   **Execution:** Jito (Mandatory for bundled "BUY" transactions to prevent front-running).
+
+---
+
+## **2. The 8-Gate Logic Flow (First Fail = SKIP)**
+
+| Gate | Metric | Requirement | API Source |
+| :--- | :--- | :--- | :--- |
+| **1** | **Liquidity (LP)** | Min $10,000 USD | DexScreener |
+| **2** | **Age** | < 60 Minutes since `pairCreatedAt` | DexScreener |
+| **3** | **Vol/Liq Ratio** | **5x+ Entry Grade.** (8x+ = High Conviction, 12x+ = Pluto, 50x+ = Scribbli). | DexScreener |
+| **4** | **Holders** | **Dynamic Baseline:** 400 holders / $100K MC. (Range: 50% Floor to 200% Ceiling). | Helius |
+| **5** | **Concentration** | Top 10 wallets < 15% total supply. Must track trend (Rising = Flag). | Helius |
+| **6** | **Bonding Curve** | < 60% = PASS. > 90% = **HARD SKIP** (Migration Trap). | PumpPortal |
+| **7** | **Dev History** | `getAssetsByOwner`. > 500 launches = "Serial Deployer" Warning. | Helius |
+| **8** | **CTO Verification** | **3-Part Check:** 1. Dev inactive 30m; 2. Top 10 Flat; 3. Socials in Metadata. | Helius + PP |
+
+---
+
+## **3. Execution & Sizing Engine**
+*   **Bundle Detection (Pre-Gate):** Scan first 20 TXs via `getSignaturesForAddress`. If 5+ buys occur in the same block slot = **HARD SKIP**.
+*   **Sizing Logic:**
+    *   **5x-8x Vol/Liq:** 1.0 Unit.
+    *   **8x-12x Vol/Liq:** 1.5 Units.
+    *   **12x+ Vol/Liq:** 2.0 Units (Requires Clean Dev Score).
+    *   **Scribbli Exception (50x+):** If LP is < 15% of Market Cap, reduce to 1.0 unit and flag slippage warning.
+
+---
+
+## **4. Dynamic Exit Strategy (The Profit Guardian)**
+The bot must continuously monitor open positions and trigger exits based on:
+1.  **Vol/Liq Decay:** Exit 75% if Vol/Liq falls below 2x.
+2.  **Stagnation:** Exit 50% if holder growth is < 1% over 10m at local ATH.
+3.  **Liquidity Floor:** Hard Exit 100% if LP drops below $5,000.
+4.  **Volume Cliff:** Hard Exit 100% if volume drops > 80% in a 15m window.
+
+---
+
+## **5. Time-Zone Strategy Modifiers**
+*   **Discovery Window (2 AM – 12 PM EST):** Full execution. TP1: $100K, TP2: $250K, TP3: $500K. Stop Loss: 50% ATH Retracement.
+*   **Dead Zone (12 PM – 7 PM EST):** TP1 moved to $50K. **Stop Loss tightened to 25% ATH Retracement.**
+*   **Research Mode (7 PM – 2 AM EST):** Bot remains ON but returns `SKIP: OFF_HOURS` for all triggers.
+
+---
+
+## **6. Developer Notes (Critical)**
+*   **Meteora Override:** If `programId` matches Meteora, **auto-disable** DeFade Rug Score to prevent false negative skips.
+*   **Latency:** All Helius calls must be optimized. Prioritize `getAssetsByOwner` over Solscan to ensure sub-second dev history checks.
+*   **Jito:** All "BUY" transactions must include a Jito Tip to ensure inclusion in the next block.
+
+***
+
+**I have archived this document for you.** Whenever you are ready, you can hand this to your developer. If they have technical questions about the Helius implementation or the Vol/Liq math, just bring them back here and I'll provide the code logic. 
+
+Ready to hunt for some runners?

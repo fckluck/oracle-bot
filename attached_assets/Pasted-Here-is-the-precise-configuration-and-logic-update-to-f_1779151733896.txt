@@ -1,0 +1,47 @@
+Here is the precise configuration and logic update to fix the bot. You can copy-paste this entire block to the developer or input it into the bot's "System Instructions" or "Custom Logic" settings.
+
+***
+
+### **System Update: "Sure Shot CTO" Logic v2.0**
+
+**Goal:** Eliminate "False Negatives" and automate position sizing based on Vol/Liq ratios.
+
+#### **1. Entry Logic & Conviction Grades**
+Discard the current binary "Skip/Trade" logic. Implement a tiered conviction system:
+*   **ENTRY GRADE (5x - 7.9x Vol/Liq):** 
+    *   *Condition:* CTO Flag = YES, Serial Deployer = NO (<10), LP > $10K.
+    *   *Action:* 1x Standard Unit.
+*   **HIGH CONVICTION (8x - 11.9x Vol/Liq):** 
+    *   *Condition:* CTO Flag = YES, LP > $10K.
+    *   *Action:* **1.5x Standard Unit.**
+*   **GOD TIER (12x+ Vol/Liq):** 
+    *   *Condition:* CTO Flag = YES, LP > $10K.
+    *   *Action:* **2x Standard Unit.**
+
+#### **2. Mandatory Filters (The "No-Go" List)**
+The bot must auto-skip if any of these are true:
+*   **Serial Deployer:** If dev has >10 tokens in history.
+*   **Low Liquidity:** If LP is < $10,000.
+*   **Time Filter (The Dead Zone):** If current time is between **12 PM - 7 PM**, the bot must scale MC targets down by 30% and require a minimum of **8x Vol/Liq** for any entry.
+
+#### **3. Automated Exit Strategy**
+Once a position is opened, the bot must monitor and alert for these exit triggers:
+*   **The 75% Trim:** Sell 75% of the position immediately if:
+    1.  Vol/Liq ratio falls below **2x**.
+    2.  Holder growth is **< 1%** over a 10-minute window.
+*   **The Moon Bag (Remaining 25%):**
+    1.  Hold for "Moon" potential.
+    2.  **Hard Stop Loss:** Execute total exit if Market Cap retraces **50%** from the local All-Time High (ATH).
+
+#### **4. Execution Requirements**
+*   **Scraping:** The bot must prioritize DexScreener "Socials Updated" or X (Twitter) mentions to verify the **CTO Flag** faster.
+*   **Data Latency:** If Holder data is `UNVERIFIED` for more than 30 seconds, trigger a "Data Lag Warning" but do not auto-skip if Vol/Liq is > 10x.
+
+***
+
+### **How to test if it's fixed:**
+Give the bot a token like the <token>CVgssrLtdHvu6M4UHwSHBwau5LNjJb4EytcLPEpGpump</token> play from earlier. 
+*   **Old Bot said:** `SKIP — LOW CONVICTION`.
+*   **New Bot should say:** `ENTRY GRADE DETECTED — 1x UNIT (Vol/Liq 6.67x)`.
+
+Would you like me to save this updated logic to your memory so we can reference it for future trade reviews?

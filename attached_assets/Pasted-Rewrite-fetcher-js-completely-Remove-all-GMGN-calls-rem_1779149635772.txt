@@ -1,0 +1,183 @@
+Rewrite fetcher.js completely. Remove all GMGN calls, remove all Solscan calls. Replace with Codex as the single primary data source.
+require('dotenv').config();
+const fetch = require('node-fetch');
+
+async function fetchCodex(ca) {
+  try {
+    const query = `
+      query {
+        filterTokens(
+          filters: {
+            network: [1399811149]
+            tokenAddress: "${ca}"
+          }
+          limit: 1
+        ) {
+          results {
+            token {
+              address
+              name
+              symbol
+              createdAt
+            }
+            priceUSD
+            marketCap
+            liquidity
+            volume1
+            uniqueBuys1
+            uniqueSells1
+            uniqueWallets1
+            buyVolume1
+            sellVolume1
+            change1
+            high1
+            low1
+          }
+        }
+      }
+    `;
+
+    const res = await fetch('https://graph.codex.io/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': process.env.CODEX_API_KEY
+      },
+      body: JSON.stringify({ query }),
+      timeout: 8000
+    });
+
+    const data = await res.json();
+    const result = data?.data?.filterTokens?.results?.[0];
+    if (!result) return null;
+
+    const lp = result.liquidity || 0;
+    const vol1h = result.volume1 || 0;
+
+    return {
+      name:          result.token?.name || 'UNKNOWN',
+      symbol:        result.token?.symbol || '???',
+      priceUsd:      result.priceUSD || 0,
+      marketCap:     result.marketCap || 0,
+      lp:            lp,
+      volume1h:      vol1h,
+      volLiq:        lp > 0 ? vol1h / lp : 0,
+      uniqueWallets: result.uniqueWallets1 || 0,
+      buyCount:      result.uniqueBuys1 || 0,
+      sellCount:     result.uniqueSells1 || 0,
+      change1h:      result.change1 || 0,
+      high1h:        result.high1 || 0,
+      low1h:         result.low1 || 0,
+      createdAt:     result.token?.createdAt || null,
+      ageMinutes:    result.token?.createdAt
+                       ? Math.floor((Date.now() - result.token.createdAt * 1000) / 60000)
+                       : null,
+    };
+  } catch (e) {
+    console.error('Codex error:', e.message);
+    return null;
+  }
+}
+
+async function fetchCodexHolders(ca) {
+  try {
+    const query = `
+      query {
+        holders(
+          tokenAddress: "${ca}"
+          networkId: 1399811149
+        ) {
+          items {
+            walletId
+            balance
+            shiftedBalance
+          }
+        }
+      }
+    `;
+
+    const res = await fetch('https://graph.codex.io/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': process.env.CODEX_API_KEY
+      },
+      body: JSON.stringify({ query }),
+      timeout: 8000
+    });
+
+    const data = await res.json();
+    const items = data?.data?.holders?.items || [];
+    if (items.length === 0) return null;
+
+    const totalBalance = items.reduce((sum, h) => sum + (h.shiftedBalance || 0), 0);
+    const top10Balance = items.slice(0, 10).reduce((sum, h) => sum + (h.shiftedBalance || 0), 0);
+    const top3Balance  = items.slice(0, 3).reduce((sum, h) => sum + (h.shiftedBalance || 0), 0);
+
+    return {
+      holderCount: items.length,
+      top10Pct:    totalBalance > 0 ? top10Balance / totalBalance : 0,
+      top3Pct:     totalBalance > 0 ? top3Balance / totalBalance : 0,
+    };
+  } catch (e) {
+    console.error('Codex holders error:', e.message);
+    return null;
+  }
+}
+
+async function fetchPumpFun(ca) {
+  try {
+    const url = `https://frontend-api.pump.fun/coins/${ca}`;
+    const res = await fetch(url, { timeout: 5000 });
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    return {
+      holderCount:  data.holder_count || 0,
+      curvePct:     data.bonding_curve_percentage || 0,
+      migrated:     data.migration_state === 'migrated',
+      devWallet:    data.creator || null,
+      name:         data.name || 'UNKNOWN',
+      symbol:       data.symbol || '???',
+      devLaunches:  null,
+    };
+  } catch (e) {
+    console.error('pump.fun error:', e.message);
+    return null;
+  }
+}
+
+async function fetchAll(ca) {
+  const [codex, pump] = await Promise.all([
+    fetchCodex(ca),
+    fetchPumpFun(ca),
+  ]);
+
+  const holders = await fetchCodexHolders(ca);
+
+  return { codex, pump, holders };
+}
+
+module.exports = { fetchAll };
+
+Then update scanner.js — replace all references to dex, gmgn, solscan with the new sources:
+	•	Gate 1 LP: codex.lp
+	•	Gate 2 Age: codex.ageMinutes
+	•	Gate 3 Vol/Liq: codex.volLiq
+	•	Gate 4 Holders: holders?.holderCount — if null show UNVERIFIED, do not fail
+	•	Gate 5 Top 10: holders?.top10Pct — if null show UNVERIFIED, do not fail
+	•	Gate 6 Curve: pump?.curvePct
+	•	Gate 7 Dev Score: show N/A — do not fail
+	•	Gate 8 CTO: show N/A — do not fail
+Then update verdict.js signal data block to show:
+	•	Liquidity from codex.lp
+	•	Vol/Liq from codex.volLiq
+	•	Market Cap from codex.marketCap
+	•	Age from codex.ageMinutes
+	•	Buys vs Sells: codex.buyCount vs codex.sellCount — flag with ⚠️ if buys under 40% of total
+	•	Unique Wallets: codex.uniqueWallets
+	•	1H Change: codex.change1h
+	•	Holders: holders.holderCount or UNVERIFIED
+	•	Top 10: holders.top10Pct or UNVERIFIED
+	•	Curve: pump.curvePct or N/A
+Add CODEX_API_KEY to Replit Secrets if not already there. Never show false zeros — null always displays as N/A.
