@@ -91,8 +91,11 @@ function bundleDisplay(bundle) {
 function parentFundingDisplay(bundle) {
   if (!bundle) return 'N/A';
   if (bundle.sybilDetected) return `⛔ SYBIL (${bundle.fundingSources} source → ${bundle.uniqueSigners} wallets)`;
-  if (bundle.tracesResolved >= 3) return `✅ CLEAN (${bundle.tracesResolved} wallets traced, ${bundle.fundingSources} source(s))`;
-  return `⚪ UNRESOLVED (${bundle.tracesResolved ?? 0} traces)`;
+  const traced = bundle.tracesResolved ?? 0;
+  // ≥3 traces = high-confidence clean; 1-2 traces = partial but still evidence of diversity
+  if (traced >= 3) return `✅ CLEAN (${traced} wallets traced, ${bundle.fundingSources} source(s))`;
+  if (traced >= 1) return `✅ CLEAN (partial — ${traced} trace${traced > 1 ? 's' : ''}, no shared funder)`;
+  return `⚪ UNRESOLVED (no traces completed)`;
 }
 
 function ctoStatusDisplay(ctoBehavior, walletAge) {
@@ -170,18 +173,21 @@ function formatVerdict(result, ca) {
 
   const { qualityLine } = washQualityDisplay(signals.washPct);
   const washSrcLabel = signals.washSource
-    ? (signals.washSource.startsWith('birdeye') ? `Birdeye ${signals.washSource.replace('birdeye-', '')} window` : 'SolanaTracker risk')
+    ? (signals.washSource.startsWith('birdeye')
+        ? `Birdeye ${signals.washSource.replace('birdeye-', '')} window`
+        : 'SolanaTracker')
     : null;
   L.push(b('── VOLUME QUALITY ──'));
   L.push(`• ${b('Raw Vol/Liq:')} ${fmt(rawVolLiq, 2)}x`);
   if (signals.washPct != null) {
-    const srcNote = washSrcLabel ? ` ${i('(' + washSrcLabel + ')')}` : '';
-    L.push(`• ${b('Fake Volume:')} ${fmtPct(signals.washPct, 0)}${signals.washVolumeUsd != null ? ' | ' + fmtUsd(signals.washVolumeUsd) : ''}${srcNote}`);
+    const fakeAmt = signals.washVolumeUsd != null ? ` ($${Math.round(signals.washVolumeUsd).toLocaleString()})` : '';
+    L.push(`• ${b('Fake Volume:')} ${fmtPct(signals.washPct, 0)}${fakeAmt} ✅`);
   } else {
     L.push(`• ${b('Fake Volume:')} ⚪ UNVERIFIED`);
   }
   L.push(`• ${b('Adjusted Vol/Liq:')} ${fmt(adjustedVolLiq, 2)}x`);
-  L.push(`• ${b('Quality:')} ${qualityLine}`);
+  const qualityVerified = washSrcLabel ? ` ${i('(Verified via ' + washSrcLabel + ')')}` : '';
+  L.push(`• ${b('Quality:')} ${qualityLine}${qualityVerified}`);
   // Sniper / insider risk — only show when non-zero (avoids noise on clean tokens)
   const totalSniperRisk = (signals.snipersPct ?? 0) + (signals.insidersPct ?? 0);
   if (totalSniperRisk > 0) {
@@ -211,9 +217,17 @@ function formatVerdict(result, ca) {
     : (dp.peakAssets != null && dp.peakAssets > 0
         ? `${dp.peakAssets} prior token(s), peak MC unknown`
         : 'N/A (no prior tokens indexed)');
-  const successRate = (dp.totalLaunches != null)
-    ? `${dp.migratedCount ?? '?'}/${dp.totalLaunches} tokens`
-    : 'N/A';
+  let successRate = 'N/A';
+  if (dp.totalLaunches != null && dp.totalLaunches > 0) {
+    const migrated = dp.migratedCount ?? 0;
+    const pct = Math.round((migrated / dp.totalLaunches) * 100);
+    const flag = pct < 5  ? ' 🔴 SERIAL RUGGER'
+               : pct > 20 ? ' 🟢 PRO PILOT'
+               : '';
+    successRate = `${migrated}/${dp.totalLaunches} tokens (${pct}%)${flag}`;
+  } else if (dp.totalLaunches != null) {
+    successRate = `0/${dp.totalLaunches} tokens (0%) 🔴 SERIAL RUGGER`;
+  }
 
   L.push(b('── DEV TRUST ──'));
   L.push(`• ${b('Success Rate:')} ${esc(successRate)}`);

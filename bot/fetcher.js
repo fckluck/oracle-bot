@@ -26,7 +26,8 @@ async function fetchDexScreener(ca) {
     const sol = (data.pairs || []).filter(p => p.chainId === 'solana');
     if (!sol.length) { console.log('[fetchDexScreener] no Solana pairs'); return null; }
     sol.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-    const top = sol[0];
+    // Prefer the highest-liquidity pair that actually has LP > 0 (avoids Phantom LP / stale pairs)
+    const top = sol.find(p => (p.liquidity?.usd || 0) > 0) || sol[0];
     const lp    = top.liquidity?.usd || 0;
     const vol1h = top.volume?.h1     || 0;
     const dexId = top.dexId || null;
@@ -75,12 +76,14 @@ async function fetchSolanaTrackerToken(ca) {
     const creator    = creation?.creator    || null;
     const createdTx  = creation?.created_tx || null;
     const createdAt  = creation?.created_time ? creation.created_time * 1000 : null;
-    // Bonus signals — we can surface these in scorecard later
-    const snipersPct = data?.risk?.snipers?.totalPercentage ?? null;
-    const insidersPct= data?.risk?.insiders?.totalPercentage ?? null;
-    const riskScore  = data?.risk?.score ?? null;
-    console.log(`[fetchSolanaTrackerToken] creator=${creator || 'null'} snipers=${snipersPct} risk=${riskScore}`);
-    return { creator, createdTx, createdAt, snipersPct, insidersPct, riskScore };
+    // Holder count — ST indexes this for many tokens (may be absent for very fresh ones)
+    const holderCount = typeof data?.token?.holders === 'number' ? data.token.holders : null;
+    // Bonus signals
+    const snipersPct  = data?.risk?.snipers?.totalPercentage  ?? null;
+    const insidersPct = data?.risk?.insiders?.totalPercentage ?? null;
+    const riskScore   = data?.risk?.score ?? null;
+    console.log(`[fetchSolanaTrackerToken] creator=${creator || 'null'} holders=${holderCount ?? 'null'} snipers=${snipersPct} risk=${riskScore}`);
+    return { creator, createdTx, createdAt, holderCount, snipersPct, insidersPct, riskScore };
   } catch (e) { console.error('[fetchSolanaTrackerToken] error:', e.message); return null; }
 }
 
@@ -753,6 +756,10 @@ async function fetchAll(ca) {
       if (pump?.holderCount) {
         console.log(`[fetchAll] holders: PumpPortal count=${pump.holderCount} (no concentration)`);
         return { holderCount: pump.holderCount, top10Pct: null, top3Pct: null, source: 'pumpportal' };
+      }
+      if (stToken?.holderCount) {
+        console.log(`[fetchAll] holders: SolanaTracker count=${stToken.holderCount} (no concentration)`);
+        return { holderCount: stToken.holderCount, top10Pct: null, top3Pct: null, source: 'solanatracker' };
       }
 
       console.log('[fetchAll] holders: null — UNVERIFIED');
