@@ -140,7 +140,7 @@ function formatVerdict(result, ca) {
     L.push('─────────────────────────────');
   } else if (timeWindow === 'DEAD_ZONE') {
     L.push(`☀️ ${b('DEAD ZONE (12PM–7PM ET)')}`);
-    L.push(`ℹ️ Low-conviction window — TP1 $50K | SL 25% | Min 8x Adjusted`);
+    L.push(`ℹ️ Low-conviction window — TP1 $50K | SL 25% | Min 5x Adjusted`);
     L.push('─────────────────────────────');
   }
 
@@ -162,11 +162,10 @@ function formatVerdict(result, ca) {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
     L.push(`${esc(watchReason)}`);
   } else {
-    const minT = timeWindow === 'DEAD_ZONE' ? 8.0 : 5.0;
     L.push(`⬇️ ${b('ORACLE VERDICT: SKIP')}`);
-    L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below ${minT}x minimum`);
+    L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below 5x minimum`);
   }
-  L.push(`Mode: ${b(timeWindow)}${timeWindow === 'DEAD_ZONE' ? ' ' + i('(TP1 $50K | SL 25% | Min 8x Adjusted)') : ''}`);
+  L.push(`Mode: ${b(timeWindow)}${timeWindow === 'DEAD_ZONE' ? ' ' + i('(TP1 $50K | SL 25% | Min 5x Adjusted)') : ''}`);
   L.push('');
 
   // ── VOLUME QUALITY ─────────────────────────────────────────────────────────
@@ -220,11 +219,14 @@ function formatVerdict(result, ca) {
   let successRate = 'N/A';
   if (dp.totalLaunches != null && dp.totalLaunches > 0) {
     const migrated = dp.migratedCount ?? 0;
-    const pct = Math.round((migrated / dp.totalLaunches) * 100);
-    const flag = pct < 5  ? ' 🔴 SERIAL RUGGER'
-               : pct > 20 ? ' 🟢 PRO PILOT'
+    const pct = (migrated / dp.totalLaunches) * 100;
+    const pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct).toString();
+    // pump.fun network average migration rate is ~0.5-2% — label accordingly
+    const flag = pct < 0.5  ? ' 🔴 SERIAL RUGGER'
+               : pct < 5    ? ' 🟡 NETWORK AVERAGE'
+               : pct > 20   ? ' 🟢 PRO PILOT'
                : '';
-    successRate = `${migrated}/${dp.totalLaunches} tokens (${pct}%)${flag}`;
+    successRate = `${migrated}/${dp.totalLaunches} tokens (${pctDisp}%)${flag}`;
   } else if (dp.totalLaunches != null) {
     successRate = `0/${dp.totalLaunches} tokens (0%) 🔴 SERIAL RUGGER`;
   }

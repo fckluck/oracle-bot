@@ -36,11 +36,14 @@ function getPositionUnits(entryTier, lp, mc) {
 function momentumGate(birdeye, volLiq) {
   if (!birdeye) return null;
   const { priceChange5m, rangePct } = birdeye;
-  if (priceChange5m !== null && priceChange5m < 0 && volLiq >= 8) {
+  // Distribution: requires a significant 5m drop (>10%) not just any red candle.
+  // Normal Solana "breathing" (small pullbacks during uptrends) should not trigger this.
+  if (priceChange5m !== null && priceChange5m < -10 && volLiq >= 8) {
     return 'VOLUMETRIC_DISTRIBUTION';
   }
   if (rangePct !== null) {
-    return rangePct >= 0.75 ? 'TOP_QUARTER' : 'LOWER_RANGE';
+    // 60% floor captures re-accumulation phase, not just absolute peak.
+    return rangePct >= 0.60 ? 'TOP_QUARTER' : 'LOWER_RANGE';
   }
   return null;
 }
