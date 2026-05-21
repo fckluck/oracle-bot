@@ -116,6 +116,12 @@ function scan(data) {
   const migratedCount = stDeployer?.migratedCount ?? devStats?.migratedCount ?? null;
   const timeWindow    = getTimeWindow();
 
+  // Pro Pilot: success rate > 5% → lower BUY floor to 3x (proven track record)
+  const successRatePct = (devLaunches != null && devLaunches > 0 && migratedCount != null)
+    ? (migratedCount / devLaunches) * 100 : null;
+  const isProPilot     = successRatePct != null && successRatePct > 5;
+  const isSerialDeployer = devLaunches !== null && devLaunches > 500;
+
   const holderCount     = holders?.holderCount     ?? null;
   const topAccountCount = holders?.topAccountCount ?? null;
   const top10Pct        = holders?.top10Pct        ?? null;
@@ -186,11 +192,7 @@ function scan(data) {
     noGoReason   = `Migration Gap — Curve at ${curvePct.toFixed(1)}% (wait for Raydium pool)`;
     headlineType = 'LIQUIDITY';
   }
-  // 6. Serial deployer
-  else if (devLaunches !== null && devLaunches > 500) {
-    noGoReason   = `Serial Deployer (${devLaunches} launches)`;
-    headlineType = 'DEPLOYER';
-  }
+  // 6. (Serial Deployer demoted to DEV TRUST warning — no longer a hard NO_GO)
   // 7. Moderate bundle without DeFade clean
   else if (bundleCount > 5 && !isDeFadeClean) {
     const ctx = deFadeScore !== null ? `DeFade=${deFadeScore}` : 'DeFade unverified';
@@ -230,6 +232,9 @@ function scan(data) {
   } else if (adjustedVolLiq >= 8) {
     entryTier    = 'HIGH_CONVICTION'; verdict = 'BUY';
   } else if (adjustedVolLiq >= 5) {
+    entryTier    = 'BASELINE_ENTRY'; verdict = 'BUY';
+  } else if (adjustedVolLiq >= 3 && isProPilot) {
+    // Pro Pilot buffer: proven dev (>5% success rate) earns 3x floor instead of 5x
     entryTier    = 'BASELINE_ENTRY'; verdict = 'BUY';
   } else if (adjustedVolLiq >= 3) {
     verdict      = 'WATCH_VOL';
@@ -277,7 +282,9 @@ function scan(data) {
       birdeye: birdeye || null,
       bundleCount, isMeteora, deFadeScore, isDeFadeClean, sybilFunded,
       holderHealth:   holderHealthData,
-      isPostCurve: pump?.migrated === true || (pump == null && codex != null),
+      isPostCurve:    pump?.migrated === true || (pump == null && codex != null),
+      isProPilot, isSerialDeployer, successRatePct,
+      proPilotBuffer: isProPilot && adjustedVolLiq >= 3 && adjustedVolLiq < 5,
     },
   };
 }

@@ -157,7 +157,8 @@ function formatVerdict(result, ca) {
     L.push(`${esc(watchReason)}`);
   } else if (verdict === 'BUY') {
     L.push(`🚀 ${b(`ORACLE VERDICT: ${tierName(entryTier)}`)}`);
-    L.push(`${b('BUY CANDIDATE')} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})`);
+    const bufferNote = signals.proPilotBuffer ? ` ${i('| PRO PILOT BUFFER (3x floor)')}` : '';
+    L.push(`${b('BUY CANDIDATE')} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})${bufferNote}`);
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
     L.push(`${esc(watchReason)}`);
@@ -233,6 +234,9 @@ function formatVerdict(result, ca) {
 
   L.push(b('── DEV TRUST ──'));
   L.push(`• ${b('Success Rate:')} ${esc(successRate)}`);
+  if (signals.isSerialDeployer) {
+    L.push(`• ${b('⚠️ Serial Deployer:')} ${dp.totalLaunches?.toLocaleString()} launches — elevated rug risk`);
+  }
   L.push(`• ${b('Peak Performance:')} ${esc(topPerf)}`);
   L.push(`• ${b('Status:')} ${esc(ctoStatusDisplay(ctoBehavior, dp.walletAge))}`);
   L.push('');
@@ -242,6 +246,8 @@ function formatVerdict(result, ca) {
   let holderDisplay;
   const effectiveCount = signals.holderCount ?? signals.topAccountCount ?? null;
   const isFloor = signals.holderCount == null && signals.topAccountCount != null;
+  // At MC < $100K, < 30% top10 is healthy (early float, concentrated holders normal)
+  const isSmallCap = mc != null && mc < 100000;
 
   if (effectiveCount !== null && mc > 0) {
     const target    = Math.round((mc / 100000) * 400);
@@ -260,15 +266,19 @@ function formatVerdict(result, ca) {
     }
   } else if (effectiveCount !== null) {
     holderDisplay = `${isFloor ? '≥' : ''}${effectiveCount} (MC unverified)`;
+  } else if (signals.top10Pct !== null && isSmallCap && signals.top10Pct <= 30) {
+    // No exact holder count, but top10 is clean on a small-cap — infer organic distribution
+    holderDisplay = `UNVERIFIED count | ✅ ORGANIC DISTRIBUTION (Top10 ${fmtPct(signals.top10Pct)})`;
   } else {
     holderDisplay = 'UNVERIFIED';
   }
 
   const top10Display = signals.top10Pct !== null
     ? `${fmtPct(signals.top10Pct)} (${esc(
-        signals.top10Pct > 35 ? 'HARD FAIL' :
-        signals.top10Pct > 25 ? 'ELEVATED'  :
-        signals.top10Pct > 15 ? 'MODERATE'  : 'NEUTRAL'
+        signals.top10Pct > 35                       ? 'HARD FAIL' :
+        (isSmallCap && signals.top10Pct <= 30)      ? 'HEALTHY'   :
+        signals.top10Pct > 25                       ? 'ELEVATED'  :
+        signals.top10Pct > 15                       ? 'MODERATE'  : 'NEUTRAL'
       )})`
     : `UNVERIFIED`;
 
