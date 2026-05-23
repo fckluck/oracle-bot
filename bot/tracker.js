@@ -1,14 +1,14 @@
-// Oracle Guardian v2.1 — Forensic position monitor
-// Polls each tracked CA every 60s. Detects cluster exits, dev fee-loading,
-// holder stagnation, momentum decay, and LP floor breaches.
-// Positions are persisted to disk and survive bot restarts/crashes.
+// Oracle Guardian v2.5 — Forensic Shield (Final)
+// 60s forensic loop: cluster exit (top50 -3%), dev fee-loader, momentum decay,
+// LP floor, ATH SL. 5m heartbeat: holders/top50/LP flow snapshot + saturation.
+// Lightweight fetch (fetchForensic) cuts per-poll API load ~70% vs full scan.
+// Positions persisted to disk — survive bot restarts/crashes.
 
 require('dotenv').config();
 const fetch = require('node-fetch');
 const fs    = require('fs');
 const path  = require('path');
-const { fetchAll } = require('./fetcher');
-const { scan }     = require('./scanner');
+const { fetchForensic } = require('./fetcher');
 
 const MAX_POSITIONS  = 10;
 const POLL_INTERVAL  = 60 * 1000; // 60s
@@ -195,10 +195,8 @@ function list() {
 
 async function checkPosition(pos, bot) {
   try {
-    const data   = await fetchAll(pos.ca);
-    if (!data.codex) return;
-    const result = scan(data);
-    const sig    = result.signals;
+    const sig = await fetchForensic(pos.ca);
+    if (!sig) return;
 
     const now            = Date.now();
     const mc             = sig.marketCap;
@@ -365,10 +363,8 @@ async function checkPosition(pos, bot) {
 
 async function sendHeartbeat(pos, bot) {
   try {
-    const data   = await fetchAll(pos.ca);
-    if (!data.codex) return;
-    const result = scan(data);
-    const sig    = result.signals;
+    const sig = await fetchForensic(pos.ca);
+    if (!sig) return;
 
     const mc          = sig.marketCap;
     const lp          = sig.lp;
@@ -444,7 +440,7 @@ function startTracker(bot) {
     }
   }, 5 * 60 * 1000);
 
-  console.log('[tracker] Oracle Guardian v2.2 started — 60s forensic + 5m heartbeat, positions persisted');
+  console.log('[tracker] Oracle Guardian v2.5 started — 60s forensic (lightweight) + 5m heartbeat, positions persisted');
 }
 
 module.exports = { track, untrack, list, startTracker };

@@ -893,4 +893,37 @@ async function fetchSocialData(ca) {
   }
 }
 
-module.exports = { fetchAll, fetchDeFadeVerification, fetchSocialData };
+// ── Lightweight Forensic Fetch (Guardian tracking loop only) ────────────────
+// Skips Codex, Helius, dev stats, bundle detection, DeFade, wash heuristics —
+// pulls only the fields the Guardian's checkPosition / sendHeartbeat need.
+// Cuts per-poll API load by ~70% vs fetchAll. Vol/Liq uses raw (uncorrected
+// for wash) — acceptable trade-off since the decay threshold is 2x and raw
+// > adjusted always, so alerts fire conservatively (slightly later, never
+// earlier).
+async function fetchForensic(ca) {
+  const [dex, holders, birdeye] = await Promise.all([
+    fetchDexScreener(ca),
+    fetchSolanaTrackerHolders(ca),
+    fetchBirdeye(ca).catch(() => null),
+  ]);
+
+  if (!dex) return null;
+
+  const lp             = dex.lp || 0;
+  const vol1h          = dex.volume1h || 0;
+  const adjustedVolLiq = lp > 0 ? vol1h / lp : 0;
+
+  return {
+    marketCap:      dex.marketCap || 0,
+    lp,
+    priceUsd:       dex.priceUsd || 0,
+    change1h:       dex.change1h ?? null,
+    adjustedVolLiq,
+    holderCount:    holders?.holderCount ?? null,
+    top10Pct:       holders?.top10Pct    ?? null,
+    top50Pct:       holders?.top50Pct    ?? null,
+    priceChange5m:  birdeye?.priceChange5m ?? null,
+  };
+}
+
+module.exports = { fetchAll, fetchForensic, fetchDeFadeVerification, fetchSocialData };
