@@ -186,21 +186,33 @@ bot.on('text', async ctx => {
 bot.on('callback_query', async ctx => {
   const data = ctx.callbackQuery?.data || '';
 
+  if (data.startsWith('untrack:')) {
+    const ca      = data.split(':')[1];
+    const removed = tracker.untrack(ca);
+    const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
+    await ctx.answerCbQuery(removed ? `❌ Stopped tracking ${shortCa}` : 'Not currently tracking this token');
+    return;
+  }
+
   if (data.startsWith('track:')) {
     const parts = data.split(':');
     const ca    = parts[1];
     const mc    = parseFloat(parts[2]) || 0;
 
-    // Quick re-scan to get entryTier and timeWindow
+    // Re-scan to get entryTier, timeWindow, devWallet, holderCount, top10Pct
     let entryTier = null, timeWindow = 'DISCOVERY';
+    let devWallet = null, holderCount = null, top10Pct = null;
     try {
       const scanData = await fetchAll(ca);
       const result   = scan(scanData);
-      entryTier  = result.entryTier;
-      timeWindow = result.timeWindow;
+      entryTier   = result.entryTier;
+      timeWindow  = result.timeWindow;
+      devWallet   = result.devProfile?.wallet   ?? null;
+      holderCount = result.signals?.holderCount ?? null;
+      top10Pct    = result.signals?.top10Pct    ?? null;
     } catch (_) {}
 
-    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow);
+    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct);
     const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
 
     if (added) {
