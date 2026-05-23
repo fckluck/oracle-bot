@@ -302,6 +302,7 @@ function scan(data) {
       change1h:       codex?.change1h     ?? null,
       holderCount, topAccountCount, top10Pct, holderSource,
       top3Pct:        holders?.top3Pct    ?? null,
+      top50Pct:       holders?.top50Pct   ?? null,
       curvePct, ctoDesc, timeWindow, bundle,
       birdeye: birdeye || null,
       bundleCount, isMeteora, deFadeScore, isDeFadeClean, sybilFunded,

@@ -16,10 +16,11 @@ const PERSIST_FILE   = path.join(__dirname, 'positions.json');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 // Map: ca -> {
-//   ca, chatId, entryMc, peakMc, trackedAt, entryTier, timeWindow,
+//   ca, chatId, entryMc, peakMc, entryLp, trackedAt, entryTier, timeWindow,
 //   devWallet,
-//   entryHolderCount, entryTop10Pct,
-//   holderSnapshots: [{ ts, count }],   // rolling 10m window
+//   entryHolderCount, entryTop10Pct, entryTop50Pct,
+//   holderSnapshots: [{ ts, count }],   // rolling 10m window for stagnation check
+//   top50Snapshots:  [{ ts, pct }],     // rolling 5m window for cluster exit
 //   alertedFlags: Set<string>,          // dedup — don't re-alert same signal
 // }
 const positions = new Map();
@@ -152,28 +153,30 @@ async function checkDevFeeLoader(devWallet) {
 
 // ── Position management ───────────────────────────────────────────────────────
 
-function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCount, top10Pct) {
+function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct, entryLp) {
   if (positions.size >= MAX_POSITIONS) {
     console.log(`[tracker] max positions (${MAX_POSITIONS}) reached`);
     return false;
   }
   if (positions.has(ca)) return false;
+  const now = Date.now();
   positions.set(ca, {
     ca, chatId,
     entryMc:          currentMc,
     peakMc:           currentMc,
-    trackedAt:        Date.now(),
+    entryLp:          entryLp    ?? null,
+    trackedAt:        now,
     entryTier:        entryTier  || 'UNKNOWN',
     timeWindow:       timeWindow || 'DISCOVERY',
     devWallet:        devWallet  || null,
     entryHolderCount: holderCount ?? null,
     entryTop10Pct:    top10Pct   ?? null,
-    holderSnapshots:  holderCount != null
-      ? [{ ts: Date.now(), count: holderCount }]
-      : [],
+    entryTop50Pct:    top50Pct   ?? null,
+    holderSnapshots:  holderCount != null ? [{ ts: now, count: holderCount }] : [],
+    top50Snapshots:   top50Pct   != null  ? [{ ts: now, pct: top50Pct }]     : [],
     alertedFlags: new Set(),
   });
-  console.log(`[tracker] tracking ${ca.slice(0,8)}... chatId=${chatId} mc=${currentMc} holders=${holderCount} top10=${top10Pct?.toFixed(1)}%`);
+  console.log(`[tracker] tracking ${ca.slice(0,8)}... mc=${fmtUsd(currentMc)} holders=${holderCount} top50=${top50Pct?.toFixed(1)}%`);
   saveToDisk();
   return true;
 }
@@ -197,41 +200,51 @@ async function checkPosition(pos, bot) {
     const result = scan(data);
     const sig    = result.signals;
 
+    const now            = Date.now();
     const mc             = sig.marketCap;
     const lp             = sig.lp;
-    const adjustedVolLiq = sig.adjustedVolLiq;  // was incorrectly `sig.volLiq` before
+    const adjustedVolLiq = sig.adjustedVolLiq;
     const top10Pct       = sig.top10Pct;
+    const top50Pct       = sig.top50Pct ?? null;
     const holderCount    = sig.holderCount;
 
     // Update ATH
     if (mc && mc > pos.peakMc) pos.peakMc = mc;
 
-    // Update holder snapshot (rolling 10m window)
+    // Update rolling holder snapshots (10m window — stagnation check)
     if (holderCount != null) {
-      pos.holderSnapshots.push({ ts: Date.now(), count: holderCount });
-      // Keep only last 10 minutes of snapshots
-      const tenMinAgo = Date.now() - 10 * 60 * 1000;
+      pos.holderSnapshots.push({ ts: now, count: holderCount });
+      const tenMinAgo = now - 10 * 60 * 1000;
       pos.holderSnapshots = pos.holderSnapshots.filter(s => s.ts >= tenMinAgo);
+    }
+
+    // Update rolling top50 snapshots (5m window — cluster exit check)
+    if (top50Pct != null) {
+      pos.top50Snapshots = pos.top50Snapshots || [];
+      pos.top50Snapshots.push({ ts: now, pct: top50Pct });
+      const fiveMinAgo = now - 5 * 60 * 1000;
+      pos.top50Snapshots = pos.top50Snapshots.filter(s => s.ts >= fiveMinAgo);
     }
 
     const slPct  = pos.timeWindow === 'DEAD_ZONE' ? 25 : 50;
     const alerts = [];
 
-    // ── A. Cluster exit — top10 concentration drop ──────────────────────────
-    // If top10Pct drops >5pp from entry AND price is falling, coordinated selling.
-    // (Full top-50 funder analysis would require ~50 RPC calls/min per position —
-    //  impractical on free tier. Top10 delta gives the same exit signal.)
+    // ── A. Top-50 Cluster Exit ───────────────────────────────────────────────
+    // Watches combined supply % held by top 50 wallets.
+    // If it drops >3% from the baseline snapshot, sub-wallets are coordinating an exit.
+    // Uses 5-minute rolling window to confirm the move is sustained (not a blip).
     if (
-      top10Pct !== null &&
-      pos.entryTop10Pct !== null &&
+      top50Pct !== null &&
+      pos.entryTop50Pct !== null &&
       !pos.alertedFlags.has('CLUSTER_EXIT')
     ) {
-      const top10Drop = pos.entryTop10Pct - top10Pct;
-      const priceFalling = sig.change1h !== null && sig.change1h < -10;
-      if (top10Drop >= 5 && priceFalling) {
+      const drop = pos.entryTop50Pct - top50Pct;
+      if (drop >= 3) {
         alerts.push(
-          `🚨 *CLUSTER EXIT* — Top 10 concentration dropped ${top10Drop.toFixed(1)}pp ` +
-          `(${pos.entryTop10Pct.toFixed(1)}% → ${top10Pct.toFixed(1)}%) while price falling\n→ *EXIT 75% NOW*`
+          `🚨 *CLUSTER EXIT DETECTED*\n` +
+          `Top 50 supply dropped *${drop.toFixed(1)}%* ` +
+          `(${pos.entryTop50Pct.toFixed(1)}% → ${top50Pct.toFixed(1)}%)\n` +
+          `Sub-wallets are coordinating an exit.\n→ *EXIT 100% NOW*`
         );
         pos.alertedFlags.add('CLUSTER_EXIT');
       }
@@ -242,44 +255,47 @@ async function checkPosition(pos, bot) {
       const fl = await checkDevFeeLoader(pos.devWallet);
       if (fl.detected) {
         alerts.push(
-          `🚨 *PRE-DUMP PREP* — Dev wallet loaded *${fl.uniqueDestinations}* sub-wallets with 0.01–0.1 SOL in the last 5 minutes\n→ *EXIT 100% NOW*`
+          `🚨 *PRE-DUMP PREP*\n` +
+          `Dev wallet loaded *${fl.uniqueDestinations}* sub-wallets with 0.01–0.1 SOL in the last 5 minutes\n→ *EXIT 100% NOW*`
         );
         pos.alertedFlags.add('FEE_LOADER');
       }
     }
 
-    // ── C. Community exhaustion — holder stagnation at ATH ──────────────────
+    // ── C. Saturation — holder stagnation at ATH ────────────────────────────
+    // Price at/near ATH but retail buy-side has stopped entering.
     if (
       pos.holderSnapshots.length >= 2 &&
       pos.peakMc > 0 &&
       mc > 0 &&
       !pos.alertedFlags.has('STAGNATION')
     ) {
-      const nearATH = mc >= pos.peakMc * 0.90; // within 10% of ATH
-      const oldest  = pos.holderSnapshots[0];
-      const newest  = pos.holderSnapshots[pos.holderSnapshots.length - 1];
+      const nearATH  = mc >= pos.peakMc * 0.90;
+      const oldest   = pos.holderSnapshots[0];
+      const newest   = pos.holderSnapshots[pos.holderSnapshots.length - 1];
       const windowMs = newest.ts - oldest.ts;
       if (nearATH && windowMs >= 8 * 60 * 1000 && oldest.count > 0) {
-        const holderGrowthPct = ((newest.count - oldest.count) / oldest.count) * 100;
-        if (holderGrowthPct < 1) {
+        const growthPct = ((newest.count - oldest.count) / oldest.count) * 100;
+        if (growthPct < 1) {
           alerts.push(
-            `⚠️ *COMMUNITY EXHAUSTION* — Price near ATH (${fmtUsd(mc)}) but holder growth ` +
-            `${holderGrowthPct.toFixed(2)}% over 10m (${oldest.count} → ${newest.count})\n→ *SECURE INITIALS*`
+            `🚨 *SATURATION DETECTED*\n` +
+            `Price near ATH (${fmtUsd(mc)}) but NO new buyers in last 10m\n` +
+            `Holder growth: ${growthPct.toFixed(2)}% (${oldest.count} → ${newest.count})\n→ *SECURE INITIALS / EXIT 75%*`
           );
           pos.alertedFlags.add('STAGNATION');
         }
       }
     }
 
-    // ── D. Momentum decay — adjusted vol/liq floor ──────────────────────────
+    // ── D. Momentum decay ───────────────────────────────────────────────────
     if (adjustedVolLiq !== null && adjustedVolLiq < 2.0 && !pos.alertedFlags.has('VOL_DECAY')) {
       alerts.push(
-        `⚠️ *MOMENTUM DECAY* — Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x (below 2x exit floor)\n→ *TRIM 75% NOW*`
+        `⚠️ *MOMENTUM DECAY*\nAdjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x — below 2x exit floor\n→ *TRIM 75% NOW*`
       );
       pos.alertedFlags.add('VOL_DECAY');
     }
 
-    // ── LP floor — hard exit ─────────────────────────────────────────────────
+    // ── LP floor ────────────────────────────────────────────────────────────
     if (lp > 0 && lp < 5000 && !pos.alertedFlags.has('LP_FLOOR')) {
       alerts.push(`🚨 *LP FLOOR HIT* — ${fmtUsd(lp)} (below $5K)\n→ *HARD EXIT 100%*`);
       pos.alertedFlags.add('LP_FLOOR');
@@ -293,61 +309,111 @@ async function checkPosition(pos, bot) {
           `🔴 *SL TRIGGERED* — ${retracePct.toFixed(1)}% retrace from ATH ${fmtUsd(pos.peakMc)}\n→ *EXIT MOON BAG (${slPct}% SL)*`
         );
         pos.alertedFlags.add('ATH_SL');
-        positions.delete(pos.ca); // auto-untrack
+        positions.delete(pos.ca);
         saveToDisk();
       }
     }
 
     if (alerts.length === 0) {
-      console.log(`[tracker] ${pos.ca.slice(0,8)}... OK — MC=${fmtUsd(mc)} Vol/Liq=${adjustedVolLiq?.toFixed(2)}x LP=${fmtUsd(lp)} holders=${holderCount}`);
+      console.log(`[tracker] ${pos.ca.slice(0,8)}... OK — MC=${fmtUsd(mc)} VolLiq=${adjustedVolLiq?.toFixed(2)}x LP=${fmtUsd(lp)} holders=${holderCount} top50=${top50Pct?.toFixed(1)}%`);
       return;
     }
 
-    // ── Alert UI ─────────────────────────────────────────────────────────────
-    const ageMin    = Math.floor((Date.now() - pos.trackedAt) / 60000);
-    const shortCa   = `${pos.ca.slice(0,6)}...${pos.ca.slice(-4)}`;
+    // ── Alert message ────────────────────────────────────────────────────────
+    const ageMin       = Math.floor((now - pos.trackedAt) / 60000);
+    const shortCa      = `${pos.ca.slice(0,6)}...${pos.ca.slice(-4)}`;
     const holdersAdded = (pos.entryHolderCount != null && holderCount != null)
-      ? holderCount - pos.entryHolderCount
-      : null;
+      ? holderCount - pos.entryHolderCount : null;
+    const top50Change  = (pos.entryTop50Pct != null && top50Pct != null)
+      ? (top50Pct - pos.entryTop50Pct) : null;
+    const lpChange     = (pos.entryLp != null && lp != null)
+      ? (lp - pos.entryLp) : null;
 
-    const header = [
+    const lines = [
       `🛡️ *ORACLE GUARDIAN ALERT*`,
-      `CA: \`${shortCa}\` | Since: ${ageMin}m ago`,
+      `CA: \`${shortCa}\` | Tracking: ${ageMin}m`,
       ``,
       `── *LIVE DIVERGENCE* ──`,
       `• *MC:* ${fmtUsd(mc)} | ATH: ${fmtUsd(pos.peakMc)}`,
-      `• *LP:* ${fmtUsd(lp)}`,
-      holdersAdded !== null
-        ? `• *Holders Added:* ${holdersAdded >= 0 ? '+' : ''}${holdersAdded} (since tracking)`
-        : null,
-      top10Pct !== null
-        ? `• *Top 10 Concentration:* ${top10Pct.toFixed(1)}%${pos.entryTop10Pct != null ? ` (was ${pos.entryTop10Pct.toFixed(1)}% at entry)` : ''}`
-        : null,
+      `• *LP:* ${fmtUsd(lp)}${lpChange != null ? ` (${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} since entry)` : ''}`,
+      holdersAdded != null ? `• *Holders Added:* ${holdersAdded >= 0 ? '+' : ''}${holdersAdded}` : null,
+      top50Change  != null ? `• *Top 50 Change:* ${top50Change >= 0 ? '+' : ''}${top50Change.toFixed(1)}% (now ${top50Pct.toFixed(1)}%)` : null,
       ``,
       `── *VELOCITY* ──`,
       `• *Adjusted Vol/Liq:* ${adjustedVolLiq != null ? adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}`,
       sig.change1h != null ? `• *Price Δ (1H):* ${fmtChange(sig.change1h)}` : null,
-    ].filter(Boolean).join('\n');
+      ``,
+      alerts.join('\n\n'),
+    ].filter(l => l !== null).join('\n');
 
-    const body = alerts.join('\n\n');
-    const footer = `\n\n📈 [Chart](https://dexscreener.com/solana/${pos.ca})`;
-
-    await bot.telegram.sendMessage(
-      pos.chatId,
-      header + '\n\n' + body + footer,
-      {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '📈 VIEW CHART',   url: `https://dexscreener.com/solana/${pos.ca}` },
-            { text: '❌ STOP TRACKING', callback_data: `untrack:${pos.ca}` },
-          ]],
-        },
-      }
-    );
+    await bot.telegram.sendMessage(pos.chatId, lines, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '📈 VIEW CHART',    url: `https://dexscreener.com/solana/${pos.ca}` },
+          { text: '❌ STOP TRACKING', callback_data: `untrack:${pos.ca}` },
+        ]],
+      },
+    });
 
   } catch (e) {
     console.error(`[tracker] error checking ${pos.ca.slice(0,8)}:`, e.message);
+  }
+}
+
+// ── Heartbeat (every 5 minutes) ───────────────────────────────────────────────
+
+async function sendHeartbeat(pos, bot) {
+  try {
+    const data   = await fetchAll(pos.ca);
+    if (!data.codex) return;
+    const result = scan(data);
+    const sig    = result.signals;
+
+    const mc          = sig.marketCap;
+    const lp          = sig.lp;
+    const holderCount = sig.holderCount;
+    const top50Pct    = sig.top50Pct ?? null;
+
+    if (mc && mc > pos.peakMc) pos.peakMc = mc;
+
+    const ageMin       = Math.floor((Date.now() - pos.trackedAt) / 60000);
+    const shortCa      = `${pos.ca.slice(0,6)}...${pos.ca.slice(-4)}`;
+    const holdersAdded = (pos.entryHolderCount != null && holderCount != null)
+      ? holderCount - pos.entryHolderCount : null;
+    const top50Change  = (pos.entryTop50Pct != null && top50Pct != null)
+      ? (top50Pct - pos.entryTop50Pct) : null;
+    const lpChange     = (pos.entryLp != null && lp != null)
+      ? (lp - pos.entryLp) : null;
+
+    const lines = [
+      `🛡️ *GUARDIAN HEARTBEAT*`,
+      `CA: \`${shortCa}\` | ${ageMin}m tracked`,
+      ``,
+      holdersAdded != null
+        ? `• *Holders Added:* ${holdersAdded >= 0 ? '+' : ''}${holdersAdded}`
+        : `• *Holders:* ${holderCount ?? 'N/A'}`,
+      top50Change != null
+        ? `• *Top 50 Change:* ${top50Change >= 0 ? '+' : ''}${top50Change.toFixed(1)}% (now ${top50Pct.toFixed(1)}%)`
+        : `• *Top 50:* ${top50Pct != null ? top50Pct.toFixed(1) + '%' : 'N/A'}`,
+      lpChange != null
+        ? `• *LP Flow:* ${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} → ${fmtUsd(lp)}`
+        : `• *LP:* ${fmtUsd(lp)}`,
+      `• *MC:* ${fmtUsd(mc)} | ATH: ${fmtUsd(pos.peakMc)}`,
+      `• *Vol/Liq:* ${sig.adjustedVolLiq != null ? sig.adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}`,
+    ].join('\n');
+
+    await bot.telegram.sendMessage(pos.chatId, lines, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '📈 VIEW CHART',    url: `https://dexscreener.com/solana/${pos.ca}` },
+          { text: '❌ STOP TRACKING', callback_data: `untrack:${pos.ca}` },
+        ]],
+      },
+    });
+  } catch (e) {
+    console.error(`[tracker] heartbeat error ${pos.ca.slice(0,8)}:`, e.message);
   }
 }
 
@@ -355,6 +421,8 @@ async function checkPosition(pos, bot) {
 
 function startTracker(bot) {
   loadFromDisk();
+
+  // Forensic scan — every 60s
   setInterval(async () => {
     if (positions.size === 0) return;
     console.log(`[tracker] Guardian poll — ${positions.size} position(s)`);
@@ -364,7 +432,19 @@ function startTracker(bot) {
       await new Promise(r => setTimeout(r, 2000));
     }
   }, POLL_INTERVAL);
-  console.log('[tracker] Oracle Guardian v2.1 started — polling every 60s, positions persisted to disk');
+
+  // Heartbeat — every 5 minutes
+  setInterval(async () => {
+    if (positions.size === 0) return;
+    console.log(`[tracker] Heartbeat — ${positions.size} position(s)`);
+    const snapshot = [...positions.values()];
+    for (const pos of snapshot) {
+      await sendHeartbeat(pos, bot);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }, 5 * 60 * 1000);
+
+  console.log('[tracker] Oracle Guardian v2.2 started — 60s forensic + 5m heartbeat, positions persisted');
 }
 
 module.exports = { track, untrack, list, startTracker };

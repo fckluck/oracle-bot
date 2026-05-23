@@ -105,10 +105,11 @@ async function fetchSolanaTrackerHolders(ca) {
     const total = typeof data?.total === 'number' ? data.total : null;
     if (!total) return null;
     const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
-    const top10Pct = accounts.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0) || null;
     const top3Pct  = accounts.slice(0, 3).reduce((s, a)  => s + (a.percentage || 0), 0) || null;
-    console.log(`[fetchSolanaTrackerHolders] total=${total} top10=${top10Pct?.toFixed(1)}% top3=${top3Pct?.toFixed(1)}%`);
-    return { holderCount: total, top10Pct, top3Pct, source: 'solanatracker-holders' };
+    const top10Pct = accounts.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0) || null;
+    const top50Pct = accounts.slice(0, 50).reduce((s, a) => s + (a.percentage || 0), 0) || null;
+    console.log(`[fetchSolanaTrackerHolders] total=${total} top10=${top10Pct?.toFixed(1)}% top50=${top50Pct?.toFixed(1)}%`);
+    return { holderCount: total, top3Pct, top10Pct, top50Pct, source: 'solanatracker-holders' };
   } catch (e) { console.error('[fetchSolanaTrackerHolders] error:', e.message); return null; }
 }
 

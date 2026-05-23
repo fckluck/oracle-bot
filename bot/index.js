@@ -201,7 +201,7 @@ bot.on('callback_query', async ctx => {
 
     // Re-scan to get entryTier, timeWindow, devWallet, holderCount, top10Pct
     let entryTier = null, timeWindow = 'DISCOVERY';
-    let devWallet = null, holderCount = null, top10Pct = null;
+    let devWallet = null, holderCount = null, top10Pct = null, top50Pct = null;
     try {
       const scanData = await fetchAll(ca);
       const result   = scan(scanData);
@@ -210,9 +210,10 @@ bot.on('callback_query', async ctx => {
       devWallet   = result.devProfile?.wallet   ?? null;
       holderCount = result.signals?.holderCount ?? null;
       top10Pct    = result.signals?.top10Pct    ?? null;
+      top50Pct    = result.signals?.top50Pct    ?? null;
     } catch (_) {}
 
-    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct);
+    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct);
     const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
 
     if (added) {
