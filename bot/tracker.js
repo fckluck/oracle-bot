@@ -1,14 +1,18 @@
-// Oracle Guardian v2.0 — Forensic position monitor
+// Oracle Guardian v2.1 — Forensic position monitor
 // Polls each tracked CA every 60s. Detects cluster exits, dev fee-loading,
 // holder stagnation, momentum decay, and LP floor breaches.
+// Positions are persisted to disk and survive bot restarts/crashes.
 
 require('dotenv').config();
 const fetch = require('node-fetch');
+const fs    = require('fs');
+const path  = require('path');
 const { fetchAll } = require('./fetcher');
 const { scan }     = require('./scanner');
 
-const MAX_POSITIONS = 10;
-const POLL_INTERVAL = 60 * 1000; // 60s
+const MAX_POSITIONS  = 10;
+const POLL_INTERVAL  = 60 * 1000; // 60s
+const PERSIST_FILE   = path.join(__dirname, 'positions.json');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 // Map: ca -> {
@@ -19,6 +23,38 @@ const POLL_INTERVAL = 60 * 1000; // 60s
 //   alertedFlags: Set<string>,          // dedup — don't re-alert same signal
 // }
 const positions = new Map();
+
+// ── Persistence ───────────────────────────────────────────────────────────────
+
+function saveToDisk() {
+  try {
+    const serializable = [...positions.values()].map(p => ({
+      ...p,
+      alertedFlags: [...p.alertedFlags],  // Set → Array for JSON
+    }));
+    fs.writeFileSync(PERSIST_FILE, JSON.stringify(serializable, null, 2));
+  } catch (e) {
+    console.error('[tracker] save error:', e.message);
+  }
+}
+
+function loadFromDisk() {
+  try {
+    if (!fs.existsSync(PERSIST_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(PERSIST_FILE, 'utf8'));
+    if (!Array.isArray(raw)) return;
+    for (const p of raw) {
+      p.alertedFlags    = new Set(p.alertedFlags || []);
+      p.holderSnapshots = p.holderSnapshots || [];
+      positions.set(p.ca, p);
+    }
+    if (positions.size > 0) {
+      console.log(`[tracker] loaded ${positions.size} position(s) from disk`);
+    }
+  } catch (e) {
+    console.error('[tracker] load error:', e.message);
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -138,11 +174,14 @@ function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCo
     alertedFlags: new Set(),
   });
   console.log(`[tracker] tracking ${ca.slice(0,8)}... chatId=${chatId} mc=${currentMc} holders=${holderCount} top10=${top10Pct?.toFixed(1)}%`);
+  saveToDisk();
   return true;
 }
 
 function untrack(ca) {
-  return positions.delete(ca);
+  const removed = positions.delete(ca);
+  if (removed) saveToDisk();
+  return removed;
 }
 
 function list() {
@@ -255,6 +294,7 @@ async function checkPosition(pos, bot) {
         );
         pos.alertedFlags.add('ATH_SL');
         positions.delete(pos.ca); // auto-untrack
+        saveToDisk();
       }
     }
 
@@ -314,6 +354,7 @@ async function checkPosition(pos, bot) {
 // ── Guardian loop ─────────────────────────────────────────────────────────────
 
 function startTracker(bot) {
+  loadFromDisk();
   setInterval(async () => {
     if (positions.size === 0) return;
     console.log(`[tracker] Guardian poll — ${positions.size} position(s)`);
@@ -323,7 +364,7 @@ function startTracker(bot) {
       await new Promise(r => setTimeout(r, 2000));
     }
   }, POLL_INTERVAL);
-  console.log('[tracker] Oracle Guardian v2.0 started — polling every 60s');
+  console.log('[tracker] Oracle Guardian v2.1 started — polling every 60s, positions persisted to disk');
 }
 
 module.exports = { track, untrack, list, startTracker };
