@@ -8,6 +8,7 @@ const PUMPPORTAL_USER = 'https://pumpportal.fun/api/data/user-stats?user=';
 const JUPITER_PRICE   = 'https://price.jup.ag/v4/price?ids=';
 const SOLANA_RPC      = 'https://api.mainnet-beta.solana.com';
 const BIRDEYE_BASE    = 'https://public-api.birdeye.so';
+const SOCIALDATA_BASE = 'https://api.socialdata.tools';
 
 function heliusRpc() {
   const key = process.env.HELIUS_API_KEY;
@@ -839,4 +840,56 @@ async function fetchAll(ca) {
   return { codex, pump, holders, bundle, devStats, devPeak, walletAge, devWallet, birdeye, deFadeScore: null, stToken, stDeployer, washPct, washVolumeUsd, washSource, snipersPct, insidersPct, stRiskScore };
 }
 
-module.exports = { fetchAll, fetchDeFadeVerification };
+// ── SocialData — X/Twitter CA mention velocity (15m window) ──────────────────
+// Searches for the contract address as a literal string on X.
+// Returns: { mentions15m, uniqueAccounts, isTrending, ctoSignal, available }
+// ctoSignal = true if 3+ unique accounts used "CTO" or "takeover" keywords.
+// isTrending = true if mentions >= 30 in 15m.
+// Falls back gracefully when key is absent or API is down.
+
+async function fetchSocialData(ca) {
+  const key = process.env.SOCIALDATA_API_KEY;
+  if (!key) return { available: false };
+  try {
+    // Search recent tweets containing the CA — returns up to 100 results per page
+    const query    = encodeURIComponent(`"${ca}" -is:retweet`);
+    const sinceMs  = Date.now() - 15 * 60 * 1000;
+    const sinceISO = new Date(sinceMs).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const url      = `${SOCIALDATA_BASE}/twitter/search?query=${query}&type=Latest&since=${sinceISO}`;
+
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${key}`, 'Accept': 'application/json' },
+      timeout: 8000,
+    });
+    if (!res.ok) {
+      console.log(`[fetchSocialData] HTTP ${res.status}`);
+      return { available: false };
+    }
+    const data = await res.json();
+    const tweets = Array.isArray(data?.tweets) ? data.tweets : [];
+
+    const uniqueAccounts = new Set(tweets.map(t => t.user?.id_str || t.user?.screen_name)).size;
+    const mentions15m    = tweets.length;
+
+    // CTO signal: 3+ unique accounts using CTO / takeover keywords
+    const ctoKeywords = ['cto', 'takeover', 'take over', 'community takeover', 'no dev'];
+    const ctoAccounts = new Set(
+      tweets
+        .filter(t => {
+          const text = (t.full_text || t.text || '').toLowerCase();
+          return ctoKeywords.some(kw => text.includes(kw));
+        })
+        .map(t => t.user?.id_str || t.user?.screen_name)
+    );
+    const ctoSignal = ctoAccounts.size >= 3;
+
+    const isTrending = mentions15m >= 30;
+    console.log(`[fetchSocialData] mentions15m=${mentions15m} unique=${uniqueAccounts} trending=${isTrending} cto=${ctoSignal}`);
+    return { available: true, mentions15m, uniqueAccounts, isTrending, ctoSignal };
+  } catch (e) {
+    console.error('[fetchSocialData] error:', e.message);
+    return { available: false };
+  }
+}
+
+module.exports = { fetchAll, fetchDeFadeVerification, fetchSocialData };

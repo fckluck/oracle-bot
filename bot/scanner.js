@@ -244,6 +244,28 @@ function scan(data) {
     verdict = 'SKIP';
   }
 
+  // ── Social Breakout upgrade (additive, never lowers math floor) ───────────
+  // Rules:
+  //   1. WATCH_VOL (3x-5x) → BASELINE_ENTRY if social breakout detected
+  //   2. Math floor stays locked: SKIP (<3x) cannot be upgraded regardless
+  //   3. Hard NO_GO / AVOID / WATCH_WASH kills are never overridden
+  const social = data.social ?? null;
+  const socialBreakout = social?.available && social?.isTrending;
+  const socialCto      = social?.available && social?.ctoSignal;
+
+  // Social CTO: X community is calling a takeover from 3+ unique accounts.
+  // Overrides the on-chain CTO detection — visible in scorecard but doesn't
+  // change verdict on its own (only the WATCH upgrade rule triggers a verdict change).
+  const effectiveCto = ctoBehavior === 'CTO_CONFIRMED' || ctoBehavior === 'CTO_LIKELY' || socialCto;
+
+  let socialUpgrade = false;
+  if (verdict === 'WATCH_VOL' && socialBreakout) {
+    verdict       = 'BUY';
+    entryTier     = 'BASELINE_ENTRY';
+    watchReason   = null;
+    socialUpgrade = true;
+  }
+
   const positionUnits   = getPositionUnits(entryTier, lp, mc);
   const positionSizeSol = +(config.SESSION_SIZE_SOL * positionUnits).toFixed(3);
   const scribbliSlippageWarning = entryTier === 'SCRIBBLI' && mc > 0 && (lp / mc) * 100 < 15;
@@ -265,6 +287,7 @@ function scan(data) {
     positionSizeSol, positionUnits, scribbliSlippageWarning,
     pressureLabel, momentumStatus, ctoBehavior,
     devProfile,
+    socialUpgrade, socialBreakout, socialCto, effectiveCto,
     signals: {
       lp, ageMinutes: ageMins,
       volume1h:       codex?.volume1h     ?? null,

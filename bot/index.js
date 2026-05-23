@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
-const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
+const { fetchAll, fetchDeFadeVerification, fetchSocialData } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
 const tracker = require('./tracker');
@@ -125,7 +125,12 @@ bot.on('text', async ctx => {
   const scanning = await ctx.replyWithHTML(`🔍 Scanning <code>${ca}</code>...`);
 
   try {
-    const data = await fetchAll(ca);
+    // Social fetch runs in parallel with the main data fetch to avoid adding latency.
+    // fetchAll is the expensive chain; social is a single fast endpoint.
+    const [data, social] = await Promise.all([
+      fetchAll(ca),
+      fetchSocialData(ca),
+    ]);
 
     if (!data.codex && !data.pump) {
       await ctx.telegram.editMessageText(
@@ -136,7 +141,13 @@ bot.on('text', async ctx => {
       return;
     }
 
+    // Attach social data to the fetchAll result so scanner can read it
+    data.social = social;
+
     const result  = scan(data);
+
+    // Attach social data to result so verdict formatter can render GROK NARRATIVE
+    result.social = social;
 
     // Post-scan DeFade verification — only on BUY candidates (free-plan quota).
     if (result.verdict === 'BUY') {

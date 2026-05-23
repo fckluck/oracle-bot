@@ -125,6 +125,7 @@ function formatVerdict(result, ca) {
     positionSizeSol, positionUnits, scribbliSlippageWarning,
     pressureLabel, momentumStatus, ctoBehavior,
     devProfile, signals,
+    socialUpgrade, socialBreakout, socialCto, effectiveCto,
   } = result;
 
   const mc            = signals.marketCap;
@@ -157,8 +158,10 @@ function formatVerdict(result, ca) {
     L.push(`${esc(watchReason)}`);
   } else if (verdict === 'BUY') {
     L.push(`🚀 ${b(`ORACLE VERDICT: ${tierName(entryTier)}`)}`);
-    const bufferNote = signals.proPilotBuffer ? ` ${i('| PRO PILOT BUFFER (3x floor)')}` : '';
-    L.push(`${b('BUY CANDIDATE')} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})${bufferNote}`);
+    const bufferNote  = signals.proPilotBuffer ? ` ${i('| PRO PILOT BUFFER (3x floor)')}` : '';
+    const socialNote  = socialUpgrade          ? ` ${i('| SOCIAL BREAKOUT UPGRADE')}` : '';
+    const socialCtoNote = !socialUpgrade && socialCto && effectiveCto ? ` ${i('| SOCIAL CTO DETECTED')}` : '';
+    L.push(`${b('BUY CANDIDATE')} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})${bufferNote}${socialNote}${socialCtoNote}`);
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
     L.push(`${esc(watchReason)}`);
@@ -296,6 +299,29 @@ function formatVerdict(result, ca) {
   L.push(`• ${b('Top 10:')} ${top10Display}`);
   L.push(`• ${b('Curve:')} ${curveDisplay}`);
   L.push('');
+
+  // ── GROK NARRATIVE (SocialData — always shown when available) ─────────────
+  const social = result.social ?? null;
+  if (social?.available) {
+    const trendIcon    = social.isTrending ? '🔥' : '🟡';
+    const trendLabel   = social.isTrending ? 'SOCIAL BREAKOUT' : 'NEUTRAL';
+    const velocityNote = social.isTrending ? ' ↗ Trending' : '';
+    L.push(b('── GROK NARRATIVE ──'));
+    L.push(`• ${b('Social Velocity:')} ${trendIcon} ${social.mentions15m} mentions / 15m${velocityNote} | ${social.uniqueAccounts} unique accounts`);
+    if (socialCto) {
+      L.push(`• ${b('CTO Signal:')} ✅ SOCIAL VERIFIED (${social.ctoSignal ? '3+' : '0'} accounts calling takeover)`);
+    }
+    if (socialUpgrade) {
+      L.push(`• ${b('Verdict Impact:')} ✅ WATCH → BUY CANDIDATE — social breakout confirmed volume intent`);
+    } else if (social.isTrending && verdict !== 'BUY') {
+      L.push(`• ${b('Verdict Impact:')} 🟡 Trending but math floor not met — monitor closely`);
+    } else if (social.isTrending) {
+      L.push(`• ${b('Verdict Impact:')} ✅ Narrative confirms volume`);
+    } else {
+      L.push(`• ${b('Verdict Impact:')} ⚪ No social breakout detected`);
+    }
+    L.push('');
+  }
 
   // ── VERIFICATION (DeFade, BUY candidates only) ────────────────────────────
   const dv = result.deFadeVerification;
