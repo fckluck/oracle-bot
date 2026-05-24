@@ -153,6 +153,91 @@ async function checkDevFeeLoader(devWallet) {
 
 // ── Position management ───────────────────────────────────────────────────────
 
+// ── Baseline establishment (with retry) ───────────────────────────────────────
+// If the API returns null at TRACK time, retry every 10s for up to 2 minutes.
+// Sends a "pending" message immediately, then a confirmation once baseline is set.
+// Also used by the /sync command to manually re-establish a missed baseline.
+
+async function establishBaseline(pos, bot, { silent = false } = {}) {
+  const shortCa = `${pos.ca.slice(0,6)}...${pos.ca.slice(-4)}`;
+  const MAX_ATTEMPTS = 12; // 12 × 10s = 2 min
+  let pendingMsgId = null;
+
+  if (!silent) {
+    try {
+      const sent = await bot.telegram.sendMessage(
+        pos.chatId,
+        `🔄 *GUARDIAN BASELINE PENDING*\n\`${shortCa}\` — Holder data unavailable at entry. Retrying every 10s (up to 2 min)...`,
+        { parse_mode: 'Markdown' }
+      );
+      pendingMsgId = sent.message_id;
+    } catch (_) {}
+  }
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    await new Promise(r => setTimeout(r, 10_000));
+    const pos2 = positions.get(pos.ca);
+    if (!pos2) return; // untracked while waiting
+
+    // Already set by a concurrent poll
+    if (pos2.entryTop50Pct !== null && pos2.entryHolderCount !== null) {
+      console.log(`[tracker] baseline already set for ${pos.ca.slice(0,8)}, skipping retry`);
+      return;
+    }
+
+    try {
+      const sig = await fetchForensic(pos.ca);
+      if (!sig) continue;
+
+      const now = Date.now();
+      if (sig.holderCount != null) {
+        pos2.entryHolderCount = sig.holderCount;
+        pos2.holderSnapshots  = [{ ts: now, count: sig.holderCount }];
+      }
+      if (sig.top10Pct != null) pos2.entryTop10Pct = sig.top10Pct;
+      if (sig.top50Pct != null) {
+        pos2.entryTop50Pct = sig.top50Pct;
+        pos2.top50Snapshots = [{ ts: now, pct: sig.top50Pct }];
+      }
+
+      if (pos2.entryTop50Pct !== null && pos2.entryHolderCount !== null) {
+        saveToDisk();
+        console.log(`[tracker] baseline established for ${pos.ca.slice(0,8)} — holders=${pos2.entryHolderCount} top50=${pos2.entryTop50Pct.toFixed(1)}%`);
+        const confirmText =
+          `✅ *GUARDIAN BASELINE SET*\n` +
+          `\`${shortCa}\`\n` +
+          `• Holders: ${pos2.entryHolderCount}\n` +
+          `• Top 50: ${pos2.entryTop50Pct.toFixed(1)}%\n` +
+          `_Cluster exit and saturation triggers now active._`;
+        if (pendingMsgId) {
+          try {
+            await bot.telegram.editMessageText(pos.chatId, pendingMsgId, undefined, confirmText, { parse_mode: 'Markdown' });
+          } catch (_) {
+            await bot.telegram.sendMessage(pos.chatId, confirmText, { parse_mode: 'Markdown' });
+          }
+        } else {
+          await bot.telegram.sendMessage(pos.chatId, confirmText, { parse_mode: 'Markdown' });
+        }
+        return;
+      }
+    } catch (e) {
+      console.error(`[tracker] baseline retry ${attempt} error:`, e.message);
+    }
+  }
+
+  // All retries exhausted
+  if (pendingMsgId) {
+    try {
+      await bot.telegram.editMessageText(
+        pos.chatId, pendingMsgId, undefined,
+        `⚠️ *GUARDIAN BASELINE UNAVAILABLE*\n\`${shortCa}\` — Holder API didn't respond in 2 min.\nUse /sync to retry manually.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
+  }
+  console.log(`[tracker] baseline retries exhausted for ${pos.ca.slice(0,8)}`);
+}
+
 function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct, entryLp) {
   if (positions.size >= MAX_POSITIONS) {
     console.log(`[tracker] max positions (${MAX_POSITIONS}) reached`);
@@ -160,7 +245,7 @@ function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCo
   }
   if (positions.has(ca)) return false;
   const now = Date.now();
-  positions.set(ca, {
+  const pos = {
     ca, chatId,
     entryMc:          currentMc,
     peakMc:           currentMc,
@@ -175,10 +260,38 @@ function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCo
     holderSnapshots:  holderCount != null ? [{ ts: now, count: holderCount }] : [],
     top50Snapshots:   top50Pct   != null  ? [{ ts: now, pct: top50Pct }]     : [],
     alertedFlags: new Set(),
-  });
+  };
+  positions.set(ca, pos);
   console.log(`[tracker] tracking ${ca.slice(0,8)}... mc=${fmtUsd(currentMc)} holders=${holderCount} top50=${top50Pct?.toFixed(1)}%`);
   saveToDisk();
   return true;
+}
+
+// Called after track() returns true — triggers baseline retry if fields are missing.
+// Must be called with the bot instance from the caller (index.js).
+function maybeEstablishBaseline(ca, bot) {
+  const pos = positions.get(ca);
+  if (!pos) return;
+  if (pos.entryTop50Pct === null || pos.entryHolderCount === null) {
+    establishBaseline(pos, bot); // fire-and-forget
+  }
+}
+
+// ── Manual sync ───────────────────────────────────────────────────────────────
+// Re-runs baseline establishment for a tracked position. Used by /sync command.
+async function syncBaseline(ca, chatId, bot) {
+  const pos = positions.get(ca);
+  if (!pos) return { found: false };
+  if (pos.chatId !== chatId) return { found: false }; // security: only the tracker's chat
+  await bot.telegram.sendMessage(chatId, `🔄 *SYNC STARTED* — Re-fetching baseline for \`${ca.slice(0,6)}...${ca.slice(-4)}\``, { parse_mode: 'Markdown' });
+  // Reset so establishBaseline doesn't early-exit due to already-set fields
+  pos.entryHolderCount = null;
+  pos.entryTop10Pct    = null;
+  pos.entryTop50Pct    = null;
+  pos.holderSnapshots  = [];
+  pos.top50Snapshots   = [];
+  await establishBaseline(pos, bot, { silent: true });
+  return { found: true };
 }
 
 function untrack(ca) {
@@ -443,4 +556,4 @@ function startTracker(bot) {
   console.log('[tracker] Oracle Guardian v2.5 started — 60s forensic (lightweight) + 5m heartbeat, positions persisted');
 }
 
-module.exports = { track, untrack, list, startTracker };
+module.exports = { track, untrack, list, startTracker, maybeEstablishBaseline, syncBaseline };

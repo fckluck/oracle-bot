@@ -91,10 +91,25 @@ bot.command('huntstatus', ctx => {
 bot.command('tracking', ctx => {
   const positions = tracker.list();
   if (!positions.length) return ctx.reply('No positions currently tracked.');
-  const lines = positions.map((p, i) =>
-    `${i+1}. <code>${p.ca.slice(0,8)}...</code> — entry MC: $${(p.entryMc/1000).toFixed(1)}K | peak: $${(p.peakMc/1000).toFixed(1)}K`
-  );
-  return ctx.replyWithHTML(`<b>Tracked Positions (${positions.length}):</b>\n\n${lines.join('\n')}`);
+  const lines = positions.map((p, i) => {
+    const baselineOk = p.entryTop50Pct !== null && p.entryHolderCount !== null;
+    return `${i+1}. <code>${p.ca.slice(0,8)}...</code> — entry MC: $${(p.entryMc/1000).toFixed(1)}K | peak: $${(p.peakMc/1000).toFixed(1)}K${baselineOk ? '' : ' ⚠️ baseline pending'}`;
+  });
+  return ctx.replyWithHTML(`<b>Tracked Positions (${positions.length}):</b>\n\n${lines.join('\n')}\n\n<i>Use /sync &lt;CA&gt; to re-establish a pending baseline.</i>`);
+});
+
+bot.command('sync', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const ca    = parts[1];
+  if (!ca || !isSolanaCA(ca)) {
+    // Show which tracked positions have a pending baseline
+    const pending = tracker.list().filter(p => p.entryTop50Pct === null || p.entryHolderCount === null);
+    if (!pending.length) return ctx.reply('All tracked positions have baselines set. Nothing to sync.');
+    const lines = pending.map(p => `• <code>${p.ca}</code>`).join('\n');
+    return ctx.replyWithHTML(`<b>Pending baselines:</b>\n${lines}\n\nUsage: /sync &lt;CA&gt;`);
+  }
+  const result = await tracker.syncBaseline(ca, ctx.chat.id, bot);
+  if (!result.found) return ctx.reply(`CA not found in your tracked positions.`);
 });
 
 bot.command('window', ctx => {
@@ -218,11 +233,17 @@ bot.on('callback_query', async ctx => {
 
     if (added) {
       await ctx.answerCbQuery(`✅ Tracking ${shortCa} — Guardian active`);
+      const baselineReady = top50Pct !== null && holderCount !== null;
       await ctx.telegram.sendMessage(
         ctx.chat.id,
-        `🔔 *Oracle Guardian activated*\nTracking \`${shortCa}\`\nEntry MC: $${(mc/1000).toFixed(1)}K\n\nI'll alert you on exit triggers every 60s.`,
+        `🔔 *Oracle Guardian activated*\nTracking \`${shortCa}\`\nEntry MC: $${(mc/1000).toFixed(1)}K\n` +
+        (baselineReady
+          ? `Baseline: ${holderCount} holders | Top 50: ${top50Pct.toFixed(1)}%\n\nAll triggers active. Forensic scan every 60s.`
+          : `\n⏳ Holder data pending — establishing baseline in background...`),
         { parse_mode: 'Markdown' }
       );
+      // If holder/top50 data was null at entry, retry in background until set
+      tracker.maybeEstablishBaseline(ca, bot);
     } else {
       const reason = tracker.list().length >= 10
         ? 'max 10 positions reached'
