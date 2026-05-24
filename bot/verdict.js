@@ -210,6 +210,49 @@ function formatVerdict(result, ca) {
   L.push(`• ${b('Parent Funding:')} ${esc(parentFundingDisplay(signals.bundle))}`);
   L.push('');
 
+  // ── ENTRY STRATEGY (BUY only) ──────────────────────────────────────────────
+  // Uses 1H OHLCV range from Birdeye to compute Fibonacci 0.618 dip-buy target.
+  // Zone B = (high1h - low1h) * 0.618 + low1h  (61.8% from low — optimal fill).
+  // Safety floor = 1H Low. Invalidation below floor.
+
+  if (verdict === 'BUY') {
+    const birdeyeData = signals.birdeye;
+    const high1h  = birdeyeData?.high1h  ?? null;
+    const low1h   = birdeyeData?.low1h   ?? null;
+    const px      = signals.priceUsd ?? 0;
+
+    if (high1h != null && low1h != null && high1h > low1h && px > 0) {
+      const zoneB = low1h + (high1h - low1h) * 0.618;
+      const isBreakout = px >= zoneB;
+      const statusLabel = isBreakout ? '🟢 BREAKOUT' : '🟡 RE-ACCUMULATING';
+
+      // R:R relative to Zone B entry (capped to avoid nonsensical values)
+      const riskToFloor  = Math.max(zoneB - low1h, 0);
+      const rewardToHigh = Math.max(high1h - zoneB, 0);
+      const rr = riskToFloor > 0 ? (rewardToHigh / riskToFloor) : null;
+      const rrLabel = rr != null ? `1:${rr.toFixed(1)}` : 'N/A';
+
+      // Verdict line
+      let actionLabel;
+      if (isBreakout) {
+        actionLabel = 'Market Buy 50% here. Set limit for Zone B fill.';
+      } else {
+        actionLabel = 'Wait for Zone B fill. Heavy limit at optimal entry.';
+      }
+
+      const fmtPx = (n) => n < 0.001 ? n.toExponential(3) : n < 1 ? n.toFixed(5) : n.toFixed(4);
+
+      L.push(b('── ENTRY STRATEGY ──'));
+      L.push(`• ${b('Status:')} ${statusLabel}`);
+      L.push(`• ${b('Zone A (Breakout Fill):')} $${fmtPx(px)} ${i('(current)')}`);
+      L.push(`• ${b('Zone B (Optimal Dip):')} $${fmtPx(zoneB)} ${i('(Limit Order)')}`);
+      L.push(`• ${b('Safety Floor:')} $${fmtPx(low1h)} — invalidation below`);
+      L.push(`• ${b('Risk/Reward:')} ${rrLabel} ${i('(to 1H High)')}`);
+      L.push(`• ${b('Verdict:')} ${esc(actionLabel)}`);
+      L.push('');
+    }
+  }
+
   // ── DEV TRUST ─────────────────────────────────────────────────────────────
 
   const dp = devProfile;

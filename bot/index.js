@@ -3,9 +3,10 @@ const { Telegraf } = require('telegraf');
 const { fetchAll, fetchDeFadeVerification, fetchSocialData } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
-const tracker = require('./tracker');
-const hunt    = require('./hunt');
-const config  = require('./config');
+const tracker   = require('./tracker');
+const hunt      = require('./hunt');
+const watchlist = require('./watchlist');
+const config    = require('./config');
 
 if (!config.TELEGRAM_BOT_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN is not set. Exiting.');
@@ -20,15 +21,17 @@ function isSolanaCA(text) {
 
 // ── Inline keyboard for each scan result ─────────────────────────────────────
 
-function buildKeyboard(ca, currentMc) {
+function buildKeyboard(ca, currentMc, verdict) {
   const mc = Math.floor(currentMc || 0);
-  return {
-    inline_keyboard: [[
-      { text: '➕ TRACK', callback_data: `track:${ca}:${mc}` },
-      { text: '📈 CHART', url: `https://dexscreener.com/solana/${ca}` },
-      { text: '🐦 X SEARCH', url: `https://x.com/search?q=${ca}&src=typed_query` },
-    ]],
-  };
+  const rows = [[
+    { text: '➕ TRACK', callback_data: `track:${ca}:${mc}` },
+    { text: '📈 CHART', url: `https://dexscreener.com/solana/${ca}` },
+    { text: '🐦 X SEARCH', url: `https://x.com/search?q=${ca}&src=typed_query` },
+  ]];
+  if (verdict === 'WATCH_VOL') {
+    rows.push([{ text: '🔔 ALERT ON ENTRY GRADE', callback_data: `alert:${ca}:${mc}` }]);
+  }
+  return { inline_keyboard: rows };
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -183,7 +186,7 @@ bot.on('text', async ctx => {
       message,
       {
         parse_mode: 'HTML',
-        reply_markup: buildKeyboard(ca, mc),
+        reply_markup: buildKeyboard(ca, mc, result.verdict),
       }
     );
   } catch (err) {
@@ -200,6 +203,31 @@ bot.on('text', async ctx => {
 
 bot.on('callback_query', async ctx => {
   const data = ctx.callbackQuery?.data || '';
+
+  if (data.startsWith('alert:')) {
+    const parts  = data.split(':');
+    const ca     = parts[1];
+    const mc     = parseFloat(parts[2]) || 0;
+    const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
+    if (watchlist.has(ca)) {
+      await ctx.answerCbQuery(`🔔 Already watching ${shortCa}`);
+      return;
+    }
+    // Pull symbol from a quick re-read of the callback message text (best-effort)
+    const symbol = ctx.callbackQuery?.message?.text?.match(/\$([A-Z]{2,10})\b/)?.[1] || '???';
+    const added = watchlist.add(ca, ctx.chat.id, symbol, mc);
+    if (added) {
+      await ctx.answerCbQuery(`🔔 Alert set for ${shortCa}`);
+      await bot.telegram.sendMessage(
+        ctx.chat.id,
+        `🔔 *ENTRY GRADE ALERT SET*\n\`${shortCa}\`\n\nI'll notify you the moment Vol/Liq ≥ 5x AND Holder Health ≥ 50% are both met.\n_Auto-expires in 6 hours._`,
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      await ctx.answerCbQuery(`Already watching ${shortCa}`);
+    }
+    return;
+  }
 
   if (data.startsWith('untrack:')) {
     const ca      = data.split(':')[1];
@@ -260,6 +288,7 @@ bot.launch({ dropPendingUpdates: true })
     console.log('Oracle Bot started');
     tracker.startTracker(bot);
     hunt.start(bot, buildKeyboard);
+    watchlist.start(bot);
   })
   .catch(err => {
     console.error('Failed to launch bot:', err.message);
