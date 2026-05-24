@@ -304,6 +304,28 @@ function list() {
   return [...positions.values()];
 }
 
+// ── Shakeout Diagnostic ────────────────────────────────────────────────────────
+// Returns { jeetExit: bool } if data confirms a shakeout, null otherwise.
+// A shakeout = price flush but on-chain health is intact.
+// Requires holder baseline to be established — won't fire on missing data.
+function detectShakeout(pos, lp, holderCount, top50Pct) {
+  // Criterion 1: holder resilience (not dropped >3% from entry)
+  if (pos.entryHolderCount == null || holderCount == null) return null;
+  if (holderCount < pos.entryHolderCount * 0.97) return null;
+
+  // Criterion 2: LP stability (not removed >10%)
+  if (pos.entryLp != null && lp != null && pos.entryLp > 0) {
+    if (lp < pos.entryLp * 0.90) return null;
+  }
+
+  // Jeet-exit confirmation: top 50 wallets are still holding firm
+  const jeetExit = (top50Pct != null && pos.entryTop50Pct != null)
+    ? top50Pct <= pos.entryTop50Pct * 1.05
+    : false;
+
+  return { jeetExit };
+}
+
 // ── Per-position forensic check ───────────────────────────────────────────────
 
 async function checkPosition(pos, bot) {
@@ -412,16 +434,54 @@ async function checkPosition(pos, bot) {
       pos.alertedFlags.add('LP_FLOOR');
     }
 
-    // ── ATH stop-loss retrace ────────────────────────────────────────────────
+    // ── ATH stop-loss retrace + Shakeout Diagnostic ─────────────────────────
     if (pos.peakMc > 0 && mc > 0) {
       const retracePct = ((pos.peakMc - mc) / pos.peakMc) * 100;
+
+      // Early advisory: ≥20% flush before SL fires — warn if on-chain health is still green.
+      // Fires once (SHAKEOUT_20) so it doesn't spam every 60s poll.
+      if (
+        retracePct >= 20 &&
+        !pos.alertedFlags.has('ATH_SL') &&
+        !pos.alertedFlags.has('SHAKEOUT_20')
+      ) {
+        const shakeout = detectShakeout(pos, lp, holderCount, top50Pct);
+        if (shakeout) {
+          const jeetLine = shakeout.jeetExit
+            ? `\n⚠️ *JEET EXIT:* Top 50 holding firm — weak hands are flushing.`
+            : '';
+          alerts.push(
+            `💎 *SHAKEOUT DETECTED* — Price flushed *${retracePct.toFixed(1)}%* from ATH.\n` +
+            `Holders are NOT selling. LP is stable.${jeetLine}\n` +
+            `→ *HOLD THE LINE. Reversal expected.*`
+          );
+          pos.alertedFlags.add('SHAKEOUT_20');
+        }
+      }
+
+      // SL check — paused once if shakeout is confirmed (one grace poll).
+      // If price keeps falling through the grace, SL fires on the next trigger.
       if (retracePct >= slPct && !pos.alertedFlags.has('ATH_SL')) {
-        alerts.push(
-          `🔴 *SL TRIGGERED* — ${retracePct.toFixed(1)}% retrace from ATH ${fmtUsd(pos.peakMc)}\n→ *EXIT MOON BAG (${slPct}% SL)*`
-        );
-        pos.alertedFlags.add('ATH_SL');
-        positions.delete(pos.ca);
-        saveToDisk();
+        const shakeout = detectShakeout(pos, lp, holderCount, top50Pct);
+        if (shakeout && !pos.alertedFlags.has('SHAKEOUT_SL_PAUSE')) {
+          const jeetLine = shakeout.jeetExit
+            ? `\n⚠️ *JEET EXIT:* Top 50 holding firm. Manufactured flush.`
+            : '';
+          alerts.push(
+            `🛡️ *SL PAUSED — SHAKEOUT CONFIRMED*\n` +
+            `${retracePct.toFixed(1)}% retrace from ATH ${fmtUsd(pos.peakMc)} — but holders are firm.${jeetLine}\n` +
+            `→ *HOLD POSITION.* One SL grace given. If price continues lower, SL fires next poll.`
+          );
+          pos.alertedFlags.add('SHAKEOUT_SL_PAUSE');
+        } else {
+          // No shakeout detected (rug), or grace already used — fire the stop loss.
+          alerts.push(
+            `🔴 *SL TRIGGERED* — ${retracePct.toFixed(1)}% retrace from ATH ${fmtUsd(pos.peakMc)}\n→ *EXIT MOON BAG (${slPct}% SL)*`
+          );
+          pos.alertedFlags.add('ATH_SL');
+          positions.delete(pos.ca);
+          saveToDisk();
+        }
       }
     }
 
