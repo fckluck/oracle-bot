@@ -116,10 +116,13 @@ function scan(data) {
   const migratedCount = stDeployer?.migratedCount ?? devStats?.migratedCount ?? null;
   const timeWindow    = getTimeWindow();
 
-  // Pro Pilot: success rate > 5% → lower BUY floor to 3x (proven track record)
-  const successRatePct = (devLaunches != null && devLaunches > 0 && migratedCount != null)
+  // Pro Pilot: success rate > 5% AND minimum 10 launches → lower BUY floor to 3x.
+  // Experience floor: devs with <10 launches are UNPROVEN — success rate is
+  // statistically meaningless and the 3x buffer must not activate for them.
+  const successRatePct   = (devLaunches != null && devLaunches > 0 && migratedCount != null)
     ? (migratedCount / devLaunches) * 100 : null;
-  const isProPilot     = successRatePct != null && successRatePct > 5;
+  const isUnproven       = devLaunches != null && devLaunches < 10;
+  const isProPilot       = successRatePct != null && successRatePct > 5 && !isUnproven;
   const isSerialDeployer = devLaunches !== null && devLaunches > 500;
 
   const holderCount     = holders?.holderCount     ?? null;
@@ -278,10 +281,11 @@ function scan(data) {
     socialUpgrade = true;
   }
 
-  // ── RISKY RUNNER override ──────────────────────────────────────────────────
-  // A NO_GO caused by concentration or liquidity CAN be a hidden opportunity
-  // when social sentiment is viral AND the dev has a proven track record.
-  // Hard kills (bundle/sybil/wash) are NEVER overridden — only soft kills.
+  // ── RISKY RUNNER overrides ─────────────────────────────────────────────────
+  let riskyRunnerReason = null;
+
+  // (A) Grok-style social+dev override: a soft NO_GO with viral X sentiment and
+  // a proven dev CAN be a hidden opportunity. Hard kills never overridden.
   const socialViral = social?.available && (social?.mentionCount ?? 0) >= 20;
   if (
     verdict === 'NO_GO' &&
@@ -291,6 +295,14 @@ function scan(data) {
     isProPilot
   ) {
     verdict = 'RISKY_RUNNER';
+    riskyRunnerReason = 'SOCIAL_GROK';
+  }
+
+  // (B) INFLATED/BOTTED demotion: synthetic holder counts at low MC mean the
+  // BUY conviction is unearned — demote to RISKY_RUNNER at 0.5x size.
+  if (verdict === 'BUY' && holderHealthData?.label === 'INFLATED/BOTTED') {
+    verdict = 'RISKY_RUNNER';
+    riskyRunnerReason = 'INFLATED_HOLDERS';
   }
 
   const positionUnits   = getPositionUnits(entryTier, lp, mc);
@@ -335,7 +347,7 @@ function scan(data) {
       bundleCount, isMeteora, deFadeScore, isDeFadeClean, sybilFunded,
       holderHealth:   holderHealthData,
       isPostCurve:    pump?.migrated === true || (pump == null && codex != null),
-      isProPilot, isSerialDeployer, successRatePct,
+      isProPilot, isUnproven, isSerialDeployer, successRatePct, riskyRunnerReason,
       proPilotBuffer: isProPilot && adjustedVolLiq >= 3 && adjustedVolLiq < 5,
     },
   };

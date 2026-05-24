@@ -581,8 +581,9 @@ async function sendHeartbeat(pos, bot) {
         ]],
       },
     });
+    console.log(`[GUARDIAN] Heartbeat sent for CA: ${pos.ca}`);
   } catch (e) {
-    console.error(`[tracker] heartbeat error ${pos.ca.slice(0,8)}:`, e.message);
+    console.error(`[GUARDIAN] Heartbeat FAILED for CA: ${pos.ca} —`, e.message);
   }
 }
 
@@ -602,15 +603,18 @@ function startTracker(bot) {
     }
   }, POLL_INTERVAL);
 
-  // Heartbeat — every 5 minutes
-  setInterval(async () => {
+  // Heartbeat — every 5 minutes, staggered non-blocking so a slow fetchForensic
+  // on one position can't delay the heartbeat for all others.
+  setInterval(() => {
     if (positions.size === 0) return;
-    console.log(`[tracker] Heartbeat — ${positions.size} position(s)`);
-    const snapshot = [...positions.values()];
-    for (const pos of snapshot) {
-      await sendHeartbeat(pos, bot);
-      await new Promise(r => setTimeout(r, 2000));
-    }
+    console.log(`[GUARDIAN] Heartbeat firing — ${positions.size} position(s)`);
+    [...positions.values()].forEach((pos, i) => {
+      setTimeout(() => {
+        sendHeartbeat(pos, bot).catch(e =>
+          console.error(`[GUARDIAN] Heartbeat error ${pos.ca.slice(0,8)}:`, e.message)
+        );
+      }, i * 2000);
+    });
   }, 5 * 60 * 1000);
 
   console.log('[tracker] Oracle Guardian v2.5 started — 60s forensic (lightweight) + 5m heartbeat, positions persisted');

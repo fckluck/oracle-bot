@@ -168,8 +168,14 @@ function formatVerdict(result, ca) {
     L.push(`${esc(watchReason)}`);
   } else if (verdict === 'RISKY_RUNNER') {
     L.push(`🟡 ${b('ORACLE VERDICT: RISKY RUNNER')}`);
-    L.push(`Social velocity + Pro Pilot override — underlying concern: ${esc(noGoReason || 'see details')}`);
-    L.push(`⚠️ ${i('High-risk play. Reduce size 50%. Exit fast.')}`);
+    if (signals.riskyRunnerReason === 'INFLATED_HOLDERS') {
+      const hp = signals.holderHealth?.healthPct;
+      L.push(`Holder count ${hp != null ? hp + '% of target' : 'inflated'} at ${fmtUsd(signals.marketCap)} MC — botted wallets suspected.`);
+      L.push(`⚠️ ${i('Conviction demoted. 0.5x size only. Watch for organic holder growth.')}`);
+    } else {
+      L.push(`Social velocity + Pro Pilot override — underlying concern: ${esc(noGoReason || 'see details')}`);
+      L.push(`⚠️ ${i('High-risk play. Reduce size 50%. Exit fast.')}`);
+    }
   } else {
     L.push(`⬇️ ${b('ORACLE VERDICT: SKIP')}`);
     L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below 5x minimum`);
