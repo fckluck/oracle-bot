@@ -73,6 +73,7 @@ function momentumDisplay(momentumStatus, birdeye) {
   const rangePctDisp = birdeye?.rangePct != null ? `${(birdeye.rangePct * 100).toFixed(0)}%` : 'N/A';
   switch (momentumStatus) {
     case 'VOLUMETRIC_DISTRIBUTION': return `🔴 DISTRIBUTION${range5m} — high vol, falling price`;
+    case 'HEALTHY_DIP':             return `♻️ RECYCLE OPPORTUNITY${range5m} — dip with buy-side dominance`;
     case 'TOP_QUARTER':             return `🟢 BREAKOUT (${rangePctDisp} of 1H range)${range5m}`;
     case 'LOWER_RANGE':             return `🟡 STALLED (${rangePctDisp} of 1H range)${range5m}`;
     default:                        return 'N/A (Birdeye candles unavailable)';
@@ -165,6 +166,10 @@ function formatVerdict(result, ca) {
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
     L.push(`${esc(watchReason)}`);
+  } else if (verdict === 'RISKY_RUNNER') {
+    L.push(`🟡 ${b('ORACLE VERDICT: RISKY RUNNER')}`);
+    L.push(`Social velocity + Pro Pilot override — underlying concern: ${esc(noGoReason || 'see details')}`);
+    L.push(`⚠️ ${i('High-risk play. Reduce size 50%. Exit fast.')}`);
   } else {
     L.push(`⬇️ ${b('ORACLE VERDICT: SKIP')}`);
     L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below 5x minimum`);

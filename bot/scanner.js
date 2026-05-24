@@ -153,7 +153,18 @@ function scan(data) {
   const sybilFunded  = !!(bundle?.sybilDetected);
 
   // ── Momentum ───────────────────────────────────────────────────────────────
-  const momentumStatus = momentumGate(birdeye, adjustedVolLiq);
+  let momentumStatus = momentumGate(birdeye, adjustedVolLiq);
+
+  // HEALTHY DIP override: price dropped >10% in 5m (would normally AVOID) but
+  // buy-side transactions still dominate — signal of dip-buying, not a dump.
+  // Lets the token fall through to the vol/liq verdict ladder as a WATCH/BUY.
+  if (
+    momentumStatus === 'VOLUMETRIC_DISTRIBUTION' &&
+    codex?.buyCount != null && codex?.sellCount != null &&
+    codex.buyCount > codex.sellCount
+  ) {
+    momentumStatus = 'HEALTHY_DIP';
+  }
 
   // ── Kill-Shot Headline Hierarchy (v8.4) ───────────────────────────────────
   // Priority: Bundle > Momentum > Concentration > Wash > Liquidity > Deployer
@@ -214,6 +225,7 @@ function scan(data) {
   } else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION') {
     verdict      = 'AVOID';
     headlineType = 'MOMENTUM';
+  // HEALTHY_DIP falls through to the normal vol/liq ladder below (no special case needed)
   } else if (washPct !== null && washPct > 30) {
     // Soft wash gate (30-50%): cap at WATCH
     verdict      = 'WATCH_WASH';
@@ -264,6 +276,21 @@ function scan(data) {
     entryTier     = 'BASELINE_ENTRY';
     watchReason   = null;
     socialUpgrade = true;
+  }
+
+  // ── RISKY RUNNER override ──────────────────────────────────────────────────
+  // A NO_GO caused by concentration or liquidity CAN be a hidden opportunity
+  // when social sentiment is viral AND the dev has a proven track record.
+  // Hard kills (bundle/sybil/wash) are NEVER overridden — only soft kills.
+  const socialViral = social?.available && (social?.mentionCount ?? 0) >= 20;
+  if (
+    verdict === 'NO_GO' &&
+    headlineType !== 'BUNDLE' &&
+    headlineType !== 'WASH' &&
+    socialViral &&
+    isProPilot
+  ) {
+    verdict = 'RISKY_RUNNER';
   }
 
   const positionUnits   = getPositionUnits(entryTier, lp, mc);
