@@ -3,10 +3,14 @@ const config = require('./config');
 // ── Eastern Time window ───────────────────────────────────────────────────────
 
 function getEasternHour() {
-  const now   = new Date();
-  const month = now.getUTCMonth() + 1;
-  const offset = (month >= 3 && month <= 11) ? -4 : -5;
-  return (now.getUTCHours() + 24 + offset) % 24;
+  // Intl.DateTimeFormat handles DST correctly including the exact switch
+  // dates in early March and late November that the old month-offset missed.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  return Number(parts.find(p => p.type === 'hour')?.value ?? 0);
 }
 
 function getTimeWindow() {
@@ -215,8 +219,8 @@ function scan(data) {
     headlineType = 'BUNDLE';
   }
   // 8. Concentration hard cap
-  else if (top10Pct !== null && top10Pct > 35) {
-    noGoReason   = `CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% > 35%`;
+  else if (top10Pct !== null && top10Pct > config.TOP10_HARD_MAX_PCT) {
+    noGoReason   = `CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% > ${config.TOP10_HARD_MAX_PCT}%`;
     headlineType = 'CONCENTRATION';
   }
   // 9. v10.2 Botted Wallets HARD-STOP — extreme inflation at low MC is

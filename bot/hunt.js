@@ -24,23 +24,31 @@ const PER_CA_COOLDOWN_MS = 5 * 60 * 1000; // don't re-broadcast same CA inside 5
 // ── Hunter registry (persisted) ─────────────────────────────────────────────
 
 let hunters = new Set();
+let huntersLoaded = false;
+
 function loadHunters() {
   try {
     if (fs.existsSync(HUNTERS_FILE)) {
       const raw = JSON.parse(fs.readFileSync(HUNTERS_FILE, 'utf8'));
       hunters = new Set(Array.isArray(raw) ? raw : []);
     }
+    huntersLoaded = true;
   } catch (e) { console.error('[hunt] loadHunters error:', e.message); }
 }
+
+function ensureHuntersLoaded() {
+  if (!huntersLoaded) loadHunters();
+}
+
 function saveHunters() {
   try { fs.writeFileSync(HUNTERS_FILE, JSON.stringify([...hunters], null, 2)); }
   catch (e) { console.error('[hunt] saveHunters error:', e.message); }
 }
-function addHunter(chatId)    { const had = hunters.has(chatId); hunters.add(chatId);    saveHunters(); return !had; }
-function removeHunter(chatId) { const had = hunters.has(chatId); hunters.delete(chatId); saveHunters(); return had; }
-function hunterCount()        { return hunters.size; }
-function isHunter(chatId)     { return hunters.has(chatId); }
-function listHunters()        { loadHunters(); return [...hunters]; }
+function addHunter(chatId)    { ensureHuntersLoaded(); const had = hunters.has(chatId); hunters.add(chatId);    saveHunters(); return !had; }
+function removeHunter(chatId) { ensureHuntersLoaded(); const had = hunters.has(chatId); hunters.delete(chatId); saveHunters(); return had; }
+function hunterCount()        { ensureHuntersLoaded(); return hunters.size; }
+function isHunter(chatId)     { ensureHuntersLoaded(); return hunters.has(chatId); }
+function listHunters()        { ensureHuntersLoaded(); return [...hunters]; }
 
 // ── Scan queue (bounded concurrency) ────────────────────────────────────────
 

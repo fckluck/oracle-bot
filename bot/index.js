@@ -141,14 +141,19 @@ bot.command('sync', async ctx => {
 });
 
 bot.command('window', ctx => {
-  const h = new Date().getUTCHours();
-  const etOffset = new Date().getUTCMonth() + 1 >= 3 && new Date().getUTCMonth() + 1 <= 11 ? -4 : -5;
-  const etHour = (h + 24 + etOffset) % 24;
+  const etHour = Number(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
+      hourCycle: 'h23',
+    }).formatToParts(new Date()).find(p => p.type === 'hour')?.value ?? 0
+  );
   const window = etHour >= 2 && etHour < 12 ? 'DISCOVERY' : etHour >= 12 && etHour < 19 ? 'DEAD_ZONE' : 'RESEARCH';
   return ctx.replyWithHTML(
     `<b>Scan Thresholds</b>\n\nLP min: $${config.LP_MIN_USD.toLocaleString()}\nAge max: ${config.AGE_MAX_MIN}min\n` +
     `Vol/Liq: ${window === 'DEAD_ZONE' ? '8x' : '5x'} (${window})\nTop 10 max: ${config.TOP10_MAX_PCT}%\n` +
-    `Curve max: ${config.CURVE_MAX_PCT}% (hard skip: ${config.CURVE_HARD_SKIP_PCT}%)\nSession: ${config.SESSION_SIZE_SOL} SOL\n\n` +
+    `Curve max: ${config.CURVE_MAX_PCT}% (hard skip: ${config.CURVE_HARD_SKIP_PCT}%)\n` +
+    `Top 10 hard NO-GO: ${config.TOP10_HARD_MAX_PCT}%\nSession: ${config.SESSION_SIZE_SOL} SOL\n\n` +
     `<b>TPs (${window === 'DEAD_ZONE' ? 'Dead Zone' : 'Normal'}):</b>\n` +
     `TP1 → ${window === 'DEAD_ZONE' ? '$50K' : '$100K'} MC\nTP2 → $250K MC\nTP3 → $500K MC\n\n` +
     `Time Mode: <b>${window}</b> (ET hour ${etHour})`
@@ -269,19 +274,20 @@ bot.on('callback_query', async ctx => {
 
     // Re-scan to get entryTier, timeWindow, devWallet, holderCount, top10Pct
     let entryTier = null, timeWindow = 'DISCOVERY';
-    let devWallet = null, holderCount = null, top10Pct = null, top50Pct = null;
+    let devWallet = null, holderCount = null, top10Pct = null, top50Pct = null, entryLp = null;
     try {
       const scanData = await fetchAll(ca);
       const result   = scan(scanData);
       entryTier   = result.entryTier;
       timeWindow  = result.timeWindow;
       devWallet   = result.devProfile?.wallet   ?? null;
+      entryLp     = result.signals?.lp          ?? null;
       holderCount = result.signals?.holderCount ?? null;
       top10Pct    = result.signals?.top10Pct    ?? null;
       top50Pct    = result.signals?.top50Pct    ?? null;
     } catch (_) {}
 
-    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct);
+    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct, entryLp);
     const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
 
     if (added) {
