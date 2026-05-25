@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const WS   = require('ws');          // explicit import — never rely on global WebSocket
 const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
@@ -162,7 +163,7 @@ function connect(broadcaster) {
   // forceReconnect → old-close-after-new-connect race.
   const myGen = ++socketGen;
   let mySocket;
-  try { mySocket = new WebSocket(WS_URL); ws = mySocket; }
+  try { mySocket = new WS(WS_URL); ws = mySocket; }
   catch (e) { console.error('[hunt] WS construct error:', e.message); scheduleReconnect(broadcaster); return; }
 
   mySocket.addEventListener('open', () => {
