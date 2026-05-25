@@ -1,6 +1,6 @@
 {
   "name": "oracle-bot",
-  "version": "10.2.5",
+  "version": "10.2.6",
   "description": "Solana token scanner Telegram bot",
   "main": "bot/index.js",
   "scripts": {

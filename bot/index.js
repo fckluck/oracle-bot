@@ -42,7 +42,7 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.5)</b>\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.6)</b>\n` +
   `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
@@ -52,6 +52,7 @@ const HELP_MENU =
   `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts on 5x+ Adjusted Vol/Liq launches\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
+  `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
   `• /window — Current trading mode (Discovery / Dead Zone / Research)\n\n` +
   `<b>── POSITION TRACKING (Guardian) ──</b>\n` +
   `• /tracking — List all tracked tokens + live state\n` +
@@ -117,6 +118,7 @@ bot.command('huntstatus', ctx => {
     `Queue:     ${h.queueDepth} pending | ${h.activeScans} running\n\n` +
     (h.staleWs ? `⚠️ <b>WS is stale:</b> PumpPortal is connected but not producing usable launch CAs. Fallback should cover partial discovery.\n\n` : '') +
     (!h.connected ? `🚨 <b>WS is disconnected:</b> reconnect hammer is active and fallback should poll immediately once /hunt is enabled.\n\n` : '') +
+    (h.startedAt == null ? `❌ <b>FATAL:</b> Hunt engine never started (start() not called). Use /huntdebug.\n\n` : '') +
     `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`;
   const extra = { parse_mode: 'HTML' };
   if (!h.connected || h.staleWs) {
@@ -130,8 +132,45 @@ bot.command('huntstatus', ctx => {
 bot.action('hunt:reconnect', async ctx => {
   try { await ctx.answerCbQuery('Reconnecting…'); } catch (_) {}
   const ok = hunt.forceReconnect();
-  if (!ok) return ctx.replyWithHTML(`⚠️ Hunt Mode not initialized — try /hunt first.`);
+  if (!ok) return ctx.replyWithHTML(`⚠️ Hunt engine has no broadcaster — start() likely never ran. Use /huntdebug.`);
   return ctx.replyWithHTML(`🔄 <b>Manual reconnect triggered.</b>\nRun /huntstatus in ~5s to verify 🟢 CONNECTED.`);
+});
+
+// v10.2.6 — surfaces every internal lifecycle counter. Use this when /huntstatus
+// looks wrong (e.g. WS disconnected with 0 reconnects) to see if start() ran,
+// if the watchdog setInterval is actually ticking, and how many WS attempts
+// have been made. Tells us what's broken without needing Railway logs.
+bot.command('huntdebug', ctx => {
+  const h = hunt.status();
+  const now = Date.now();
+  const ago = ts => ts ? Math.floor((now - ts) / 1000) + 's ago' : 'never';
+  const ready = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][h.wsReadyState ?? -1] || 'no-socket';
+  const verdict =
+    h.startedAt == null               ? '❌ start() NEVER ran — try /unhunt then /hunt, or check Railway logs for tracker/watchlist crash' :
+    h.connectAttempts === 0           ? '❌ connect() never called inside start()' :
+    h.watchdogArmedAt == null         ? '❌ watchdog never armed' :
+    h.watchdogTicks === 0 && (now - h.watchdogArmedAt) > 20_000 ? '❌ watchdog setInterval is NOT firing (event loop issue)' :
+    h.lastConstructError              ? `❌ WS constructor failed: ${h.lastConstructError.msg}` :
+    h.connected                       ? '✅ WS is connected' :
+    h.fallbackAttempts > 0            ? '🟡 WS down but fallback is polling — alerts should still flow if launches occur' :
+    '🟡 WS down, fallback not yet attempted';
+  return ctx.replyWithHTML(
+    `<b>Hunt Engine Deep Debug</b>\n\n` +
+    `<b>Lifecycle</b>\n` +
+    `start() called:     ${ago(h.startedAt)}\n` +
+    `watchdog armed:     ${ago(h.watchdogArmedAt)}\n` +
+    `watchdog ticks:     ${h.watchdogTicks} ${h.watchdogTicks === 0 && h.watchdogArmedAt ? '⚠️ (should be ≥1 every 15s)' : ''}\n` +
+    `connect() attempts: ${h.connectAttempts}\n` +
+    `last connect():     ${ago(h.lastConnectAt)}\n` +
+    `WS readyState:      ${ready} (${h.wsReadyState ?? 'null'})\n` +
+    `last construct err: ${h.lastConstructError ? `${h.lastConstructError.msg} (${ago(h.lastConstructError.ts)})` : 'none'}\n` +
+    `\n<b>Traffic</b>\n` +
+    `raw frames seen:    ${h.rawEvents ?? 0}\n` +
+    `fallback attempts:  ${h.fallbackAttempts ?? 0}\n` +
+    `fallback polls:     ${h.fallbackPolls ?? 0} (gated on hunters>0 + WS stale)\n` +
+    `hard reconnects:    ${h.hardReconnects ?? 0}\n` +
+    `\n<b>Diagnosis</b>\n${verdict}`
+  );
 });
 
 bot.command('tracking', ctx => {
@@ -334,7 +373,7 @@ bot.on('callback_query', async ctx => {
 
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
-    console.log('Oracle Bot v10.2.5 (Hardened Startup) started');
+    console.log('Oracle Bot v10.2.6 (Deep Instrumentation) started');
 
     // Each startup subsystem is isolated — one crash must not kill the others.
     try { tracker.startTracker(bot); }
@@ -349,7 +388,7 @@ bot.launch({ dropPendingUpdates: true })
     // Broadcast startup ping to all persisted hunters so they know the bot
     // restarted (Railway redeploys would otherwise be invisible).
     const hunters = hunt.listHunters();
-    const startupMsg = `🚀 <b>Oracle v10.2.5 Online &amp; Hardened Startup</b>\nType /hunt to begin.`;
+    const startupMsg = `🚀 <b>Oracle v10.2.6 Online &amp; Deep Instrumentation</b>\nRailway wiped my hunters list — tap /hunt to re-enable.\nUse /huntdebug if anything looks wrong.`;
     for (const chatId of hunters) {
       try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
       catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }

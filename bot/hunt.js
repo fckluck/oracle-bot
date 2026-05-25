@@ -1,4 +1,4 @@
-// ── Oracle v10.2.5 Predator Hunt Mode ────────────────────────────────────────
+// ── Oracle v10.2.6 Predator Hunt Mode ────────────────────────────────────────
 // Persistent WebSocket to wss://pumpportal.fun/api/data. Subscribes to
 // new-token + migration events. Each event triggers a full Oracle scan in
 // a concurrency-limited queue. Verdicts with Vol/Liq ≥ 5x are broadcast to
@@ -220,6 +220,21 @@ let wasDisconnected = false;         // outage epoch flag — gates dedupe of RE
 let savedBroadcaster = null;         // for forceReconnect() + restoration ping
 let savedBotRef = null;              // for sending restoration alert to hunters
 
+// v10.2.6 deep diagnostics — surfaces internal lifecycle state in /huntstatus
+// so we can debug Railway without log access. These tell us:
+//   startedAt          → did start() actually run? (null = NO)
+//   watchdogArmedAt    → did the watchdog setInterval get registered?
+//   watchdogTicks      → is the watchdog interval ACTUALLY firing?
+//   connectAttempts    → how many times has connect() been called?
+//   lastConnectAt      → when was the most recent connect() call?
+//   lastConstructError → did the WS constructor throw? (network/DNS issue)
+let startedAt          = null;
+let watchdogArmedAt    = null;
+let watchdogTicks      = 0;
+let connectAttempts    = 0;
+let lastConnectAt      = null;
+let lastConstructError = null;
+
 function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
@@ -280,19 +295,23 @@ function hardReconnect(broadcaster, reason) {
     console.error('[hunt] fallback during hardReconnect failed:', e?.message || e);
   });
 
-  setTimeout(() => connect(broadcaster), 250).unref?.();
+  // NOT unreffed — reconnect must complete even if event loop is otherwise idle.
+  setTimeout(() => connect(broadcaster), 250);
   return true;
 }
 
 function startReconnectWatchdog(broadcaster) {
   stopReconnectWatchdog();
+  watchdogArmedAt = Date.now();
+  watchdogTicks = 0;
   // NOTE: deliberately NOT unreffed — this must fire on Railway even if all
   // other timers are unreffed. It is the last-resort reconnect guarantee.
   reconnectWatchdogTimer = setInterval(() => {
+    watchdogTicks++;
     if (intentionallyStopped) return;
     const disconnected = !connectedAt || !ws || ws.readyState === WS.CLOSED || ws.readyState === WS.CLOSING;
     if (disconnected) {
-      console.error('[hunt] reconnect watchdog: WS is disconnected; hard reconnecting');
+      console.error(`[hunt] reconnect watchdog tick #${watchdogTicks}: WS is disconnected; hard reconnecting`);
       hardReconnect(broadcaster, 'watchdog-disconnected');
       return;
     }
@@ -355,7 +374,7 @@ function warnIfWsStale(myGen) {
         : 'no raw frames seen';
       console.error(`[hunt] WS connected but no usable launch events (${rawLine}). PumpPortal may require API key, be stale, blocked, or changed payload shape.`);
     }
-  }, WS_STALE_MS).unref?.();
+  }, WS_STALE_MS);
 }
 
 function connect(broadcaster) {
@@ -365,6 +384,8 @@ function connect(broadcaster) {
   // socket will see myGen !== socketGen and no-op. This is the fix for the
   // forceReconnect → old-close-after-new-connect race.
   const myGen = ++socketGen;
+  connectAttempts++;
+  lastConnectAt = Date.now();
   let mySocket;
   try {
     const url = buildWsUrl();
@@ -376,9 +397,15 @@ function connect(broadcaster) {
       },
     });
     ws = mySocket;
-    console.log(`[hunt] connecting to PumpPortal WS (${config.PUMPPORTAL_API_KEY ? 'API key configured' : 'no API key'})`);
+    lastConstructError = null;
+    console.log(`[hunt] connect attempt #${connectAttempts} → PumpPortal WS (${config.PUMPPORTAL_API_KEY ? 'API key configured' : 'no API key'})`);
   }
-  catch (e) { console.error('[hunt] WS construct error:', e.message); scheduleReconnect(broadcaster); return; }
+  catch (e) {
+    lastConstructError = { msg: e.message, ts: Date.now() };
+    console.error('[hunt] WS construct error:', e.message);
+    scheduleReconnect(broadcaster);
+    return;
+  }
 
   mySocket.addEventListener('open', () => {
     if (myGen !== socketGen) { try { mySocket.close(); } catch (_) {} return; } // stale
@@ -482,6 +509,7 @@ function normalizeDexCandidate(item, source) {
 }
 
 async function pollDexFallback(broadcaster, { force = false } = {}) {
+  stats.fallbackAttempts = (stats.fallbackAttempts || 0) + 1;
   if (!FALLBACK_ENABLED || hunters.size === 0) return;
   // Fallback only activates when PumpPortal is stale or disconnected.
   // It is not a replacement for the firehose; it prevents total blindness.
@@ -542,12 +570,12 @@ function startDexFallback(broadcaster) {
     console.log('[hunt] Dex fallback disabled by HUNT_FALLBACK_ENABLED=false');
     return;
   }
+  // NOT unreffed — fallback polling is the safety net when PumpPortal WS fails.
   fallbackTimer = setInterval(() => pollDexFallback(broadcaster), FALLBACK_POLL_MS);
-  fallbackTimer.unref?.();
   // Start immediately. If there are no hunters, addHunter() forces another probe.
-  setTimeout(() => pollDexFallback(broadcaster, { force: true }), 0).unref?.();
+  setTimeout(() => pollDexFallback(broadcaster, { force: true }), 0);
   // Give PumpPortal a short first chance, then probe again if it is still stale.
-  setTimeout(() => pollDexFallback(broadcaster, { force: true }), Math.min(15_000, FALLBACK_POLL_MS)).unref?.();
+  setTimeout(() => pollDexFallback(broadcaster, { force: true }), Math.min(15_000, FALLBACK_POLL_MS));
   console.log(`[hunt] Dex fallback armed — poll ${Math.floor(FALLBACK_POLL_MS / 1000)}s, max ${FALLBACK_MAX_PER_POLL}/poll`);
 }
 
@@ -572,6 +600,14 @@ function status() {
     hardReconnects: stats.hardReconnects,
     lastReconnectReason: stats.lastReconnectReason,
     lastWsClose: stats.lastWsClose,
+    // v10.2.6 deep diagnostics
+    startedAt,
+    watchdogArmedAt,
+    watchdogTicks,
+    connectAttempts,
+    lastConnectAt,
+    lastConstructError,
+    wsReadyState: ws ? ws.readyState : null,
     ...stats,
   };
 }
@@ -579,6 +615,7 @@ function status() {
 // ── Public init ─────────────────────────────────────────────────────────────
 
 function start(bot, buildKeyboard) {
+  startedAt = Date.now();
   loadHunters();
   savedBotRef = bot;
   const broadcaster = async (ca, mc, html, verdict = null) => {
