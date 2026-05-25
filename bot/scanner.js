@@ -314,7 +314,16 @@ function scan(data) {
   const effectiveCto = ctoBehavior === 'CTO_CONFIRMED' || ctoBehavior === 'CTO_LIKELY' || socialCto;
 
   let socialUpgrade = false;
-  if (verdict === 'WATCH_VOL' && socialBreakout) {
+  // v10.2.7 (post-architect fix): the social upgrade was the back door that
+  // undid Spine Lock. A trending X post could lift any WATCH_VOL — including
+  // dirty-SCRIBBLI, failed-PLUTO, LOWER_RANGE, INFLATED-holder cases — back to
+  // BUY. Now the upgrade requires the SAME safety pass as PLUTO/SCRIBBLI:
+  // momentum in top quarter, top10 < 15, wash < 20, bundle/sybil clean,
+  // holder health sane, dev not active. Plus an explicit watchReason guard so
+  // momentum/wash-cap WATCH states cannot be promoted regardless.
+  const watchIsRecoverable = watchReason !== null &&
+    !/momentum fail|safety failed|wash volume/i.test(watchReason);
+  if (verdict === 'WATCH_VOL' && socialBreakout && highTierSafe && watchIsRecoverable) {
     verdict       = 'BUY';
     entryTier     = 'BASELINE_ENTRY';
     watchReason   = null;
@@ -335,6 +344,26 @@ function scan(data) {
     noGoReason   = `INFLATED HOLDERS — Health ${holderHealthData.healthPct}% (>200%) — bot wallets suspected.`;
     headlineType = 'INFLATED';
     entryTier    = null;
+  }
+
+  // ── v10.2.7 invariant fuse (last line of defense) ─────────────────────────
+  // Even if some future change (a new override block, a refactor) re-introduces
+  // a path that lets BUY slip past Spine Lock, these invariants force the
+  // verdict back to WATCH_VOL. Treat any trip here as a bug.
+  if (verdict === 'BUY') {
+    let invariantFail = null;
+    if (top10Pct !== null && top10Pct > 15)                  invariantFail = `INVARIANT: top10 ${top10Pct.toFixed(1)}% > 15`;
+    else if (momentumStatus === 'LOWER_RANGE')               invariantFail = `INVARIANT: momentum LOWER_RANGE`;
+    else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION')   invariantFail = `INVARIANT: momentum VOLUMETRIC_DISTRIBUTION`;
+    else if (washPct !== null && washPct > 30)               invariantFail = `INVARIANT: wash ${washPct.toFixed(0)}% > 30`;
+    else if (holderHealthData?.label === 'INFLATED/BOTTED')  invariantFail = `INVARIANT: INFLATED/BOTTED holders`;
+    if (invariantFail) {
+      console.error(`[scanner] ${invariantFail} — forcing BUY → WATCH_VOL (bug in upstream verdict logic)`);
+      verdict       = 'WATCH_VOL';
+      entryTier     = null;
+      watchReason   = `${invariantFail} — verdict downgraded by safety invariant.`;
+      socialUpgrade = false;
+    }
   }
 
   const positionUnits   = getPositionUnits(entryTier, lp, mc);
