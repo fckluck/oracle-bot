@@ -111,10 +111,13 @@ async function runScan(job, broadcaster) {
 
 let ws = null;
 let reconnectMs = RECONNECT_BASE_MS;
-let intentionallyClosed = false;
+let intentionallyStopped = false;    // true only during shutdown via stop()
 let connectedAt = null;
 let heartbeatTimer = null;
+let reconnectTimer = null;           // pending reconnect (cancelled on new connect)
+let socketGen = 0;                   // bumped per connect; stale handlers no-op
 let wasEverConnected = false;        // first connect ≠ "restored"
+let wasDisconnected = false;         // outage epoch flag — gates dedupe of RESTORED
 let savedBroadcaster = null;         // for forceReconnect() + restoration ping
 let savedBotRef = null;              // for sending restoration alert to hunters
 
@@ -147,25 +150,36 @@ async function broadcastRestored() {
   }
 }
 
+function cancelPendingReconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+
 function connect(broadcaster) {
-  intentionallyClosed = false;
+  cancelPendingReconnect();
   savedBroadcaster = broadcaster;
-  try { ws = new WebSocket(WS_URL); }
+  // Bump generation BEFORE constructing — any stale close/open from a prior
+  // socket will see myGen !== socketGen and no-op. This is the fix for the
+  // forceReconnect → old-close-after-new-connect race.
+  const myGen = ++socketGen;
+  let mySocket;
+  try { mySocket = new WebSocket(WS_URL); ws = mySocket; }
   catch (e) { console.error('[hunt] WS construct error:', e.message); scheduleReconnect(broadcaster); return; }
 
-  ws.addEventListener('open', () => {
-    const wasDown = wasEverConnected;       // true only on a true RE-connect
+  mySocket.addEventListener('open', () => {
+    if (myGen !== socketGen) { try { mySocket.close(); } catch (_) {} return; } // stale
+    const wasDown = wasDisconnected;        // fires once per outage epoch
     connectedAt = Date.now();
     reconnectMs = RECONNECT_BASE_MS;
     console.log(`[hunt] WS connected → subscribing${wasDown ? ' (RESTORED)' : ''}`);
-    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    ws.send(JSON.stringify({ method: 'subscribeMigration' }));
+    mySocket.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    mySocket.send(JSON.stringify({ method: 'subscribeMigration' }));
     startHeartbeat();
-    if (wasDown) broadcastRestored().catch(() => {});
+    if (wasDown) { wasDisconnected = false; broadcastRestored().catch(() => {}); }
     wasEverConnected = true;
   });
 
-  ws.addEventListener('message', (ev) => {
+  mySocket.addEventListener('message', (ev) => {
+    if (myGen !== socketGen) return;        // ignore stale frames
     try {
       const msg = JSON.parse(ev.data);
       stats.lastEvent = Date.now();
@@ -184,38 +198,48 @@ function connect(broadcaster) {
     } catch (e) { /* malformed frame */ }
   });
 
-  ws.addEventListener('close', (ev) => {
+  mySocket.addEventListener('close', (ev) => {
+    if (myGen !== socketGen) return;        // stale — a newer socket owns the state
     connectedAt = null;
     stopHeartbeat();
-    if (intentionallyClosed) return;
+    if (intentionallyStopped) return;       // process shutdown — don't reconnect
+    if (wasEverConnected) wasDisconnected = true; // mark outage for RESTORED dedupe
     console.log(`[hunt] WS closed code=${ev.code} → reconnect in ${reconnectMs}ms`);
     scheduleReconnect(broadcaster);
   });
 
-  ws.addEventListener('error', (e) => {
+  mySocket.addEventListener('error', (e) => {
+    if (myGen !== socketGen) return;
     console.error('[hunt] WS error:', e?.message || 'unknown');
   });
 }
 
 function scheduleReconnect(broadcaster) {
-  setTimeout(() => connect(broadcaster), reconnectMs);
+  cancelPendingReconnect();
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(broadcaster); }, reconnectMs);
   reconnectMs = Math.min(reconnectMs * 2, RECONNECT_MAX_MS);
 }
 
 function stop() {
-  intentionallyClosed = true;
+  intentionallyStopped = true;
+  socketGen++;                              // invalidate all handlers
+  cancelPendingReconnect();
   stopHeartbeat();
   try { ws?.close(); } catch (_) {}
 }
 
 // Manual reconnect — fires when user taps [🔄 RECONNECT] in /huntstatus.
-// Resets backoff so the retry is instant, closes any stale socket, reconnects.
+// socketGen bump invalidates the old socket's handlers cleanly, so we don't
+// need (and must NOT use) the intentionallyStopped global here.
 function forceReconnect() {
   if (!savedBroadcaster) return false;
   reconnectMs = RECONNECT_BASE_MS;
-  intentionallyClosed = true;       // suppress auto-reconnect from old close
+  socketGen++;                              // invalidate old socket's close/open
+  cancelPendingReconnect();
   stopHeartbeat();
   try { ws?.close(); } catch (_) {}
+  // Treat this as an outage so the RESTORED broadcast fires on success.
+  if (wasEverConnected) wasDisconnected = true;
   setTimeout(() => connect(savedBroadcaster), 250);
   return true;
 }

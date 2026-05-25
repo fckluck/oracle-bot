@@ -221,12 +221,19 @@ function scan(data) {
   }
   // 9. v10.2 Botted Wallets HARD-STOP — extreme inflation at low MC is
   //     unrecoverable. NO RISKY_RUNNER override allowed for this pattern.
+  //     v10.2.2 fail-safe: when holder health is UNAVAILABLE at low MC, the
+  //     gate also trips — we cannot certify a sub-$100K launch without it.
   else if (
-    holderHealthData?.healthPct != null &&
-    holderHealthData.healthPct > 250 &&
-    mc != null && mc < 100000
+    mc != null && mc < 100000 && (
+      (holderHealthData?.healthPct != null && holderHealthData.healthPct > 250) ||
+      holderHealthData?.healthPct == null
+    )
   ) {
-    noGoReason   = `BOTTED WALLETS — Holder Health ${holderHealthData.healthPct}% at $${(mc/1000).toFixed(0)}K MC (>250% threshold under $100K)`;
+    if (holderHealthData?.healthPct == null) {
+      noGoReason = `HOLDER DATA UNAVAILABLE — Cannot certify wallet quality at $${(mc/1000).toFixed(0)}K MC (gate 9 fail-safe)`;
+    } else {
+      noGoReason = `BOTTED WALLETS — Holder Health ${holderHealthData.healthPct}% at $${(mc/1000).toFixed(0)}K MC (>250% threshold under $100K)`;
+    }
     headlineType = 'INFLATED';
   }
 
