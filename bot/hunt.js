@@ -1,4 +1,4 @@
-// ── Oracle v10.2.3 Predator Hunt Mode ────────────────────────────────────────
+// ── Oracle v10.2.4 Predator Hunt Mode ────────────────────────────────────────
 // Persistent WebSocket to wss://pumpportal.fun/api/data. Subscribes to
 // new-token + migration events. Each event triggers a full Oracle scan in
 // a concurrency-limited queue. Verdicts with Vol/Liq ≥ 5x are broadcast to
@@ -7,6 +7,11 @@
 // v10.2.3: DexScreener fallback poller arms automatically when PumpPortal WS
 // is stale or disconnected. Robust message normalization handles payload-shape
 // changes. Full per-frame diagnostics exposed via /huntstatus.
+//
+// v10.2.4: Reconnect watchdog hammer — fires every RECONNECT_HAMMER_MS when
+// disconnected, ensuring the bot never stays dark. WS handshake timeout and
+// User-Agent header added. hardReconnect() consolidates all reconnect paths.
+// pollDexFallback() accepts { force } to bypass stale-check on demand.
 
 const fs    = require('fs');
 const path  = require('path');
@@ -17,16 +22,19 @@ const { scan }          = require('./scanner');
 const { formatVerdict } = require('./verdict');
 const config            = require('./config');
 
-const WS_BASE_URL    = 'wss://pumpportal.fun/api/data';
+const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
 const DEX_PROFILES_URL = 'https://api.dexscreener.com/token-profiles/latest/v1';
 const DEX_CTO_URL      = 'https://api.dexscreener.com/community-takeovers/latest/v1';
-const HUNTERS_FILE   = path.join(__dirname, 'hunters.json');
+const HUNTERS_FILE     = path.join(__dirname, 'hunters.json');
 const MIN_VOLLIQ_BROADCAST       = 5;
 const MIN_MARKET_CAP_SOL_PRESCAN = 30;   // skip dust launches (~$4K)
-const WS_STALE_MS          = Number.isFinite(config.HUNT_WS_STALE_MS)           ? config.HUNT_WS_STALE_MS           : 120_000;
-const FALLBACK_ENABLED     = config.HUNT_FALLBACK_ENABLED !== false;
-const FALLBACK_POLL_MS     = Number.isFinite(config.HUNT_FALLBACK_POLL_MS)      ? config.HUNT_FALLBACK_POLL_MS      : 90_000;
-const FALLBACK_MAX_PER_POLL = Number.isFinite(config.HUNT_FALLBACK_MAX_PER_POLL) ? config.HUNT_FALLBACK_MAX_PER_POLL : 10;
+const WS_STALE_MS           = Number.isFinite(config.HUNT_WS_STALE_MS)            ? config.HUNT_WS_STALE_MS            : 120_000;
+const FALLBACK_ENABLED      = config.HUNT_FALLBACK_ENABLED !== false;
+const FALLBACK_POLL_MS      = Number.isFinite(config.HUNT_FALLBACK_POLL_MS)       ? config.HUNT_FALLBACK_POLL_MS       : 90_000;
+const FALLBACK_MAX_PER_POLL = Number.isFinite(config.HUNT_FALLBACK_MAX_PER_POLL)  ? config.HUNT_FALLBACK_MAX_PER_POLL  : 10;
+const RECONNECT_HAMMER_MS   = Number.isFinite(config.HUNT_RECONNECT_HAMMER_MS)    ? config.HUNT_RECONNECT_HAMMER_MS    : 15_000;
+const WS_HANDSHAKE_TIMEOUT_MS = Number.isFinite(config.HUNT_WS_HANDSHAKE_TIMEOUT_MS) ? config.HUNT_WS_HANDSHAKE_TIMEOUT_MS : 15_000;
+const WS_USER_AGENT         = config.HUNT_WS_USER_AGENT || 'OracleBot/10.2.4 Railway NodeWS';
 const QUEUE_CONCURRENCY  = 2;
 const SCAN_STALE_MS      = 30_000;
 const RECONNECT_BASE_MS  = 2_000;
@@ -69,7 +77,21 @@ function saveHunters() {
   try { fs.writeFileSync(HUNTERS_FILE, JSON.stringify([...hunters], null, 2)); }
   catch (e) { console.error('[hunt] saveHunters error:', e.message); }
 }
-function addHunter(chatId)    { ensureHuntersLoaded(); const had = hunters.has(chatId); hunters.add(chatId);    saveHunters(); return !had; }
+
+function addHunter(chatId) {
+  ensureHuntersLoaded();
+  const had = hunters.has(chatId);
+  hunters.add(chatId);
+  saveHunters();
+
+  // If the bot booted with zero hunters, fallback may have skipped itself.
+  // Probe immediately when a chat enables /hunt.
+  if (!had && savedBroadcaster) {
+    setTimeout(() => pollDexFallback(savedBroadcaster, { force: true }), 0).unref?.();
+  }
+  return !had;
+}
+
 function removeHunter(chatId) { ensureHuntersLoaded(); const had = hunters.has(chatId); hunters.delete(chatId); saveHunters(); return had; }
 function hunterCount()        { ensureHuntersLoaded(); return hunters.size; }
 function isHunter(chatId)     { ensureHuntersLoaded(); return hunters.has(chatId); }
@@ -96,6 +118,9 @@ const stats = {
   fallbackPolls: 0,
   fallbackEnqueued: 0,
   fallbackErrors: 0,
+  hardReconnects: 0,
+  lastReconnectReason: null,
+  lastWsClose: null,
 };
 
 function enqueue(job, broadcaster) {
@@ -188,6 +213,7 @@ let intentionallyStopped = false;    // true only during shutdown via stop()
 let connectedAt = null;
 let heartbeatTimer = null;
 let reconnectTimer = null;           // pending reconnect (cancelled on new connect)
+let reconnectWatchdogTimer = null;   // v10.2.4 reconnect hammer
 let socketGen = 0;                   // bumped per connect; stale handlers no-op
 let wasEverConnected = false;        // first connect ≠ "restored"
 let wasDisconnected = false;         // outage epoch flag — gates dedupe of RESTORED
@@ -222,6 +248,62 @@ async function broadcastRestored() {
 
 function cancelPendingReconnect() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+
+function terminateSocket(reason = 'unknown') {
+  const s = ws;
+  ws = null;
+  if (!s) return;
+  try {
+    if (typeof s.terminate === 'function') s.terminate();
+    else s.close();
+    console.log(`[hunt] socket terminated (${reason})`);
+  } catch (e) {
+    console.error(`[hunt] socket terminate failed (${reason}):`, e.message);
+  }
+}
+
+function hardReconnect(broadcaster, reason) {
+  if (!broadcaster) return false;
+  stats.hardReconnects++;
+  stats.lastReconnectReason = reason;
+  reconnectMs = RECONNECT_BASE_MS;
+  socketGen++;
+  connectedAt = null;
+  cancelPendingReconnect();
+  stopHeartbeat();
+  terminateSocket(reason);
+  if (wasEverConnected) wasDisconnected = true;
+
+  // Poll fallback immediately while PumpPortal is being recovered.
+  pollDexFallback(broadcaster, { force: true }).catch(e => {
+    console.error('[hunt] fallback during hardReconnect failed:', e?.message || e);
+  });
+
+  setTimeout(() => connect(broadcaster), 250).unref?.();
+  return true;
+}
+
+function startReconnectWatchdog(broadcaster) {
+  stopReconnectWatchdog();
+  reconnectWatchdogTimer = setInterval(() => {
+    if (intentionallyStopped) return;
+    const disconnected = !connectedAt || !ws || ws.readyState === WS.CLOSED || ws.readyState === WS.CLOSING;
+    if (disconnected) {
+      console.error('[hunt] reconnect watchdog: WS is disconnected; hard reconnecting');
+      hardReconnect(broadcaster, 'watchdog-disconnected');
+      return;
+    }
+    if (wsIsStale()) {
+      pollDexFallback(broadcaster, { force: true }).catch(() => {});
+    }
+  }, RECONNECT_HAMMER_MS);
+  reconnectWatchdogTimer.unref?.();
+  console.log(`[hunt] reconnect watchdog armed — ${Math.floor(RECONNECT_HAMMER_MS / 1000)}s`);
+}
+
+function stopReconnectWatchdog() {
+  if (reconnectWatchdogTimer) { clearInterval(reconnectWatchdogTimer); reconnectWatchdogTimer = null; }
 }
 
 // Normalise a raw PumpPortal WS frame into { ok, ca, eventType, mcSol }.
@@ -285,7 +367,13 @@ function connect(broadcaster) {
   let mySocket;
   try {
     const url = buildWsUrl();
-    mySocket = new WS(url);
+    mySocket = new WS(url, {
+      handshakeTimeout: WS_HANDSHAKE_TIMEOUT_MS,
+      perMessageDeflate: false,
+      headers: {
+        'User-Agent': WS_USER_AGENT,
+      },
+    });
     ws = mySocket;
     console.log(`[hunt] connecting to PumpPortal WS (${config.PUMPPORTAL_API_KEY ? 'API key configured' : 'no API key'})`);
   }
@@ -332,7 +420,13 @@ function connect(broadcaster) {
     stopHeartbeat();
     if (intentionallyStopped) return;       // process shutdown — don't reconnect
     if (wasEverConnected) wasDisconnected = true; // mark outage for RESTORED dedupe
-    console.log(`[hunt] WS closed code=${ev.code} → reconnect in ${reconnectMs}ms`);
+    stats.lastWsClose = {
+      code:   ev?.code   ?? null,
+      reason: ev?.reason ? String(ev.reason).slice(0, 120) : '',
+      ts:     Date.now(),
+    };
+    console.log(`[hunt] WS closed code=${ev.code} reason="${stats.lastWsClose.reason}" → reconnect in ${reconnectMs}ms`);
+    pollDexFallback(broadcaster, { force: true }).catch(() => {});
     scheduleReconnect(broadcaster);
   });
 
@@ -352,25 +446,17 @@ function stop() {
   intentionallyStopped = true;
   socketGen++;                              // invalidate all handlers
   cancelPendingReconnect();
+  stopReconnectWatchdog();
   stopDexFallback();
   stopHeartbeat();
-  try { ws?.close(); } catch (_) {}
+  terminateSocket('stop');
 }
 
 // Manual reconnect — fires when user taps [🔄 RECONNECT] in /huntstatus.
-// socketGen bump invalidates the old socket's handlers cleanly, so we don't
-// need (and must NOT use) the intentionallyStopped global here.
+// Delegates to hardReconnect() which handles all bookkeeping atomically.
 function forceReconnect() {
   if (!savedBroadcaster) return false;
-  reconnectMs = RECONNECT_BASE_MS;
-  socketGen++;                              // invalidate old socket's close/open
-  cancelPendingReconnect();
-  stopHeartbeat();
-  try { ws?.close(); } catch (_) {}
-  // Treat this as an outage so the RESTORED broadcast fires on success.
-  if (wasEverConnected) wasDisconnected = true;
-  setTimeout(() => connect(savedBroadcaster), 250);
-  return true;
+  return hardReconnect(savedBroadcaster, 'manual-forceReconnect');
 }
 
 // ── DexScreener fallback poller ───────────────────────────────────────────────
@@ -394,11 +480,11 @@ function normalizeDexCandidate(item, source) {
   return { ca, eventType: source, source };
 }
 
-async function pollDexFallback(broadcaster) {
+async function pollDexFallback(broadcaster, { force = false } = {}) {
   if (!FALLBACK_ENABLED || hunters.size === 0) return;
   // Fallback only activates when PumpPortal is stale or disconnected.
   // It is not a replacement for the firehose; it prevents total blindness.
-  if (connectedAt && !wsIsStale()) return;
+  if (!force && connectedAt && !wsIsStale()) return;
 
   stats.fallbackPolls++;
   cleanupMaps();
@@ -457,8 +543,10 @@ function startDexFallback(broadcaster) {
   }
   fallbackTimer = setInterval(() => pollDexFallback(broadcaster), FALLBACK_POLL_MS);
   fallbackTimer.unref?.();
-  // Give PumpPortal a short first chance, then probe fallback if still stale.
-  setTimeout(() => pollDexFallback(broadcaster), Math.min(15_000, FALLBACK_POLL_MS)).unref?.();
+  // Start immediately. If there are no hunters, addHunter() forces another probe.
+  setTimeout(() => pollDexFallback(broadcaster, { force: true }), 0).unref?.();
+  // Give PumpPortal a short first chance, then probe again if it is still stale.
+  setTimeout(() => pollDexFallback(broadcaster, { force: true }), Math.min(15_000, FALLBACK_POLL_MS)).unref?.();
   console.log(`[hunt] Dex fallback armed — poll ${Math.floor(FALLBACK_POLL_MS / 1000)}s, max ${FALLBACK_MAX_PER_POLL}/poll`);
 }
 
@@ -479,6 +567,10 @@ function status() {
     hunters:    hunterCount(),
     pumpPortalApiKeyConfigured: !!config.PUMPPORTAL_API_KEY,
     fallbackEnabled: FALLBACK_ENABLED,
+    reconnectHammerMs: RECONNECT_HAMMER_MS,
+    hardReconnects: stats.hardReconnects,
+    lastReconnectReason: stats.lastReconnectReason,
+    lastWsClose: stats.lastWsClose,
     ...stats,
   };
 }
@@ -507,6 +599,7 @@ function start(bot, buildKeyboard) {
   };
   connect(broadcaster);
   startDexFallback(broadcaster);
+  startReconnectWatchdog(broadcaster);
   console.log(`[hunt] hunt mode started — ${hunters.size} hunter(s) registered`);
 }
 

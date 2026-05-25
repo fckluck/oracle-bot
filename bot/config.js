@@ -23,6 +23,11 @@ const config = {
   HUNT_FALLBACK_ENABLED:      process.env.HUNT_FALLBACK_ENABLED !== 'false',
   HUNT_FALLBACK_POLL_MS:      parseInt(process.env.HUNT_FALLBACK_POLL_MS || String(90 * 1000), 10),
   HUNT_FALLBACK_MAX_PER_POLL: parseInt(process.env.HUNT_FALLBACK_MAX_PER_POLL || '10', 10),
+  HUNT_RECONNECT_HAMMER_MS:   parseInt(process.env.HUNT_RECONNECT_HAMMER_MS   || String(15 * 1000), 10),
+  HUNT_WS_HANDSHAKE_TIMEOUT_MS: parseInt(process.env.HUNT_WS_HANDSHAKE_TIMEOUT_MS || String(15 * 1000), 10),
+
+  // Some WebSocket gateways/datacenter firewalls behave better with a normal UA.
+  HUNT_WS_USER_AGENT: process.env.HUNT_WS_USER_AGENT || 'OracleBot/10.2.4 Railway NodeWS',
 
   // TP levels (Discovery Window / normal hours)
   TP1_MC: parseFloat(process.env.TP1_MC || '100000'),

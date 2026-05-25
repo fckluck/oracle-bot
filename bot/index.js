@@ -42,7 +42,7 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.3)</b>\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.4)</b>\n` +
   `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
@@ -111,8 +111,12 @@ bot.command('huntstatus', ctx => {
     `Skipped:   ${h.skipped}\n` +
     `Errors:    ${h.errors}\n` +
     `Fallback:  ${h.fallbackEnabled ? 'ON' : 'OFF'} | polls ${h.fallbackPolls ?? 0} | enqueued ${h.fallbackEnqueued ?? 0} | errors ${h.fallbackErrors ?? 0}\n` +
+    `Reconnects: ${h.hardReconnects ?? 0}${h.lastReconnectReason ? ` (${h.lastReconnectReason})` : ''}\n` +
+    `Hammer:    every ${Math.floor((h.reconnectHammerMs || 15000) / 1000)}s if disconnected\n` +
+    (h.lastWsClose ? `Last close: code ${h.lastWsClose.code ?? 'n/a'}${h.lastWsClose.reason ? ` | ${h.lastWsClose.reason}` : ''}\n` : '') +
     `Queue:     ${h.queueDepth} pending | ${h.activeScans} running\n\n` +
-    (h.staleWs ? `⚠️ <b>WS is stale:</b> PumpPortal connected but not producing usable launch CAs. Fallback covering partial discovery.\n\n` : '') +
+    (h.staleWs ? `⚠️ <b>WS is stale:</b> PumpPortal is connected but not producing usable launch CAs. Fallback should cover partial discovery.\n\n` : '') +
+    (!h.connected ? `🚨 <b>WS is disconnected:</b> reconnect hammer is active and fallback should poll immediately once /hunt is enabled.\n\n` : '') +
     `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`;
   const extra = { parse_mode: 'HTML' };
   if (!h.connected || h.staleWs) {
@@ -330,7 +334,7 @@ bot.on('callback_query', async ctx => {
 
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
-    console.log('Oracle Bot v10.2.3 (Hunt-Resilient) started');
+    console.log('Oracle Bot v10.2.4 (Emergency Connection) started');
     tracker.startTracker(bot);
     hunt.start(bot, buildKeyboard);
     watchlist.start(bot);
@@ -338,7 +342,7 @@ bot.launch({ dropPendingUpdates: true })
     // Broadcast startup ping to all persisted hunters so they know the bot
     // restarted (Railway redeploys would otherwise be invisible).
     const hunters = hunt.listHunters();
-    const startupMsg = `🚀 <b>Oracle v10.2.3 Online &amp; Hunt-Resilient</b>\nType /hunt to begin.`;
+    const startupMsg = `🚀 <b>Oracle v10.2.4 Online &amp; Emergency Connection Active</b>\nType /hunt to begin.`;
     for (const chatId of hunters) {
       try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
       catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }
