@@ -219,6 +219,16 @@ function scan(data) {
     noGoReason   = `CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% > 35%`;
     headlineType = 'CONCENTRATION';
   }
+  // 9. v10.2 Botted Wallets HARD-STOP — extreme inflation at low MC is
+  //     unrecoverable. NO RISKY_RUNNER override allowed for this pattern.
+  else if (
+    holderHealthData?.healthPct != null &&
+    holderHealthData.healthPct > 250 &&
+    mc != null && mc < 100000
+  ) {
+    noGoReason   = `BOTTED WALLETS — Holder Health ${holderHealthData.healthPct}% at $${(mc/1000).toFixed(0)}K MC (>250% threshold under $100K)`;
+    headlineType = 'INFLATED';
+  }
 
   // ── Verdict ladder (v8.4 — adjusted vol/liq) ──────────────────────────────
   let entryTier = null, verdict, watchReason = null;

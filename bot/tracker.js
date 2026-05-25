@@ -359,8 +359,36 @@ async function checkPosition(pos, bot) {
       pos.top50Snapshots = pos.top50Snapshots.filter(s => s.ts >= fiveMinAgo);
     }
 
+    // Update rolling price snapshots (90s window — candle-crush detection).
+    // 90s gives ~2 polls of headroom so a slightly delayed poll still catches the move.
+    if (mc != null && mc > 0) {
+      pos.priceSnapshots = pos.priceSnapshots || [];
+      pos.priceSnapshots.push({ ts: now, mc });
+      const ninetySecAgo = now - 90 * 1000;
+      pos.priceSnapshots = pos.priceSnapshots.filter(s => s.ts >= ninetySecAgo);
+    }
+
     const slPct  = pos.timeWindow === 'DEAD_ZONE' ? 25 : 50;
     const alerts = [];
+
+    // ── 0. CANDLE CRUSH (highest priority — sub-minute rug detection) ───────
+    // If MC dropped >25% within the last 90s, broadcast IMMEDIATELY before any
+    // other check. Beats the 60s forensic poll for fast rugs like $MANNY.
+    if (mc != null && mc > 0 && (pos.priceSnapshots?.length ?? 0) >= 2 && !pos.alertedFlags.has('CANDLE_CRUSH')) {
+      const maxMc = Math.max(...pos.priceSnapshots.map(s => s.mc));
+      const dropPct = ((maxMc - mc) / maxMc) * 100;
+      if (dropPct > 25) {
+        alerts.push(
+          `🚨 *ORACLE EMERGENCY: CANDLE CRUSH*\n` +
+          `Price dropped *${dropPct.toFixed(1)}%* in <90s ` +
+          `(${fmtUsd(maxMc)} → ${fmtUsd(mc)})\n` +
+          `→ *EXIT 100% IMMEDIATELY. RUG IN PROGRESS.*`
+        );
+        pos.alertedFlags.add('CANDLE_CRUSH');
+        positions.delete(pos.ca);
+        saveToDisk();
+      }
+    }
 
     // ── A. Top-50 Cluster Exit ───────────────────────────────────────────────
     // Watches combined supply % held by top 50 wallets.
@@ -617,7 +645,7 @@ function startTracker(bot) {
     });
   }, 5 * 60 * 1000);
 
-  console.log('[tracker] Oracle Guardian v2.5 started — 60s forensic (lightweight) + 5m heartbeat, positions persisted');
+  console.log('[tracker] Oracle Guardian v10.2 (Spine-Aligned) — 60s forensic + 90s candle-crush + 5m heartbeat, positions persisted');
 }
 
 module.exports = { track, untrack, list, startTracker, maybeEstablishBaseline, syncBaseline };

@@ -74,8 +74,10 @@ async function runScan(job, broadcaster) {
     if (!data?.codex) { stats.skipped++; return; }
 
     const result = scan(data);
-    const volLiq = result.signals?.volLiq ?? 0;
-    if (volLiq < MIN_VOLLIQ_BROADCAST) { stats.skipped++; return; }
+    // v10.2 Spine Alignment: use adjustedVolLiq (organic, wash-corrected) — the
+    // raw `volLiq` field never existed, so Hunt was silent. 5x floor = Entry Grade.
+    const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
+    if (adjustedVolLiq < MIN_VOLLIQ_BROADCAST) { stats.skipped++; return; }
 
     // Post-scan DeFade verification on BUY candidates only (free-plan quota).
     if (result.verdict === 'BUY') {
@@ -94,7 +96,7 @@ async function runScan(job, broadcaster) {
     const mc = result.signals?.marketCap || 0;
     const symbol = data.codex?.symbol || data.pump?.symbol || '???';
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>\n` +
-                   `Detected: <code>${symbol}</code> | Vol/Liq: <b>${volLiq.toFixed(1)}x</b>\n\n`;
+                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>\n\n`;
     await broadcaster(ca, mc, header + message);
     recentlyBroadcast.set(ca, Date.now());
     stats.broadcast++;
