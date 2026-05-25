@@ -40,14 +40,15 @@ function getPositionUnits(entryTier, lp, mc) {
 function momentumGate(birdeye, volLiq) {
   if (!birdeye) return null;
   const { priceChange5m, rangePct } = birdeye;
-  // Distribution: requires a significant 5m drop (>10%) not just any red candle.
-  // Normal Solana "breathing" (small pullbacks during uptrends) should not trigger this.
-  if (priceChange5m !== null && priceChange5m < -10 && volLiq >= 8) {
+  // v10.2.7 STRICT: ANY negative 5m candle with significant volume = distribution.
+  // The old -10% threshold let obvious dumps through as HIGH_CONVICTION.
+  if (priceChange5m !== null && priceChange5m < 0 && volLiq >= 8) {
     return 'VOLUMETRIC_DISTRIBUTION';
   }
   if (rangePct !== null) {
-    // 60% floor captures re-accumulation phase, not just absolute peak.
-    return rangePct >= 0.60 ? 'TOP_QUARTER' : 'LOWER_RANGE';
+    // v10.2.7: tightened 0.60 → 0.75 — must be in top 25% of 1H range to qualify
+    // for any BUY tier. LOWER_RANGE is caught explicitly in the verdict ladder.
+    return rangePct >= 0.75 ? 'TOP_QUARTER' : 'LOWER_RANGE';
   }
   return null;
 }
@@ -160,18 +161,10 @@ function scan(data) {
   const sybilFunded  = !!(bundle?.sybilDetected);
 
   // ── Momentum ───────────────────────────────────────────────────────────────
-  let momentumStatus = momentumGate(birdeye, adjustedVolLiq);
-
-  // HEALTHY DIP override: price dropped >10% in 5m (would normally AVOID) but
-  // buy-side transactions still dominate — signal of dip-buying, not a dump.
-  // Lets the token fall through to the vol/liq verdict ladder as a WATCH/BUY.
-  if (
-    momentumStatus === 'VOLUMETRIC_DISTRIBUTION' &&
-    codex?.buyCount != null && codex?.sellCount != null &&
-    codex.buyCount > codex.sellCount
-  ) {
-    momentumStatus = 'HEALTHY_DIP';
-  }
+  // v10.2.7: HEALTHY_DIP override removed. Letting AVOID flip to BUY because
+  // buyCount > sellCount during a 5m dump was producing false BUY signals on
+  // distribution candles. Strict distribution = strict AVOID, no exceptions.
+  const momentumStatus = momentumGate(birdeye, adjustedVolLiq);
 
   // ── Kill-Shot Headline Hierarchy (v8.4) ───────────────────────────────────
   // Priority: Bundle > Momentum > Concentration > Wash > Liquidity > Deployer
@@ -241,31 +234,57 @@ function scan(data) {
     headlineType = 'INFLATED';
   }
 
-  // ── Verdict ladder (v8.4 — adjusted vol/liq) ──────────────────────────────
+  // ── Verdict ladder (v10.2.7 — Spine Lock) ─────────────────────────────────
+  // Tiered BUY now REQUIRES a multi-factor safety pass. v10.2.6 let high-vol
+  // tokens with bad top10/wash/momentum still earn BUY via the "downgrade to
+  // HIGH_CONVICTION" path. v10.2.7 routes failed safety to WATCH instead.
   let entryTier = null, verdict, watchReason = null;
+
+  // Shared safety predicate for the high tiers (SCRIBBLI / PLUTO).
+  // ALL of: momentum in top 25%, top10 < 15%, wash < 20%, bundle/parent clean,
+  // holder health sane (50-200% or unknown), dev not active.
+  const highTierSafe = (
+    momentumStatus === 'TOP_QUARTER' &&
+    (top10Pct === null || top10Pct < 15) &&
+    (washPct === null || washPct < 20) &&
+    bundleCount <= 7 &&
+    !sybilFunded &&
+    (holderHealthData?.healthPct == null ||
+      (holderHealthData.healthPct >= 50 && holderHealthData.healthPct <= 200)) &&
+    ctoBehavior !== 'DEV_ACTIVE'
+  );
+  // SCRIBBLI adds an LP/MC health gate (>=15%) — required for 50x+ extreme tier.
+  const scribbliSafe = highTierSafe && (mc <= 0 || (lp / mc) * 100 >= 15);
 
   if (noGoReason) {
     verdict = 'NO_GO';
   } else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION') {
     verdict      = 'AVOID';
     headlineType = 'MOMENTUM';
-  // HEALTHY_DIP falls through to the normal vol/liq ladder below (no special case needed)
+  } else if (momentumStatus === 'LOWER_RANGE') {
+    // v10.2.7: range <0.75 = momentum fail. Cannot become BUY at any vol tier.
+    verdict      = 'WATCH_VOL';
+    watchReason  = `MOMENTUM FAIL — Price in lower 75% of 1H range. WATCH for re-accumulation back to top quarter.`;
+    headlineType = 'MOMENTUM';
   } else if (washPct !== null && washPct > 30) {
     // Soft wash gate (30-50%): cap at WATCH
     verdict      = 'WATCH_WASH';
     watchReason  = `Wash volume ${washPct.toFixed(0)}% exceeds 30% — capped at WATCH. Wait for organic volume to dominate.`;
     headlineType = 'WASH';
-  } else if (adjustedVolLiq >= 50) {
+  } else if (adjustedVolLiq >= 50 && scribbliSafe) {
     entryTier    = 'SCRIBBLI'; verdict = 'BUY';
-  } else if (adjustedVolLiq >= 12 &&
-             (washPct === null || washPct < 20) &&
-             (top10Pct === null || top10Pct < 15) &&
-             momentumStatus === 'TOP_QUARTER') {
-    // Pluto Lock: all four conditions required
+  } else if (adjustedVolLiq >= 50) {
+    // v10.2.7: 50x+ without safety NO LONGER auto-buys. Sit on hands.
+    verdict      = 'WATCH_VOL';
+    watchReason  = `SCRIBBLI threshold met (${adjustedVolLiq.toFixed(1)}x) but safety failed — top10/momentum/bundle/wash/holder/dev/LP-MC. WATCH only.`;
+  } else if (adjustedVolLiq >= 12 && highTierSafe) {
     entryTier    = 'PLUTO'; verdict = 'BUY';
   } else if (adjustedVolLiq >= 12) {
-    // Pluto conditions not fully met — downgrade to HIGH_CONVICTION
-    entryTier    = 'HIGH_CONVICTION'; verdict = 'BUY';
+    // v10.2.7: failed PLUTO safety NO LONGER downgrades to HIGH_CONVICTION BUY.
+    // It becomes WATCH. The old downgrade was the single biggest source of
+    // "Oracle called this rug a BUY" complaints in v10.2.6.
+    verdict      = 'WATCH_VOL';
+    watchReason  = `PLUTO threshold met (${adjustedVolLiq.toFixed(1)}x) but safety failed — top10/momentum/wash/bundle/holder/dev. WATCH only.`;
   } else if (adjustedVolLiq >= 8) {
     entryTier    = 'HIGH_CONVICTION'; verdict = 'BUY';
   } else if (adjustedVolLiq >= 5) {
@@ -302,28 +321,20 @@ function scan(data) {
     socialUpgrade = true;
   }
 
-  // ── RISKY RUNNER overrides ─────────────────────────────────────────────────
+  // ── RISKY RUNNER (v10.2.7: temporarily disabled) ──────────────────────────
+  // The Grok social+pro-pilot override and the INFLATED→RISKY_RUNNER demotion
+  // both produced false signals on obvious rugs in v10.2.6. Disabled until the
+  // base scanner is reliable; inflated holders now go to NO_GO instead.
   let riskyRunnerReason = null;
 
-  // (A) Grok-style social+dev override: a soft NO_GO with viral X sentiment and
-  // a proven dev CAN be a hidden opportunity. Hard kills never overridden.
-  const socialViral = social?.available && (social?.mentionCount ?? 0) >= 20;
-  if (
-    verdict === 'NO_GO' &&
-    headlineType !== 'BUNDLE' &&
-    headlineType !== 'WASH' &&
-    socialViral &&
-    isProPilot
-  ) {
-    verdict = 'RISKY_RUNNER';
-    riskyRunnerReason = 'SOCIAL_GROK';
-  }
-
-  // (B) INFLATED/BOTTED demotion: synthetic holder counts at low MC mean the
-  // BUY conviction is unearned — demote to RISKY_RUNNER at 0.5x size.
+  // INFLATED/BOTTED demotion: at any MC, synthetic holder count means the
+  // BUY conviction is unearned. v10.2.6 demoted to RISKY_RUNNER; v10.2.7 → NO_GO.
+  // (Gate 9 in the NO_GO ladder already covers MC<$100K; this catches MC>=$100K.)
   if (verdict === 'BUY' && holderHealthData?.label === 'INFLATED/BOTTED') {
-    verdict = 'RISKY_RUNNER';
-    riskyRunnerReason = 'INFLATED_HOLDERS';
+    verdict      = 'NO_GO';
+    noGoReason   = `INFLATED HOLDERS — Health ${holderHealthData.healthPct}% (>200%) — bot wallets suspected.`;
+    headlineType = 'INFLATED';
+    entryTier    = null;
   }
 
   const positionUnits   = getPositionUnits(entryTier, lp, mc);

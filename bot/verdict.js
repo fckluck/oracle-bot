@@ -311,14 +311,14 @@ function formatVerdict(result, ca) {
     const healthPct = Math.round((effectiveCount / target) * 100);
     let label, icon;
     if (isFloor) {
-      if (healthPct >= 200)      { label = 'INFLATED/BOTTED'; icon = '🔴'; }
-      else if (healthPct >= 50)  { label = 'PASS (floor)';    icon = '✅'; }
-      else                       { label = 'UNVERIFIED';      icon = '⚪'; }
+      if (healthPct >= 200)      { label = 'OVERDISTRIBUTED / BOT-LIKELY'; icon = '🔴'; }
+      else if (healthPct >= 50)  { label = 'PASS (floor)';                 icon = '✅'; }
+      else                       { label = 'UNVERIFIED';                   icon = '⚪'; }
       holderDisplay = `≥${effectiveCount} | Health: ≥${healthPct}% ${icon} ${esc(label)} (target ~${target})`;
     } else {
-      if (healthPct < 50)        { label = 'LOW ORGANIC';     icon = '🟡'; }
-      else if (healthPct > 200)  { label = 'INFLATED/BOTTED'; icon = '🔴'; }
-      else                       { label = 'PASS';            icon = '✅'; }
+      if (healthPct < 50)        { label = 'LOW ORGANIC';                  icon = '🟡'; }
+      else if (healthPct > 200)  { label = 'OVERDISTRIBUTED / BOT-LIKELY'; icon = '🔴'; }
+      else                       { label = 'PASS';                         icon = '✅'; }
       holderDisplay = `${effectiveCount} | Health: ${healthPct}% ${icon} ${esc(label)} (target ~${target})`;
     }
   } else if (effectiveCount !== null) {
@@ -330,12 +330,13 @@ function formatVerdict(result, ca) {
     holderDisplay = 'UNVERIFIED';
   }
 
+  // v10.2.7: anything > 15% is FAIL. The old MODERATE/ELEVATED/NEUTRAL tiers
+  // made >15% top10 look acceptable in the UI even though the scanner now
+  // routes it to NO_GO. Display must match scanner truth.
   const top10Display = signals.top10Pct !== null
     ? `${fmtPct(signals.top10Pct)} (${esc(
-        signals.top10Pct > 35                       ? 'HARD FAIL' :
-        (isSmallCap && signals.top10Pct <= 30)      ? 'HEALTHY'   :
-        signals.top10Pct > 25                       ? 'ELEVATED'  :
-        signals.top10Pct > 15                       ? 'MODERATE'  : 'NEUTRAL'
+        (isSmallCap && signals.top10Pct <= 15)  ? 'HEALTHY (small-cap)' :
+        signals.top10Pct > 15                   ? 'FAIL'                : 'CLEAN'
       )})`
     : `UNVERIFIED`;
 

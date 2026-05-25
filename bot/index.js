@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
-const { fetchAll, fetchDeFadeVerification, fetchSocialData } = require('./fetcher');
+const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
 const tracker   = require('./tracker');
@@ -42,7 +42,7 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.6)</b>\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.7 — Spine Lock)</b>\n` +
   `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
@@ -53,6 +53,7 @@ const HELP_MENU =
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
+  `• /huntping — Force one Dex fallback poll and report results\n` +
   `• /window — Current trading mode (Discovery / Dead Zone / Research)\n\n` +
   `<b>── POSITION TRACKING (Guardian) ──</b>\n` +
   `• /tracking — List all tracked tokens + live state\n` +
@@ -89,6 +90,30 @@ bot.command('unhunt', ctx => {
   return ctx.reply(removed ? '🎯 Hunt Mode: OFF for this chat.' : 'Hunt Mode was not active for this chat.');
 });
 
+// v10.2.7: forces one Dex fallback poll on demand and reports the stat delta,
+// so users can verify the fallback path is alive without waiting up to 90s
+// for the next scheduled poll. Distinguishes "fallback never runs" from
+// "fallback runs but never finds usable launches".
+bot.command('huntping', async ctx => {
+  await ctx.reply('🛰️ Forcing one Dex fallback poll...');
+  const r = await hunt.pingFallback();
+  if (!r.ok) return ctx.replyWithHTML(`⚠️ /huntping failed: ${r.reason}`);
+  const d = r.delta;
+  const note = d.enqueued === 0
+    ? '⚠️ Fallback polled DexScreener but found no new launches passing dust filter (this is normal in quiet windows).'
+    : '✅ Fallback enqueued tokens for scanning.';
+  return ctx.replyWithHTML(
+    `<b>/huntping result (delta this call)</b>\n` +
+    `attempts:  ${d.attempts}\n` +
+    `polls:     ${d.polls}\n` +
+    `enqueued:  ${d.enqueued}\n` +
+    `scanned:   ${d.scanned}\n` +
+    `broadcast: ${d.broadcast}\n` +
+    `skipped:   ${d.skipped}\n` +
+    `errors:    ${d.errors}\n\n${note}`
+  );
+});
+
 bot.command('huntstatus', ctx => {
   const h = hunt.status();
   const uptime  = h.uptimeMs   ? Math.floor(h.uptimeMs   / 1000) + 's' : '—';
@@ -116,7 +141,7 @@ bot.command('huntstatus', ctx => {
     `Hammer:    every ${Math.floor((h.reconnectHammerMs || 15000) / 1000)}s if disconnected\n` +
     (h.lastWsClose ? `Last close: code ${h.lastWsClose.code ?? 'n/a'}${h.lastWsClose.reason ? ` | ${h.lastWsClose.reason}` : ''}\n` : '') +
     `Queue:     ${h.queueDepth} pending | ${h.activeScans} running\n\n` +
-    (h.staleWs ? `⚠️ <b>WS is stale:</b> PumpPortal is connected but not producing usable launch CAs. Fallback should cover partial discovery.\n\n` : '') +
+    (h.staleWs ? `⚠️ <b>PumpPortal firehose unavailable</b> — WS connected but 0 raw frames in 2+ min. Dex fallback active only.\n\n` : '') +
     (!h.connected ? `🚨 <b>WS is disconnected:</b> reconnect hammer is active and fallback should poll immediately once /hunt is enabled.\n\n` : '') +
     (h.startedAt == null ? `❌ <b>FATAL:</b> Hunt engine never started (start() not called). Use /huntdebug.\n\n` : '') +
     `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`;
@@ -171,6 +196,25 @@ bot.command('huntdebug', ctx => {
     `hard reconnects:    ${h.hardReconnects ?? 0}\n` +
     `\n<b>Diagnosis</b>\n${verdict}`
   );
+});
+
+// v10.2.7: real /untrack <CA> command. Previously only worked as inline button.
+bot.command('untrack', ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const ca    = parts[1];
+  if (!ca || !isSolanaCA(ca)) {
+    const lst = tracker.list();
+    if (!lst.length) return ctx.reply('Usage: /untrack <CA>\n(No positions currently tracked.)');
+    const lines = lst.map((p,i) => `${i+1}. <code>${p.ca}</code>`).join('\n');
+    return ctx.replyWithHTML(`Usage: <code>/untrack &lt;CA&gt;</code>\n\n<b>Tracked positions:</b>\n${lines}`);
+  }
+  const pos = tracker.list().find(p => p.ca === ca);
+  if (!pos) return ctx.reply(`Not currently tracking ${ca.slice(0,6)}...${ca.slice(-4)}.`);
+  if (pos.chatId !== ctx.chat.id) return ctx.reply('You can only untrack your own positions.');
+  const removed = tracker.untrack(ca);
+  return ctx.replyWithHTML(removed
+    ? `❌ Stopped tracking <code>${ca.slice(0,6)}...${ca.slice(-4)}</code>. Guardian poll halted.`
+    : `Untrack failed for <code>${ca.slice(0,6)}...${ca.slice(-4)}</code>.`);
 });
 
 bot.command('tracking', ctx => {
@@ -347,24 +391,42 @@ bot.on('callback_query', async ctx => {
     const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct, entryLp);
     const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
 
-    if (added) {
-      await ctx.answerCbQuery(`✅ Tracking ${shortCa} — Guardian active`);
-      const baselineReady = top50Pct !== null && holderCount !== null;
-      await ctx.telegram.sendMessage(
-        ctx.chat.id,
-        `🔔 *Oracle Guardian activated*\nTracking \`${shortCa}\`\nEntry MC: $${(mc/1000).toFixed(1)}K\n` +
-        (baselineReady
-          ? `Baseline: ${holderCount} holders | Top 50: ${top50Pct.toFixed(1)}%\n\nAll triggers active. Forensic scan every 60s.`
-          : `\n⏳ Holder data pending — establishing baseline in background...`),
-        { parse_mode: 'Markdown' }
-      );
-      // If holder/top50 data was null at entry, retry in background until set
-      tracker.maybeEstablishBaseline(ca, bot);
-    } else {
-      const reason = tracker.list().length >= 10
-        ? 'max 10 positions reached'
-        : 'already tracking this token';
+    if (!added) {
+      const reason = tracker.list().length >= 10 ? 'max 10 positions reached' : 'already tracking this token';
       await ctx.answerCbQuery(`⚠️ ${reason}`);
+      return;
+    }
+    await ctx.answerCbQuery(`✅ Tracking ${shortCa}`);
+
+    // v10.2.7: synchronous baseline. If forensic fetch fails RIGHT NOW, untrack
+    // and tell the user — don't silently add a position that Guardian can't poll.
+    // The old code would say "Tracking" even when entry data was all null.
+    try {
+      const sig = await fetchForensic(ca);
+      if (!sig) throw new Error('forensic returned null (DexScreener/SolanaTracker unreachable)');
+      const fmtUsd = (n) => !n ? 'N/A' : n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : n >= 1e3 ? `$${(n/1e3).toFixed(1)}K` : `$${n.toFixed(2)}`;
+      await ctx.telegram.sendMessage(ctx.chat.id,
+        `🔔 *Oracle Guardian — Baseline Set*\n` +
+        `\`${shortCa}\`\n` +
+        `• MC: ${fmtUsd(sig.marketCap)}\n` +
+        `• LP: ${fmtUsd(sig.lp)}\n` +
+        `• Holders: ${sig.holderCount ?? 'N/A'}\n` +
+        `• Top 10: ${sig.top10Pct != null ? sig.top10Pct.toFixed(1) + '%' : 'N/A'}\n` +
+        `• Top 50: ${sig.top50Pct != null ? sig.top50Pct.toFixed(1) + '%' : 'N/A'}\n` +
+        `• Vol/Liq (1h): ${sig.adjustedVolLiq != null ? sig.adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}\n\n` +
+        `_Next forensic poll in 60s. All triggers active._`,
+        { parse_mode: 'Markdown' });
+      // If holder/top50 missing at this moment, the async retry will fill them in.
+      if (sig.top50Pct == null || sig.holderCount == null) {
+        tracker.maybeEstablishBaseline(ca, bot);
+      }
+    } catch (e) {
+      tracker.untrack(ca);
+      await ctx.telegram.sendMessage(ctx.chat.id,
+        `❌ *TRACK FAILED — forensic data unavailable*\n` +
+        `\`${shortCa}\` is NOT actively monitored.\n` +
+        `Reason: ${e.message}\nTry /sync ${ca.slice(0,6)}... in a few minutes once the token settles.`,
+        { parse_mode: 'Markdown' });
     }
   }
 });
@@ -373,7 +435,7 @@ bot.on('callback_query', async ctx => {
 
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
-    console.log('Oracle Bot v10.2.6 (Deep Instrumentation) started');
+    console.log('Oracle Bot v10.2.7 (Spine Lock) started');
 
     // Each startup subsystem is isolated — one crash must not kill the others.
     try { tracker.startTracker(bot); }
@@ -388,7 +450,10 @@ bot.launch({ dropPendingUpdates: true })
     // Broadcast startup ping to all persisted hunters so they know the bot
     // restarted (Railway redeploys would otherwise be invisible).
     const hunters = hunt.listHunters();
-    const startupMsg = `🚀 <b>Oracle v10.2.6 Online &amp; Deep Instrumentation</b>\nRailway wiped my hunters list — tap /hunt to re-enable.\nUse /huntdebug if anything looks wrong.`;
+    const startupMsg = `🚀 <b>Oracle v10.2.7 Online — Spine Lock active</b>\n` +
+      `Stricter scanner: PLUTO/SCRIBBLI now require multi-factor safety.\n` +
+      `Top10 &gt;15%, range &lt;75%, or 5m red + 8x vol → no longer BUY.\n` +
+      `Use /huntdebug or /huntping if anything looks wrong.`;
     for (const chatId of hunters) {
       try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
       catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }

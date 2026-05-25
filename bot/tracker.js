@@ -12,7 +12,18 @@ const { fetchForensic } = require('./fetcher');
 
 const MAX_POSITIONS  = 10;
 const POLL_INTERVAL  = 60 * 1000; // 60s
-const PERSIST_FILE   = path.join(__dirname, 'positions.json');
+
+// v10.2.7: persist on Railway volume if available. Order:
+//   1. POSITIONS_FILE env override (explicit)
+//   2. /data/positions.json (Railway volume convention)
+//   3. bot/positions.json (dev / no volume — wiped on Railway redeploy)
+function resolvePersistFile() {
+  if (process.env.POSITIONS_FILE) return process.env.POSITIONS_FILE;
+  try { fs.accessSync('/data', fs.constants.W_OK); return '/data/positions.json'; } catch (_) {}
+  return path.join(__dirname, 'positions.json');
+}
+const PERSIST_FILE = resolvePersistFile();
+console.log(`[tracker] persist file: ${PERSIST_FILE}`);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 // Map: ca -> {

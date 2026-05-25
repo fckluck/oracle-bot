@@ -25,7 +25,14 @@ const config            = require('./config');
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
 const DEX_PROFILES_URL = 'https://api.dexscreener.com/token-profiles/latest/v1';
 const DEX_CTO_URL      = 'https://api.dexscreener.com/community-takeovers/latest/v1';
-const HUNTERS_FILE     = path.join(__dirname, 'hunters.json');
+// v10.2.7: persist on Railway volume if available so /hunt survives redeploys.
+function resolveHuntersFile() {
+  if (process.env.HUNTERS_FILE) return process.env.HUNTERS_FILE;
+  try { fs.accessSync('/data', fs.constants.W_OK); return '/data/hunters.json'; } catch (_) {}
+  return path.join(__dirname, 'hunters.json');
+}
+const HUNTERS_FILE = resolveHuntersFile();
+console.log(`[hunt] hunters file: ${HUNTERS_FILE}`);
 const MIN_VOLLIQ_BROADCAST       = 5;
 const MIN_MARKET_CAP_SOL_PRESCAN = 30;   // skip dust launches (~$4K)
 const WS_STALE_MS           = Number.isFinite(config.HUNT_WS_STALE_MS)            ? config.HUNT_WS_STALE_MS            : 120_000;
@@ -66,6 +73,14 @@ function loadHunters() {
       hunters = new Set(Array.isArray(raw) ? raw : []);
     }
     huntersLoaded = true;
+    // v10.2.7: if persistence was wiped (Railway redeploy w/o volume) and an
+    // owner is configured, auto-register them so the bot doesn't go blind.
+    const ownerId = parseInt(config.OWNER_TELEGRAM_ID, 10);
+    if (hunters.size === 0 && Number.isFinite(ownerId) && ownerId > 0) {
+      hunters.add(ownerId);
+      console.log(`[hunt] auto-registered OWNER_TELEGRAM_ID=${ownerId} as default hunter (list was empty)`);
+      try { fs.writeFileSync(HUNTERS_FILE, JSON.stringify([...hunters], null, 2)); } catch (_) {}
+    }
   } catch (e) { console.error('[hunt] loadHunters error:', e.message); }
 }
 
@@ -641,4 +656,31 @@ function start(bot, buildKeyboard) {
   console.log(`[hunt] hunt mode started — ${hunters.size} hunter(s) registered`);
 }
 
-module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect };
+// v10.2.7: /huntping forces one Dex fallback poll and returns the stats delta
+// so users can verify the fallback path is alive without waiting for the next
+// scheduled poll (which may be up to 90s away).
+async function pingFallback() {
+  if (!savedBroadcaster) return { ok: false, reason: 'start() never called — Hunt engine not initialized' };
+  const snap = () => ({
+    attempts:  stats.fallbackAttempts  || 0,
+    polls:     stats.fallbackPolls     || 0,
+    enqueued:  stats.fallbackEnqueued  || 0,
+    scanned:   stats.scanned           || 0,
+    broadcast: stats.broadcast         || 0,
+    skipped:   stats.skipped           || 0,
+    errors:    stats.fallbackErrors    || 0,
+  });
+  const before = snap();
+  try {
+    await pollDexFallback(savedBroadcaster, { force: true });
+  } catch (e) {
+    return { ok: false, reason: `pollDexFallback threw: ${e.message}` };
+  }
+  // Give the queue a beat to drain the immediate ones so the delta is meaningful.
+  await new Promise(r => setTimeout(r, 1500));
+  const after = snap();
+  const delta = Object.fromEntries(Object.keys(before).map(k => [k, after[k] - before[k]]));
+  return { ok: true, delta };
+}
+
+module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect, pingFallback };
