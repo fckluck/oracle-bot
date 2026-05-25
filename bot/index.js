@@ -36,17 +36,29 @@ function buildKeyboard(ca, currentMc, verdict) {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-bot.start(ctx => ctx.replyWithHTML(
-  `🚀 <b>Oracle Solana Bot</b>\n\nSend a contract address to scan.\n/help for commands.`
-));
+const HELP_MENU =
+  `🛠️ <b>ORACLE COMMAND CENTER (v10.2)</b>\n` +
+  `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
+  `<b>── CORE ──</b>\n` +
+  `• /start — Re-initialize the Oracle interface\n` +
+  `• /help — Show this command menu\n` +
+  `• /status — API + Guardian health snapshot\n\n` +
+  `<b>── HUNT MODE (Automated) ──</b>\n` +
+  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts on 5x+ Adjusted Vol/Liq launches\n` +
+  `• /unhunt — Disable automated alerts\n` +
+  `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
+  `• /window — Current trading mode (Discovery / Dead Zone / Research)\n\n` +
+  `<b>── POSITION TRACKING (Guardian) ──</b>\n` +
+  `• /tracking — List all tracked tokens + live state\n` +
+  `• /sync [CA] — Force-sync Guardian baseline if entry was missed\n` +
+  `• /untrack [CA] — Stop monitoring a specific token\n\n` +
+  `<b>── RESEARCH ──</b>\n` +
+  `• /watchlist — Tokens being watched for Entry Grade activation\n` +
+  `• <i>[Paste any CA]</i> — Full 10-gate forensic Oracle Scorecard\n\n` +
+  `<i>Type /hunt to begin. 🔒🛡️🚀</i>`;
 
-bot.help(ctx => ctx.replyWithHTML(
-  `<b>Oracle Solana Bot v8.1 (Predator)</b>\n\nPaste any Solana CA to get a full Oracle Scorecard.\n\n` +
-  `<b>Commands:</b>\n/start — welcome\n/help — this message\n/status — bot health\n` +
-  `/tracking — list tracked positions\n/window — current thresholds\n` +
-  `/hunt — 🎯 24/7 auto-scan new launches (vol/liq ≥ 5x only)\n` +
-  `/unhunt — stop hunt mode\n/huntstatus — hunt diagnostics`
-));
+bot.start(ctx => ctx.replyWithHTML(HELP_MENU));
+bot.help(ctx  => ctx.replyWithHTML(HELP_MENU));
 
 bot.command('status', ctx => {
   const h = hunt.status();
@@ -284,11 +296,21 @@ bot.on('callback_query', async ctx => {
 // ── Launch ────────────────────────────────────────────────────────────────────
 
 bot.launch({ dropPendingUpdates: true })
-  .then(() => {
-    console.log('Oracle Bot started');
+  .then(async () => {
+    console.log('Oracle Bot v10.2 (Spine-Aligned) started');
     tracker.startTracker(bot);
     hunt.start(bot, buildKeyboard);
     watchlist.start(bot);
+
+    // Broadcast startup ping to all persisted hunters so they know the bot
+    // restarted (Railway redeploys would otherwise be invisible).
+    const hunters = hunt.listHunters();
+    const startupMsg = `🚀 <b>Oracle v10.2 Online &amp; Spine-Aligned</b>\nType /hunt to begin.`;
+    for (const chatId of hunters) {
+      try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
+      catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }
+    }
+    if (hunters.length) console.log(`[startup] pinged ${hunters.length} hunter(s)`);
   })
   .catch(err => {
     console.error('Failed to launch bot:', err.message);

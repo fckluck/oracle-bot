@@ -39,6 +39,7 @@ function addHunter(chatId)    { const had = hunters.has(chatId); hunters.add(cha
 function removeHunter(chatId) { const had = hunters.has(chatId); hunters.delete(chatId); saveHunters(); return had; }
 function hunterCount()        { return hunters.size; }
 function isHunter(chatId)     { return hunters.has(chatId); }
+function listHunters()        { loadHunters(); return [...hunters]; }
 
 // ── Scan queue (bounded concurrency) ────────────────────────────────────────
 
