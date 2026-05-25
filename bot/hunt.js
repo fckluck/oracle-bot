@@ -1,25 +1,50 @@
-// ── Oracle v8.1 Predator Hunt Mode ──────────────────────────────────────────
+// ── Oracle v10.2.3 Predator Hunt Mode ────────────────────────────────────────
 // Persistent WebSocket to wss://pumpportal.fun/api/data. Subscribes to
 // new-token + migration events. Each event triggers a full Oracle scan in
 // a concurrency-limited queue. Verdicts with Vol/Liq ≥ 5x are broadcast to
 // every chat that has opted in via /hunt. Below that, the bot stays silent.
+//
+// v10.2.3: DexScreener fallback poller arms automatically when PumpPortal WS
+// is stale or disconnected. Robust message normalization handles payload-shape
+// changes. Full per-frame diagnostics exposed via /huntstatus.
 
-const fs = require('fs');
-const path = require('path');
-const WS   = require('ws');          // explicit import — never rely on global WebSocket
+const fs    = require('fs');
+const path  = require('path');
+const fetch = require('node-fetch');
+const WS    = require('ws');          // explicit import — never rely on global WebSocket
 const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
-const { scan }     = require('./scanner');
+const { scan }          = require('./scanner');
 const { formatVerdict } = require('./verdict');
+const config            = require('./config');
 
-const WS_URL = 'wss://pumpportal.fun/api/data';
-const HUNTERS_FILE = path.join(__dirname, 'hunters.json');
-const MIN_VOLLIQ_BROADCAST = 5;
+const WS_BASE_URL    = 'wss://pumpportal.fun/api/data';
+const DEX_PROFILES_URL = 'https://api.dexscreener.com/token-profiles/latest/v1';
+const DEX_CTO_URL      = 'https://api.dexscreener.com/community-takeovers/latest/v1';
+const HUNTERS_FILE   = path.join(__dirname, 'hunters.json');
+const MIN_VOLLIQ_BROADCAST       = 5;
 const MIN_MARKET_CAP_SOL_PRESCAN = 30;   // skip dust launches (~$4K)
-const QUEUE_CONCURRENCY = 2;
-const SCAN_STALE_MS = 30_000;
-const RECONNECT_BASE_MS = 2_000;
-const RECONNECT_MAX_MS = 60_000;
+const WS_STALE_MS          = Number.isFinite(config.HUNT_WS_STALE_MS)           ? config.HUNT_WS_STALE_MS           : 120_000;
+const FALLBACK_ENABLED     = config.HUNT_FALLBACK_ENABLED !== false;
+const FALLBACK_POLL_MS     = Number.isFinite(config.HUNT_FALLBACK_POLL_MS)      ? config.HUNT_FALLBACK_POLL_MS      : 90_000;
+const FALLBACK_MAX_PER_POLL = Number.isFinite(config.HUNT_FALLBACK_MAX_PER_POLL) ? config.HUNT_FALLBACK_MAX_PER_POLL : 10;
+const QUEUE_CONCURRENCY  = 2;
+const SCAN_STALE_MS      = 30_000;
+const RECONNECT_BASE_MS  = 2_000;
+const RECONNECT_MAX_MS   = 60_000;
 const PER_CA_COOLDOWN_MS = 5 * 60 * 1000; // don't re-broadcast same CA inside 5min
+const READY_STATE_OPEN   = 1;
+const HEARTBEAT_MS       = 30 * 1000;     // ping every 30s to keep door open
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function buildWsUrl() {
+  const key = config.PUMPPORTAL_API_KEY || process.env.PUMPPORTAL_API_KEY || '';
+  return key
+    ? `${WS_BASE_URL}?api-key=${encodeURIComponent(key)}`
+    : WS_BASE_URL;
+}
+
+function isSolanaCA(text) { return typeof text === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,50}$/.test(text.trim()); }
 
 // ── Hunter registry (persisted) ─────────────────────────────────────────────
 
@@ -55,12 +80,50 @@ function listHunters()        { ensureHuntersLoaded(); return [...hunters]; }
 const queue = [];
 let active = 0;
 const recentlyBroadcast = new Map(); // ca -> ts
-const stats = { scanned: 0, broadcast: 0, skipped: 0, errors: 0, lastEvent: null };
+const seenFallback      = new Map(); // ca -> ts
+let fallbackTimer = null;
+const stats = {
+  scanned: 0,
+  broadcast: 0,
+  skipped: 0,
+  errors: 0,
+  rawEvents: 0,
+  ignoredEvents: 0,
+  lastRawEvent: null,
+  lastEvent: null,         // last usable event that produced a CA
+  lastSource: null,
+  lastIgnoredReason: null,
+  fallbackPolls: 0,
+  fallbackEnqueued: 0,
+  fallbackErrors: 0,
+};
 
 function enqueue(job, broadcaster) {
   job.enqueuedAt = Date.now();
   queue.push({ job, broadcaster });
   pump();
+}
+
+function markIgnored(reason, msg) {
+  stats.ignoredEvents++;
+  stats.lastIgnoredReason = reason;
+  if (stats.ignoredEvents <= 10 || stats.ignoredEvents % 100 === 0) {
+    let sample = '';
+    try { sample = JSON.stringify(msg).slice(0, 500); } catch (_) { sample = '[unserializable]'; }
+    console.log(`[hunt] ignored WS frame (${reason}): ${sample}`);
+  }
+}
+
+function cleanupMaps() {
+  const now = Date.now();
+  const broadcastTtl = PER_CA_COOLDOWN_MS * 3;
+  for (const [ca, ts] of recentlyBroadcast) {
+    if (now - ts > broadcastTtl) recentlyBroadcast.delete(ca);
+  }
+  const fallbackTtl = 30 * 60 * 1000;
+  for (const [ca, ts] of seenFallback) {
+    if (now - ts > fallbackTtl) seenFallback.delete(ca);
+  }
 }
 
 async function pump() {
@@ -73,7 +136,7 @@ async function pump() {
 }
 
 async function runScan(job, broadcaster) {
-  const { ca, eventType } = job;
+  const { ca, eventType, source = 'unknown' } = job;
   try {
     // Per-CA cooldown — avoid spamming the same token across new + migration events
     const last = recentlyBroadcast.get(ca);
@@ -106,13 +169,14 @@ async function runScan(job, broadcaster) {
     const mc = result.signals?.marketCap || 0;
     const symbol = data.codex?.symbol || data.pump?.symbol || '???';
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>\n` +
-                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>\n\n`;
-    await broadcaster(ca, mc, header + message);
+                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>\n` +
+                   `Source: <code>${source}</code>\n\n`;
+    await broadcaster(ca, mc, header + message, result.verdict);
     recentlyBroadcast.set(ca, Date.now());
     stats.broadcast++;
   } catch (e) {
     stats.errors++;
-    console.error(`[hunt] scan error for ${ca}:`, e.message);
+    console.error(`[hunt] scan error for ${ca}:`, e?.stack || e.message);
   }
 }
 
@@ -130,13 +194,10 @@ let wasDisconnected = false;         // outage epoch flag — gates dedupe of RE
 let savedBroadcaster = null;         // for forceReconnect() + restoration ping
 let savedBotRef = null;              // for sending restoration alert to hunters
 
-const HEARTBEAT_MS = 30 * 1000;      // ping every 30s to keep door open
-
 function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
-    // ws (native global / ws lib) — readyState 1 = OPEN
-    if (ws && ws.readyState === 1) {
+    if (ws && ws.readyState === READY_STATE_OPEN) {
       try {
         if (typeof ws.ping === 'function') ws.ping();          // node-ws lib
         else ws.send(JSON.stringify({ method: 'ping' }));      // browser-style fallback
@@ -163,6 +224,57 @@ function cancelPendingReconnect() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 }
 
+// Normalise a raw PumpPortal WS frame into { ok, ca, eventType, mcSol }.
+// Handles any payload envelope (msg.data, msg.result, msg.payload, or root).
+// Robust to PumpPortal changing field names — tries every known CA path.
+function normalizeWsMessage(msg) {
+  const payload = msg?.data || msg?.result || msg?.payload || msg;
+  const ca =
+    payload?.mint ||
+    payload?.tokenAddress ||
+    payload?.address ||
+    payload?.ca ||
+    payload?.contractAddress ||
+    payload?.token?.mint ||
+    payload?.token?.address ||
+    payload?.baseToken?.address;
+
+  if (!isSolanaCA(ca)) return { ok: false, reason: 'NO_VALID_CA' };
+
+  const rawType = String(payload?.txType || payload?.type || payload?.event || payload?.method || '').toLowerCase();
+  const eventType =
+    rawType.includes('create') || rawType.includes('new')
+      ? 'new'
+      : rawType.includes('migration') || rawType.includes('migrate') || payload?.pool || payload?.raydiumPool
+        ? 'migration'
+        : 'event';
+
+  const mcSolRaw = payload?.marketCapSol ?? payload?.mcSol ?? null;
+  const mcSol    = mcSolRaw == null ? null : Number(mcSolRaw);
+
+  return {
+    ok: true,
+    ca,
+    eventType,
+    mcSol: Number.isFinite(mcSol) ? mcSol : null,
+  };
+}
+
+// Fires WS_STALE_MS after each connect. If no usable launch events arrived,
+// logs a diagnostic (so Railway logs show the stale condition immediately).
+function warnIfWsStale(myGen) {
+  setTimeout(() => {
+    if (myGen !== socketGen || !connectedAt) return;
+    const stale = !stats.lastEvent || Date.now() - stats.lastEvent > WS_STALE_MS;
+    if (stale) {
+      const rawLine = stats.lastRawEvent
+        ? `raw frames seen ${Math.floor((Date.now() - stats.lastRawEvent) / 1000)}s ago`
+        : 'no raw frames seen';
+      console.error(`[hunt] WS connected but no usable launch events (${rawLine}). PumpPortal may require API key, be stale, blocked, or changed payload shape.`);
+    }
+  }, WS_STALE_MS).unref?.();
+}
+
 function connect(broadcaster) {
   cancelPendingReconnect();
   savedBroadcaster = broadcaster;
@@ -171,7 +283,12 @@ function connect(broadcaster) {
   // forceReconnect → old-close-after-new-connect race.
   const myGen = ++socketGen;
   let mySocket;
-  try { mySocket = new WS(WS_URL); ws = mySocket; }
+  try {
+    const url = buildWsUrl();
+    mySocket = new WS(url);
+    ws = mySocket;
+    console.log(`[hunt] connecting to PumpPortal WS (${config.PUMPPORTAL_API_KEY ? 'API key configured' : 'no API key'})`);
+  }
   catch (e) { console.error('[hunt] WS construct error:', e.message); scheduleReconnect(broadcaster); return; }
 
   mySocket.addEventListener('open', () => {
@@ -183,6 +300,7 @@ function connect(broadcaster) {
     mySocket.send(JSON.stringify({ method: 'subscribeNewToken' }));
     mySocket.send(JSON.stringify({ method: 'subscribeMigration' }));
     startHeartbeat();
+    warnIfWsStale(myGen);
     if (wasDown) { wasDisconnected = false; broadcastRestored().catch(() => {}); }
     wasEverConnected = true;
   });
@@ -191,20 +309,21 @@ function connect(broadcaster) {
     if (myGen !== socketGen) return;        // ignore stale frames
     try {
       const msg = JSON.parse(ev.data);
+      stats.rawEvents++;
+      stats.lastRawEvent = Date.now();
+
+      const normalized = normalizeWsMessage(msg);
+      if (!normalized.ok) { markIgnored(normalized.reason, msg); return; }
+
+      const { ca, eventType, mcSol } = normalized;
       stats.lastEvent = Date.now();
-      const ca = msg.mint || msg.tokenAddress || msg.address;
-      if (!ca || typeof ca !== 'string') return;
+      stats.lastSource = 'pumpportal-ws';
+      // If marketCapSol is missing, do NOT skip. Old code treated missing as 0
+      // and could silently drop every new-token event if PumpPortal changed fields.
+      if (eventType === 'new' && mcSol != null && mcSol < MIN_MARKET_CAP_SOL_PRESCAN) { stats.skipped++; return; }
 
-      // Cheap pre-filter — skip dust launches before paying for a full scan
-      const mcSol = Number(msg.marketCapSol ?? msg.marketCap ?? 0);
-      const eventType = msg.txType === 'create' ? 'new'
-                      : msg.pool                ? 'migration'
-                      : (msg.signature ? 'event' : null);
-      if (!eventType) return;
-      if (eventType === 'new' && mcSol < MIN_MARKET_CAP_SOL_PRESCAN) { stats.skipped++; return; }
-
-      enqueue({ ca, eventType, mcSol }, broadcaster);
-    } catch (e) { /* malformed frame */ }
+      enqueue({ ca, eventType, mcSol, source: 'pumpportal-ws' }, broadcaster);
+    } catch (e) { markIgnored('MALFORMED_JSON', ev?.data || ''); }
   });
 
   mySocket.addEventListener('close', (ev) => {
@@ -233,6 +352,7 @@ function stop() {
   intentionallyStopped = true;
   socketGen++;                              // invalidate all handlers
   cancelPendingReconnect();
+  stopDexFallback();
   stopHeartbeat();
   try { ws?.close(); } catch (_) {}
 }
@@ -253,13 +373,112 @@ function forceReconnect() {
   return true;
 }
 
+// ── DexScreener fallback poller ───────────────────────────────────────────────
+// Polls two public DexScreener endpoints (no key required) when PumpPortal WS
+// is stale or disconnected. Prevents total blindness during WS outages.
+// Each CA is deduplicated via seenFallback (30m TTL) to avoid repeated scans.
+
+function wsIsStale() {
+  return !stats.lastEvent || Date.now() - stats.lastEvent > WS_STALE_MS;
+}
+
+function asArray(x) {
+  if (Array.isArray(x)) return x;
+  return x ? [x] : [];
+}
+
+function normalizeDexCandidate(item, source) {
+  const ca = item?.tokenAddress || item?.baseToken?.address || item?.address || item?.mint;
+  if (!isSolanaCA(ca)) return null;
+  if (item?.chainId && item.chainId !== 'solana') return null;
+  return { ca, eventType: source, source };
+}
+
+async function pollDexFallback(broadcaster) {
+  if (!FALLBACK_ENABLED || hunters.size === 0) return;
+  // Fallback only activates when PumpPortal is stale or disconnected.
+  // It is not a replacement for the firehose; it prevents total blindness.
+  if (connectedAt && !wsIsStale()) return;
+
+  stats.fallbackPolls++;
+  cleanupMaps();
+
+  try {
+    const [profilesRes, ctoRes] = await Promise.all([
+      fetch(DEX_PROFILES_URL, { headers: { Accept: 'application/json' }, timeout: 8000 }).catch(e => ({ ok: false, _err: e })),
+      fetch(DEX_CTO_URL,      { headers: { Accept: 'application/json' }, timeout: 8000 }).catch(e => ({ ok: false, _err: e })),
+    ]);
+
+    const candidates = [];
+    if (profilesRes.ok) {
+      const data = await profilesRes.json();
+      for (const item of asArray(data)) {
+        const c = normalizeDexCandidate(item, 'dexscreener-profile');
+        if (c) candidates.push(c);
+      }
+    } else {
+      console.error('[hunt] Dex fallback profiles HTTP error:', profilesRes.status || profilesRes._err?.message);
+    }
+
+    if (ctoRes.ok) {
+      const data = await ctoRes.json();
+      for (const item of asArray(data)) {
+        const c = normalizeDexCandidate(item, 'dexscreener-cto');
+        if (c) candidates.push(c);
+      }
+    } else {
+      console.error('[hunt] Dex fallback CTO HTTP error:', ctoRes.status || ctoRes._err?.message);
+    }
+
+    let enqueued = 0;
+    for (const c of candidates) {
+      if (enqueued >= FALLBACK_MAX_PER_POLL) break;
+      if (seenFallback.has(c.ca)) continue;
+      seenFallback.set(c.ca, Date.now());
+      enqueue(c, broadcaster);
+      enqueued++;
+    }
+    stats.fallbackEnqueued += enqueued;
+    if (enqueued > 0) {
+      stats.lastSource = 'dexscreener-fallback';
+      console.log(`[hunt] Dex fallback enqueued ${enqueued} candidate(s)`);
+    }
+  } catch (e) {
+    stats.fallbackErrors++;
+    console.error('[hunt] Dex fallback poll error:', e?.stack || e.message);
+  }
+}
+
+function startDexFallback(broadcaster) {
+  stopDexFallback();
+  if (!FALLBACK_ENABLED) {
+    console.log('[hunt] Dex fallback disabled by HUNT_FALLBACK_ENABLED=false');
+    return;
+  }
+  fallbackTimer = setInterval(() => pollDexFallback(broadcaster), FALLBACK_POLL_MS);
+  fallbackTimer.unref?.();
+  // Give PumpPortal a short first chance, then probe fallback if still stale.
+  setTimeout(() => pollDexFallback(broadcaster), Math.min(15_000, FALLBACK_POLL_MS)).unref?.();
+  console.log(`[hunt] Dex fallback armed — poll ${Math.floor(FALLBACK_POLL_MS / 1000)}s, max ${FALLBACK_MAX_PER_POLL}/poll`);
+}
+
+function stopDexFallback() {
+  if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
+}
+
+// ── Status ───────────────────────────────────────────────────────────────────
+
 function status() {
+  const staleWs = connectedAt !== null && wsIsStale();
   return {
     connected:  connectedAt !== null,
+    staleWs,
     uptimeMs:   connectedAt ? Date.now() - connectedAt : 0,
     queueDepth: queue.length,
     activeScans: active,
-    hunters:    hunters.size,
+    hunters:    hunterCount(),
+    pumpPortalApiKeyConfigured: !!config.PUMPPORTAL_API_KEY,
+    fallbackEnabled: FALLBACK_ENABLED,
     ...stats,
   };
 }
@@ -269,9 +488,9 @@ function status() {
 function start(bot, buildKeyboard) {
   loadHunters();
   savedBotRef = bot;
-  const broadcaster = async (ca, mc, html) => {
+  const broadcaster = async (ca, mc, html, verdict = null) => {
     if (hunters.size === 0) return;
-    const reply_markup = buildKeyboard(ca, mc);
+    const reply_markup = buildKeyboard(ca, mc, verdict);
     for (const chatId of hunters) {
       try {
         await bot.telegram.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup });
@@ -287,6 +506,7 @@ function start(bot, buildKeyboard) {
     }
   };
   connect(broadcaster);
+  startDexFallback(broadcaster);
   console.log(`[hunt] hunt mode started — ${hunters.size} hunter(s) registered`);
 }
 

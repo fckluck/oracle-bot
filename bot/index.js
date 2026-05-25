@@ -15,6 +15,11 @@ if (!config.TELEGRAM_BOT_TOKEN) {
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 
+bot.catch((err, ctx) => {
+  const updateType = ctx?.updateType || 'unknown';
+  console.error(`[telegram] handler error during ${updateType}:`, err?.stack || err.message);
+});
+
 function isSolanaCA(text) {
   return /^[1-9A-HJ-NP-Za-km-z]{32,50}$/.test(text.trim());
 }
@@ -37,7 +42,7 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v10.2)</b>\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.3)</b>\n` +
   `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
@@ -63,10 +68,10 @@ bot.help(ctx  => ctx.replyWithHTML(HELP_MENU));
 bot.command('status', ctx => {
   const h = hunt.status();
   const huntLine = h.connected
-    ? `🎯 Hunt: <b>ACTIVE</b> | ${h.hunters} hunter(s) | scanned ${h.scanned} | broadcast ${h.broadcast} | queue ${h.queueDepth}`
+    ? `🎯 Hunt: <b>${h.staleWs ? 'STALE' : 'ACTIVE'}</b> | ${h.hunters} hunter(s) | scanned ${h.scanned} | broadcast ${h.broadcast} | queue ${h.queueDepth}`
     : `🎯 Hunt: <b>OFFLINE</b> (reconnecting)`;
   return ctx.replyWithHTML(
-    `<b>Bot Status: ONLINE</b>\n\nData: DexScreener | PumpPortal | Birdeye | Helius${process.env.DEFADE_API_KEY ? ' | DeFade' : ''}\n` +
+    `<b>Bot Status: ONLINE</b>\n\nData: DexScreener | PumpPortal${h.fallbackEnabled ? ' + Dex fallback' : ''} | Birdeye | Helius${process.env.DEFADE_API_KEY ? ' | DeFade' : ''}\n` +
     `Guardian: ${tracker.list().length} position(s) tracked\nSession: ${config.SESSION_SIZE_SOL} SOL\n${huntLine}`
   );
 });
@@ -74,7 +79,7 @@ bot.command('status', ctx => {
 bot.command('hunt', ctx => {
   const added = hunt.addHunter(ctx.chat.id);
   return ctx.replyWithHTML(added
-    ? `🎯 <b>Hunt Mode: ON</b>\nYou'll receive a full scorecard for every new launch / migration with Vol/Liq ≥ 5x.\nSilent below that threshold.\nUse /unhunt to stop.`
+    ? `🎯 <b>Hunt Mode: ON</b>\nYou'll receive a full scorecard for every new launch / migration with Adjusted Vol/Liq ≥ 5x.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
     : `🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
 });
 
@@ -85,23 +90,32 @@ bot.command('unhunt', ctx => {
 
 bot.command('huntstatus', ctx => {
   const h = hunt.status();
-  const uptime = h.uptimeMs ? Math.floor(h.uptimeMs / 1000) + 's' : '—';
-  const lastEv = h.lastEvent ? Math.floor((Date.now() - h.lastEvent) / 1000) + 's ago' : 'never';
+  const uptime  = h.uptimeMs   ? Math.floor(h.uptimeMs   / 1000) + 's' : '—';
+  const lastEv  = h.lastEvent  ? Math.floor((Date.now() - h.lastEvent)  / 1000) + 's ago' : 'never';
+  const lastRaw = h.lastRawEvent ? Math.floor((Date.now() - h.lastRawEvent) / 1000) + 's ago' : 'never';
+  const wsLabel = !h.connected ? '🔴 DISCONNECTED' : h.staleWs ? '🟡 CONNECTED / STALE' : '🟢 CONNECTED';
   const text =
     `<b>Hunt Mode Diagnostics</b>\n\n` +
-    `WS:       ${h.connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}\n` +
+    `WS:       ${wsLabel}\n` +
     `Uptime:   ${uptime}\n` +
     `Hunters:  ${h.hunters}\n` +
-    `Last event: ${lastEv}\n\n` +
+    `PumpPortal key: ${h.pumpPortalApiKeyConfigured ? 'configured' : 'not configured'}\n` +
+    `Last raw frame: ${lastRaw}\n` +
+    `Last usable event: ${lastEv}\n` +
+    `Last source: ${h.lastSource || 'none'}\n\n` +
     `<b>Lifetime stats</b>\n` +
+    `Raw WS frames: ${h.rawEvents ?? 0}\n` +
+    `Ignored WS frames: ${h.ignoredEvents ?? 0}${h.lastIgnoredReason ? ` (${h.lastIgnoredReason})` : ''}\n` +
     `Scanned:   ${h.scanned}\n` +
     `Broadcast: ${h.broadcast} (vol/liq ≥ 5x)\n` +
     `Skipped:   ${h.skipped}\n` +
     `Errors:    ${h.errors}\n` +
+    `Fallback:  ${h.fallbackEnabled ? 'ON' : 'OFF'} | polls ${h.fallbackPolls ?? 0} | enqueued ${h.fallbackEnqueued ?? 0} | errors ${h.fallbackErrors ?? 0}\n` +
     `Queue:     ${h.queueDepth} pending | ${h.activeScans} running\n\n` +
+    (h.staleWs ? `⚠️ <b>WS is stale:</b> PumpPortal connected but not producing usable launch CAs. Fallback covering partial discovery.\n\n` : '') +
     `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`;
   const extra = { parse_mode: 'HTML' };
-  if (!h.connected) {
+  if (!h.connected || h.staleWs) {
     extra.reply_markup = { inline_keyboard: [[
       { text: '🔄 RECONNECT', callback_data: 'hunt:reconnect' }
     ]]};
@@ -316,7 +330,7 @@ bot.on('callback_query', async ctx => {
 
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
-    console.log('Oracle Bot v10.2 (Spine-Aligned) started');
+    console.log('Oracle Bot v10.2.3 (Hunt-Resilient) started');
     tracker.startTracker(bot);
     hunt.start(bot, buildKeyboard);
     watchlist.start(bot);
@@ -324,7 +338,7 @@ bot.launch({ dropPendingUpdates: true })
     // Broadcast startup ping to all persisted hunters so they know the bot
     // restarted (Railway redeploys would otherwise be invisible).
     const hunters = hunt.listHunters();
-    const startupMsg = `🚀 <b>Oracle v10.2 Online &amp; Spine-Aligned</b>\nType /hunt to begin.`;
+    const startupMsg = `🚀 <b>Oracle v10.2.3 Online &amp; Hunt-Resilient</b>\nType /hunt to begin.`;
     for (const chatId of hunters) {
       try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
       catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }
@@ -338,3 +352,12 @@ bot.launch({ dropPendingUpdates: true })
 
 process.once('SIGINT',  () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+process.on('unhandledRejection', err => {
+  console.error('[process] unhandledRejection:', err?.stack || err);
+});
+
+process.on('uncaughtException', err => {
+  console.error('[process] uncaughtException:', err?.stack || err);
+  process.exit(1);
+});
