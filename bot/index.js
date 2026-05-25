@@ -87,7 +87,7 @@ bot.command('huntstatus', ctx => {
   const h = hunt.status();
   const uptime = h.uptimeMs ? Math.floor(h.uptimeMs / 1000) + 's' : '—';
   const lastEv = h.lastEvent ? Math.floor((Date.now() - h.lastEvent) / 1000) + 's ago' : 'never';
-  return ctx.replyWithHTML(
+  const text =
     `<b>Hunt Mode Diagnostics</b>\n\n` +
     `WS:       ${h.connected ? '🟢 CONNECTED' : '🔴 DISCONNECTED'}\n` +
     `Uptime:   ${uptime}\n` +
@@ -99,8 +99,21 @@ bot.command('huntstatus', ctx => {
     `Skipped:   ${h.skipped}\n` +
     `Errors:    ${h.errors}\n` +
     `Queue:     ${h.queueDepth} pending | ${h.activeScans} running\n\n` +
-    `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`
-  );
+    `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`;
+  const extra = { parse_mode: 'HTML' };
+  if (!h.connected) {
+    extra.reply_markup = { inline_keyboard: [[
+      { text: '🔄 RECONNECT', callback_data: 'hunt:reconnect' }
+    ]]};
+  }
+  return ctx.reply(text, extra);
+});
+
+bot.action('hunt:reconnect', async ctx => {
+  try { await ctx.answerCbQuery('Reconnecting…'); } catch (_) {}
+  const ok = hunt.forceReconnect();
+  if (!ok) return ctx.replyWithHTML(`⚠️ Hunt Mode not initialized — try /hunt first.`);
+  return ctx.replyWithHTML(`🔄 <b>Manual reconnect triggered.</b>\nRun /huntstatus in ~5s to verify 🟢 CONNECTED.`);
 });
 
 bot.command('tracking', ctx => {

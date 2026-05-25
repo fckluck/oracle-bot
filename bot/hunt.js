@@ -113,18 +113,56 @@ let ws = null;
 let reconnectMs = RECONNECT_BASE_MS;
 let intentionallyClosed = false;
 let connectedAt = null;
+let heartbeatTimer = null;
+let wasEverConnected = false;        // first connect ≠ "restored"
+let savedBroadcaster = null;         // for forceReconnect() + restoration ping
+let savedBotRef = null;              // for sending restoration alert to hunters
+
+const HEARTBEAT_MS = 30 * 1000;      // ping every 30s to keep door open
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    // ws (native global / ws lib) — readyState 1 = OPEN
+    if (ws && ws.readyState === 1) {
+      try {
+        if (typeof ws.ping === 'function') ws.ping();          // node-ws lib
+        else ws.send(JSON.stringify({ method: 'ping' }));      // browser-style fallback
+      } catch (e) { /* next close handler will reconnect */ }
+    }
+  }, HEARTBEAT_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+
+async function broadcastRestored() {
+  if (!savedBotRef) return;
+  loadHunters();
+  const msg = `✅ <b>Hunt Mode WebSocket RESTORED.</b>\nWe are back in the trenches.`;
+  for (const chatId of hunters) {
+    try { await savedBotRef.telegram.sendMessage(chatId, msg, { parse_mode: 'HTML' }); }
+    catch (e) { /* drop unreachable */ }
+  }
+}
 
 function connect(broadcaster) {
   intentionallyClosed = false;
+  savedBroadcaster = broadcaster;
   try { ws = new WebSocket(WS_URL); }
   catch (e) { console.error('[hunt] WS construct error:', e.message); scheduleReconnect(broadcaster); return; }
 
   ws.addEventListener('open', () => {
+    const wasDown = wasEverConnected;       // true only on a true RE-connect
     connectedAt = Date.now();
     reconnectMs = RECONNECT_BASE_MS;
-    console.log('[hunt] WS connected → subscribing');
+    console.log(`[hunt] WS connected → subscribing${wasDown ? ' (RESTORED)' : ''}`);
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     ws.send(JSON.stringify({ method: 'subscribeMigration' }));
+    startHeartbeat();
+    if (wasDown) broadcastRestored().catch(() => {});
+    wasEverConnected = true;
   });
 
   ws.addEventListener('message', (ev) => {
@@ -148,6 +186,7 @@ function connect(broadcaster) {
 
   ws.addEventListener('close', (ev) => {
     connectedAt = null;
+    stopHeartbeat();
     if (intentionallyClosed) return;
     console.log(`[hunt] WS closed code=${ev.code} → reconnect in ${reconnectMs}ms`);
     scheduleReconnect(broadcaster);
@@ -165,7 +204,20 @@ function scheduleReconnect(broadcaster) {
 
 function stop() {
   intentionallyClosed = true;
+  stopHeartbeat();
   try { ws?.close(); } catch (_) {}
+}
+
+// Manual reconnect — fires when user taps [🔄 RECONNECT] in /huntstatus.
+// Resets backoff so the retry is instant, closes any stale socket, reconnects.
+function forceReconnect() {
+  if (!savedBroadcaster) return false;
+  reconnectMs = RECONNECT_BASE_MS;
+  intentionallyClosed = true;       // suppress auto-reconnect from old close
+  stopHeartbeat();
+  try { ws?.close(); } catch (_) {}
+  setTimeout(() => connect(savedBroadcaster), 250);
+  return true;
 }
 
 function status() {
@@ -183,6 +235,7 @@ function status() {
 
 function start(bot, buildKeyboard) {
   loadHunters();
+  savedBotRef = bot;
   const broadcaster = async (ca, mc, html) => {
     if (hunters.size === 0) return;
     const reply_markup = buildKeyboard(ca, mc);
@@ -204,4 +257,4 @@ function start(bot, buildKeyboard) {
   console.log(`[hunt] hunt mode started — ${hunters.size} hunter(s) registered`);
 }
 
-module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status };
+module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect };
