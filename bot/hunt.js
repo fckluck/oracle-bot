@@ -1,4 +1,4 @@
-// ── Oracle v10.2.4 Predator Hunt Mode ────────────────────────────────────────
+// ── Oracle v10.2.5 Predator Hunt Mode ────────────────────────────────────────
 // Persistent WebSocket to wss://pumpportal.fun/api/data. Subscribes to
 // new-token + migration events. Each event triggers a full Oracle scan in
 // a concurrency-limited queue. Verdicts with Vol/Liq ≥ 5x are broadcast to
@@ -85,9 +85,9 @@ function addHunter(chatId) {
   saveHunters();
 
   // If the bot booted with zero hunters, fallback may have skipped itself.
-  // Probe immediately when a chat enables /hunt.
+  // Probe immediately when a chat enables /hunt (not unreffed — must fire).
   if (!had && savedBroadcaster) {
-    setTimeout(() => pollDexFallback(savedBroadcaster, { force: true }), 0).unref?.();
+    setTimeout(() => pollDexFallback(savedBroadcaster, { force: true }), 0);
   }
   return !had;
 }
@@ -286,6 +286,8 @@ function hardReconnect(broadcaster, reason) {
 
 function startReconnectWatchdog(broadcaster) {
   stopReconnectWatchdog();
+  // NOTE: deliberately NOT unreffed — this must fire on Railway even if all
+  // other timers are unreffed. It is the last-resort reconnect guarantee.
   reconnectWatchdogTimer = setInterval(() => {
     if (intentionallyStopped) return;
     const disconnected = !connectedAt || !ws || ws.readyState === WS.CLOSED || ws.readyState === WS.CLOSING;
@@ -298,7 +300,6 @@ function startReconnectWatchdog(broadcaster) {
       pollDexFallback(broadcaster, { force: true }).catch(() => {});
     }
   }, RECONNECT_HAMMER_MS);
-  reconnectWatchdogTimer.unref?.();
   console.log(`[hunt] reconnect watchdog armed — ${Math.floor(RECONNECT_HAMMER_MS / 1000)}s`);
 }
 

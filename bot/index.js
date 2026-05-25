@@ -42,7 +42,7 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.4)</b>\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.5)</b>\n` +
   `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
@@ -334,15 +334,22 @@ bot.on('callback_query', async ctx => {
 
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
-    console.log('Oracle Bot v10.2.4 (Emergency Connection) started');
-    tracker.startTracker(bot);
-    hunt.start(bot, buildKeyboard);
-    watchlist.start(bot);
+    console.log('Oracle Bot v10.2.5 (Hardened Startup) started');
+
+    // Each startup subsystem is isolated — one crash must not kill the others.
+    try { tracker.startTracker(bot); }
+    catch (e) { console.error('[startup] tracker.startTracker error:', e?.stack || e.message); }
+
+    try { hunt.start(bot, buildKeyboard); }
+    catch (e) { console.error('[startup] hunt.start error:', e?.stack || e.message); }
+
+    try { watchlist.start(bot); }
+    catch (e) { console.error('[startup] watchlist.start error:', e?.stack || e.message); }
 
     // Broadcast startup ping to all persisted hunters so they know the bot
     // restarted (Railway redeploys would otherwise be invisible).
     const hunters = hunt.listHunters();
-    const startupMsg = `🚀 <b>Oracle v10.2.4 Online &amp; Emergency Connection Active</b>\nType /hunt to begin.`;
+    const startupMsg = `🚀 <b>Oracle v10.2.5 Online &amp; Hardened Startup</b>\nType /hunt to begin.`;
     for (const chatId of hunters) {
       try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
       catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }
