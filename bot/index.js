@@ -1,4 +1,5 @@
 require('dotenv').config();
+const http     = require('http');
 const { Telegraf } = require('telegraf');
 const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic } = require('./fetcher');
 const { scan }     = require('./scanner');
@@ -7,6 +8,24 @@ const tracker   = require('./tracker');
 const hunt      = require('./hunt');
 const watchlist = require('./watchlist');
 const config    = require('./config');
+
+// ── Railway health check ───────────────────────────────────────────────────────
+// Railway treats every service as a web service and kills the process if it
+// gets no HTTP 200 on $PORT within the health-check window (~60s). Without
+// this listener the bot fires its startup polls, sends a burst of signals, then
+// Railway kills it — making Hunt Mode look like it "only works at deploy."
+// This tiny server costs nothing and keeps the process alive indefinitely.
+const HEALTH_PORT = parseInt(process.env.PORT, 10) || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status: 'ok',
+    bot:    'Oracle v10.2.7',
+    uptime: Math.floor(process.uptime()),
+  }));
+}).listen(HEALTH_PORT, () => {
+  console.log(`[health] HTTP check listening on :${HEALTH_PORT}`);
+});
 
 if (!config.TELEGRAM_BOT_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN is not set. Exiting.');
