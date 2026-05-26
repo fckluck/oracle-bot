@@ -468,38 +468,63 @@ bot.on('callback_query', async ctx => {
 });
 
 // ── Launch ────────────────────────────────────────────────────────────────────
+// v10.2.8 FIX: Start subsystems BEFORE bot.launch().
+//
+// Root cause of "hunt.start() never called": when Railway deploys, the old
+// instance keeps polling for a few seconds. The new instance calls bot.launch(),
+// gets 409 Conflict, the old .catch() called process.exit(1), Railway restarted,
+// and we were stuck in a boot loop. hunt.start() only ran inside .then(), so it
+// was never reached during the loop — and when the loop finally broke, timing
+// could still race. Fix: subsystems need only the bot object (they call
+// bot.telegram.sendMessage directly, not via polling), so start them immediately.
+// bot.launch() is retried with backoff; a 409 is not fatal.
 
-bot.launch({ dropPendingUpdates: true })
-  .then(async () => {
-    console.log('Oracle Bot v10.2.7 (Spine Lock) started');
+try { tracker.startTracker(bot); }
+catch (e) { console.error('[startup] tracker.startTracker error:', e?.stack || e.message); }
 
-    // Each startup subsystem is isolated — one crash must not kill the others.
-    try { tracker.startTracker(bot); }
-    catch (e) { console.error('[startup] tracker.startTracker error:', e?.stack || e.message); }
+try { hunt.start(bot, buildKeyboard); }
+catch (e) { console.error('[startup] hunt.start error:', e?.stack || e.message); }
 
-    try { hunt.start(bot, buildKeyboard); }
-    catch (e) { console.error('[startup] hunt.start error:', e?.stack || e.message); }
+try { watchlist.start(bot); }
+catch (e) { console.error('[startup] watchlist.start error:', e?.stack || e.message); }
 
-    try { watchlist.start(bot); }
-    catch (e) { console.error('[startup] watchlist.start error:', e?.stack || e.message); }
+console.log('[startup] subsystems started — launching Telegram polling...');
 
-    // Broadcast startup ping to all persisted hunters so they know the bot
-    // restarted (Railway redeploys would otherwise be invisible).
-    const hunters = hunt.listHunters();
-    const startupMsg = `🚀 <b>Oracle v10.2.7 Online — Spine Lock active</b>\n` +
-      `Stricter scanner: PLUTO/SCRIBBLI now require multi-factor safety.\n` +
-      `Top10 &gt;15%, range &lt;75%, or 5m red + 8x vol → no longer BUY.\n` +
-      `Use /huntdebug or /huntping if anything looks wrong.`;
-    for (const chatId of hunters) {
-      try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
-      catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }
+async function launchWithRetry(maxAttempts = 10, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await bot.launch({ dropPendingUpdates: true });
+      console.log(`Oracle Bot v10.2.8 (Safe Calibration) started — polling active (attempt ${attempt})`);
+
+      // Startup ping — hunters already loaded by hunt.start() above.
+      const hunters = hunt.listHunters();
+      const startupMsg =
+        `🚀 <b>Oracle v10.2.8 Online — Safe Calibration</b>\n` +
+        `Top10 gate: 25% | Spine Lock: active\n` +
+        `Hunt engine: running | Use /huntstatus to verify.`;
+      for (const chatId of hunters) {
+        try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
+        catch (e) { console.error(`[startup] ping failed for ${chatId}:`, e.message); }
+      }
+      if (hunters.length) console.log(`[startup] pinged ${hunters.length} hunter(s)`);
+      return; // success
+    } catch (err) {
+      const is409 = err.message?.includes('409') || err.description?.includes('Conflict');
+      if (is409) {
+        console.warn(`[launch] attempt ${attempt}/${maxAttempts}: 409 Conflict — old instance still holds polling lock. Retrying in ${delayMs}ms...`);
+      } else {
+        console.error(`[launch] attempt ${attempt}/${maxAttempts} failed:`, err.message);
+      }
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
+      } else {
+        console.error('[launch] all attempts exhausted — polling inactive, but subsystems and health check are still running.');
+      }
     }
-    if (hunters.length) console.log(`[startup] pinged ${hunters.length} hunter(s)`);
-  })
-  .catch(err => {
-    console.error('Failed to launch bot:', err.message);
-    process.exit(1);
-  });
+  }
+}
+
+launchWithRetry().catch(err => console.error('[launch] launchWithRetry unexpected error:', err?.stack || err));
 
 process.once('SIGINT',  () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
