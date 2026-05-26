@@ -398,12 +398,37 @@ bot.on('callback_query', async ctx => {
     }
     await ctx.answerCbQuery(`✅ Tracking ${shortCa}`);
 
-    // v10.2.7: synchronous baseline. If forensic fetch fails RIGHT NOW, untrack
-    // and tell the user — don't silently add a position that Guardian can't poll.
-    // The old code would say "Tracking" even when entry data was all null.
-    try {
-      const sig = await fetchForensic(ca);
-      if (!sig) throw new Error('forensic returned null (DexScreener/SolanaTracker unreachable)');
+    // v10.2.7: synchronous baseline with 3-attempt retry.
+    // Solana API lag is common in the first few seconds after a new launch.
+    // A single-shot fetch would untrack good tokens unnecessarily. Retry 3×
+    // at 2s intervals — baseline message arrives within ~6s worst case (the
+    // callback was already answered, so the user isn't blocked).
+    const MAX_BASELINE_ATTEMPTS = 3;
+    const BASELINE_RETRY_MS     = 2000;
+    let sig = null;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= MAX_BASELINE_ATTEMPTS; attempt++) {
+      try {
+        sig = await fetchForensic(ca);
+        if (sig) { console.log(`[track] baseline attempt ${attempt} OK for ${shortCa}`); break; }
+        lastErr = new Error('forensic returned null (DexScreener/SolanaTracker unreachable)');
+        console.log(`[track] baseline attempt ${attempt} returned null — retry in ${BASELINE_RETRY_MS}ms`);
+      } catch (e) {
+        lastErr = e;
+        console.log(`[track] baseline attempt ${attempt} threw: ${e.message} — retry in ${BASELINE_RETRY_MS}ms`);
+      }
+      if (attempt < MAX_BASELINE_ATTEMPTS) await new Promise(r => setTimeout(r, BASELINE_RETRY_MS));
+    }
+
+    if (!sig) {
+      tracker.untrack(ca);
+      await ctx.telegram.sendMessage(ctx.chat.id,
+        `❌ *TRACK FAILED — forensic data unavailable*\n` +
+        `\`${shortCa}\` is NOT actively monitored.\n` +
+        `Tried ${MAX_BASELINE_ATTEMPTS}× — ${lastErr?.message ?? 'API unreachable'}.\n` +
+        `Re-click [ ➕ TRACK ] in a few minutes once the token settles.`,
+        { parse_mode: 'Markdown' });
+    } else {
       const fmtUsd = (n) => !n ? 'N/A' : n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : n >= 1e3 ? `$${(n/1e3).toFixed(1)}K` : `$${n.toFixed(2)}`;
       await ctx.telegram.sendMessage(ctx.chat.id,
         `🔔 *Oracle Guardian — Baseline Set*\n` +
@@ -416,17 +441,9 @@ bot.on('callback_query', async ctx => {
         `• Vol/Liq (1h): ${sig.adjustedVolLiq != null ? sig.adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}\n\n` +
         `_Next forensic poll in 60s. All triggers active._`,
         { parse_mode: 'Markdown' });
-      // If holder/top50 missing at this moment, the async retry will fill them in.
       if (sig.top50Pct == null || sig.holderCount == null) {
         tracker.maybeEstablishBaseline(ca, bot);
       }
-    } catch (e) {
-      tracker.untrack(ca);
-      await ctx.telegram.sendMessage(ctx.chat.id,
-        `❌ *TRACK FAILED — forensic data unavailable*\n` +
-        `\`${shortCa}\` is NOT actively monitored.\n` +
-        `Reason: ${e.message}\nTry /sync ${ca.slice(0,6)}... in a few minutes once the token settles.`,
-        { parse_mode: 'Markdown' });
     }
   }
 });
