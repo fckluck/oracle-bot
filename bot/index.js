@@ -134,41 +134,56 @@ bot.command('huntping', async ctx => {
 });
 
 bot.command('huntstatus', ctx => {
-  const h = hunt.status();
-  const uptime  = h.uptimeMs   ? Math.floor(h.uptimeMs   / 1000) + 's' : '—';
-  const lastEv  = h.lastEvent  ? Math.floor((Date.now() - h.lastEvent)  / 1000) + 's ago' : 'never';
-  const lastRaw = h.lastRawEvent ? Math.floor((Date.now() - h.lastRawEvent) / 1000) + 's ago' : 'never';
-  const wsLabel = !h.connected ? '🔴 DISCONNECTED' : h.staleWs ? '🟡 CONNECTED / STALE' : '🟢 CONNECTED';
+  const h   = hunt.status();
+  const now = Date.now();
+  const ago = ts => ts ? Math.floor((now - ts) / 1000) + 's ago' : 'never';
+  const wsLabel   = !h.connected ? '🔴 DISCONNECTED' : h.staleWs ? '🟡 CONNECTED / STALE' : '🟢 CONNECTED';
+  const uptime    = h.uptimeMs ? Math.floor(h.uptimeMs / 1000) + 's' : '—';
+  // Mask hunter IDs for privacy: show first 3 + last 2 digits, e.g. 123***89
+  const maskedIds = (h.hunterIds || []).map(id => {
+    const s = String(id);
+    return s.length <= 5 ? '****' : s.slice(0, 3) + '***' + s.slice(-2);
+  }).join(', ') || 'none';
+
   const text =
     `<b>Hunt Mode Diagnostics</b>\n\n` +
-    `WS:       ${wsLabel}\n` +
-    `Uptime:   ${uptime}\n` +
-    `Hunters:  ${h.hunters}\n` +
+    `WS:         ${wsLabel}\n` +
+    `Uptime:     ${uptime}\n` +
+    `Hunters:    ${h.hunters}\n` +
+    `Hunter IDs: ${maskedIds}\n` +
+    `Your chat:  <code>${ctx.chat.id}</code>\n` +
     `PumpPortal key: ${h.pumpPortalApiKeyConfigured ? 'configured' : 'not configured'}\n` +
-    `Last raw frame: ${lastRaw}\n` +
-    `Last usable event: ${lastEv}\n` +
+    `Last raw frame:    ${ago(h.lastRawEvent)}\n` +
+    `Last usable event: ${ago(h.lastEvent)}\n` +
     `Last source: ${h.lastSource || 'none'}\n\n` +
-    `<b>Lifetime stats</b>\n` +
+    `<b>Traffic</b>\n` +
     `Raw WS frames: ${h.rawEvents ?? 0}\n` +
-    `Ignored WS frames: ${h.ignoredEvents ?? 0}${h.lastIgnoredReason ? ` (${h.lastIgnoredReason})` : ''}\n` +
+    `Ignored:   ${h.ignoredEvents ?? 0}${h.lastIgnoredReason ? ` (${h.lastIgnoredReason})` : ''}\n` +
     `Scanned:   ${h.scanned}\n` +
-    `Broadcast: ${h.broadcast} (vol/liq ≥ 5x)\n` +
     `Skipped:   ${h.skipped}\n` +
-    `Errors:    ${h.errors}\n` +
+    `Errors:    ${h.errors}\n\n` +
+    `<b>Broadcast delivery</b>\n` +
+    `Candidates (passed filter): ${h.broadcastCandidates ?? h.broadcast ?? 0}\n` +
+    `Telegram attempts:  ${h.broadcastAttempts ?? 0}\n` +
+    `✅ Delivered:       ${h.broadcastDelivered ?? 0}\n` +
+    `❌ Failed:          ${h.broadcastFailed ?? 0}\n` +
+    `Last candidate:  ${h.lastBroadcastCA ? `<code>${h.lastBroadcastCA.slice(0,8)}...</code> ${ago(h.lastBroadcastAt)}` : 'none'}\n` +
+    `Last delivered:  ${ago(h.lastDeliveredAt)}\n` +
+    `Last error:      ${h.lastBroadcastError || 'none'}\n\n` +
+    `<b>Infrastructure</b>\n` +
     `Fallback:  ${h.fallbackEnabled ? 'ON' : 'OFF'} | polls ${h.fallbackPolls ?? 0} | enqueued ${h.fallbackEnqueued ?? 0} | errors ${h.fallbackErrors ?? 0}\n` +
     `Reconnects: ${h.hardReconnects ?? 0}${h.lastReconnectReason ? ` (${h.lastReconnectReason})` : ''}\n` +
     `Hammer:    every ${Math.floor((h.reconnectHammerMs || 15000) / 1000)}s if disconnected\n` +
     (h.lastWsClose ? `Last close: code ${h.lastWsClose.code ?? 'n/a'}${h.lastWsClose.reason ? ` | ${h.lastWsClose.reason}` : ''}\n` : '') +
     `Queue:     ${h.queueDepth} pending | ${h.activeScans} running\n\n` +
-    (h.staleWs ? `⚠️ <b>PumpPortal firehose unavailable</b> — WS connected but 0 raw frames in 2+ min. Dex fallback active only.\n\n` : '') +
-    (!h.connected ? `🚨 <b>WS is disconnected:</b> reconnect hammer is active and fallback should poll immediately once /hunt is enabled.\n\n` : '') +
-    (h.startedAt == null ? `❌ <b>FATAL:</b> Hunt engine never started (start() not called). Use /huntdebug.\n\n` : '') +
-    `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}`;
+    (h.staleWs ? `⚠️ <b>PumpPortal unavailable</b> — WS connected but 0 raw frames in 2+ min. Dex fallback active.\n\n` : '') +
+    (!h.connected ? `🚨 <b>WS disconnected</b> — reconnect hammer active.\n\n` : '') +
+    (h.startedAt == null ? `❌ <b>FATAL:</b> Hunt engine never started. Use /huntdebug.\n\n` : '') +
+    `You: ${hunt.isHunter(ctx.chat.id) ? '🎯 hunting' : '⚪ not hunting (/hunt to enable)'}\n` +
+    `<i>Run /hunttest to verify delivery path. /huntlast to see last 5 candidates.</i>`;
   const extra = { parse_mode: 'HTML' };
   if (!h.connected || h.staleWs) {
-    extra.reply_markup = { inline_keyboard: [[
-      { text: '🔄 RECONNECT', callback_data: 'hunt:reconnect' }
-    ]]};
+    extra.reply_markup = { inline_keyboard: [[{ text: '🔄 RECONNECT', callback_data: 'hunt:reconnect' }]] };
   }
   return ctx.reply(text, extra);
 });
@@ -178,6 +193,50 @@ bot.action('hunt:reconnect', async ctx => {
   const ok = hunt.forceReconnect();
   if (!ok) return ctx.replyWithHTML(`⚠️ Hunt engine has no broadcaster — start() likely never ran. Use /huntdebug.`);
   return ctx.replyWithHTML(`🔄 <b>Manual reconnect triggered.</b>\nRun /huntstatus in ~5s to verify 🟢 CONNECTED.`);
+});
+
+// v10.2.10: shows last 5 candidates that passed Hunt filter with delivery status.
+bot.command('huntlast', ctx => {
+  const h = hunt.status();
+  const candidates = h.lastCandidates || [];
+  if (!candidates.length) {
+    return ctx.replyWithHTML(
+      `<b>Hunt Last Candidates</b>\n\nNo candidates recorded yet this session.\n` +
+      `<i>Hunt has scanned ${h.scanned ?? 0} token(s) but none passed the Vol/Liq ≥ 5x filter, or the session just started.</i>`
+    );
+  }
+  const now = Date.now();
+  const lines = candidates.map((c, i) => {
+    const age    = Math.floor((now - c.ts) / 1000);
+    const ageStr = age < 60 ? `${age}s ago` : `${Math.floor(age/60)}m ago`;
+    const deliv  = c.delivered > 0 ? `✅ delivered` : c.attempted === 0 ? `⚪ no hunters` : `❌ FAILED`;
+    const errStr = c.error ? `\n   ⚠️ <i>${c.error.slice(0, 80)}</i>` : '';
+    return (
+      `${i+1}. <b>$${c.symbol}</b> — <code>${c.ca.slice(0,8)}...</code>\n` +
+      `   ${c.verdict} | ${c.adjustedVolLiq.toFixed(1)}x Vol/Liq | MC $${c.mc >= 1000 ? (c.mc/1000).toFixed(1)+'K' : c.mc.toFixed(0)}\n` +
+      `   ${ageStr} — ${deliv}${errStr}\n` +
+      `   <a href="https://dexscreener.com/solana/${c.ca}">Chart</a>`
+    );
+  });
+  return ctx.replyWithHTML(
+    `<b>Hunt Last ${candidates.length} Candidate(s)</b>\n\n` + lines.join('\n\n')
+  );
+});
+
+// v10.2.10: tests the broadcaster path directly — same code path Hunt uses.
+bot.command('hunttest', async ctx => {
+  const result = await hunt.testBroadcast(ctx.chat.id);
+  if (result.ok) {
+    return ctx.replyWithHTML(
+      `✅ <b>Hunt broadcaster test delivered to chatId <code>${ctx.chat.id}</code></b>\n` +
+      `Delivery path is working. If you are still not receiving Hunt alerts, the issue is upstream — check /huntstatus for filter stats and delivery counts.`
+    );
+  }
+  return ctx.replyWithHTML(
+    `❌ <b>Hunt broadcaster test FAILED for chatId <code>${ctx.chat.id}</code></b>\n` +
+    `Telegram error: <code>${result.reason}</code>\n\n` +
+    `This means Hunt cannot deliver to you. Common causes: bot was blocked, chat ID mismatch, or Telegram API error.`
+  );
 });
 
 // v10.2.6 — surfaces every internal lifecycle counter. Use this when /huntstatus

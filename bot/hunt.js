@@ -121,13 +121,23 @@ const seenFallback      = new Map(); // ca -> ts
 let fallbackTimer = null;
 const stats = {
   scanned: 0,
-  broadcast: 0,
+  // v10.2.10: split broadcast accounting — candidates vs confirmed deliveries
+  broadcast: 0,              // legacy alias kept for /huntping delta compat (= broadcastCandidates)
+  broadcastCandidates: 0,    // passed vol/liq filter and entered broadcaster
+  broadcastAttempts: 0,      // total sendMessage calls made
+  broadcastDelivered: 0,     // confirmed Telegram deliveries (sendMessage resolved)
+  broadcastFailed: 0,        // sendMessage threw (non-block error)
+  lastBroadcastCA: null,
+  lastBroadcastVerdict: null,
+  lastBroadcastAt: null,
+  lastBroadcastError: null,
+  lastDeliveredAt: null,
   skipped: 0,
   errors: 0,
   rawEvents: 0,
   ignoredEvents: 0,
   lastRawEvent: null,
-  lastEvent: null,         // last usable event that produced a CA
+  lastEvent: null,
   lastSource: null,
   lastIgnoredReason: null,
   fallbackPolls: 0,
@@ -137,6 +147,11 @@ const stats = {
   lastReconnectReason: null,
   lastWsClose: null,
 };
+
+// Ring buffer of last N candidates that passed the Hunt vol/liq filter.
+// Persists in memory only — used by /huntlast to show delivery status.
+const lastCandidates = [];
+const MAX_LAST_CANDIDATES = 5;
 
 function enqueue(job, broadcaster) {
   job.enqueuedAt = Date.now();
@@ -187,8 +202,6 @@ async function runScan(job, broadcaster) {
     if (!data?.codex) { stats.skipped++; return; }
 
     const result = scan(data);
-    // v10.2 Spine Alignment: use adjustedVolLiq (organic, wash-corrected) — the
-    // raw `volLiq` field never existed, so Hunt was silent. 5x floor = Entry Grade.
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
     if (adjustedVolLiq < MIN_VOLLIQ_BROADCAST) { stats.skipped++; return; }
 
@@ -197,8 +210,6 @@ async function runScan(job, broadcaster) {
       const v = await fetchDeFadeVerification(ca, { lp: result.signals?.lp });
       result.deFadeVerification = v;
       if (v.action === 'HARD_SKIP') {
-        // Suppress broadcast AND set cooldown so repeated events for this CA
-        // (e.g. new + migration in quick succession) don't re-burn quota.
         console.log(`[hunt] ${ca} HARD_SKIP by DeFade: ${v.reason}`);
         recentlyBroadcast.set(ca, Date.now());
         stats.skipped++; return;
@@ -206,14 +217,39 @@ async function runScan(job, broadcaster) {
     }
 
     const message = formatVerdict(result, ca);
-    const mc = result.signals?.marketCap || 0;
+    const mc     = result.signals?.marketCap || 0;
     const symbol = data.codex?.symbol || data.pump?.symbol || '???';
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>\n` +
                    `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>\n` +
                    `Source: <code>${source}</code>\n\n`;
-    await broadcaster(ca, mc, header + message, result.verdict);
+
+    // v10.2.10: record candidate BEFORE attempting delivery
+    stats.broadcastCandidates++;
+    stats.broadcast = stats.broadcastCandidates; // keep legacy alias in sync
+    stats.lastBroadcastCA      = ca;
+    stats.lastBroadcastVerdict = result.verdict;
+    stats.lastBroadcastAt      = Date.now();
+
+    const delivery = await broadcaster(ca, mc, header + message, result.verdict);
     recentlyBroadcast.set(ca, Date.now());
-    stats.broadcast++;
+
+    // Record in ring buffer for /huntlast
+    const candidateEntry = {
+      ca,
+      symbol,
+      adjustedVolLiq,
+      verdict:   result.verdict,
+      mc,
+      attempted: delivery.attempted,
+      delivered: delivery.delivered,
+      failed:    delivery.failed,
+      error:     delivery.errors[0] || null,
+      ts:        Date.now(),
+    };
+    lastCandidates.unshift(candidateEntry);
+    if (lastCandidates.length > MAX_LAST_CANDIDATES) lastCandidates.pop();
+
+    console.log(`[hunt] broadcast ${ca.slice(0,8)} — delivered:${delivery.delivered} failed:${delivery.failed}${delivery.errors[0] ? ` err:${delivery.errors[0]}` : ''}`);
   } catch (e) {
     stats.errors++;
     console.error(`[hunt] scan error for ${ca}:`, e?.stack || e.message);
@@ -611,6 +647,7 @@ function status() {
     queueDepth: queue.length,
     activeScans: active,
     hunters:    hunterCount(),
+    hunterIds:  listHunters(),
     pumpPortalApiKeyConfigured: !!config.PUMPPORTAL_API_KEY,
     fallbackEnabled: FALLBACK_ENABLED,
     reconnectHammerMs: RECONNECT_HAMMER_MS,
@@ -625,6 +662,7 @@ function status() {
     lastConnectAt,
     lastConstructError,
     wsReadyState: ws ? ws.readyState : null,
+    lastCandidates: [...lastCandidates],
     ...stats,
   };
 }
@@ -635,22 +673,67 @@ function start(bot, buildKeyboard) {
   startedAt = Date.now();
   loadHunters();
   savedBotRef = bot;
+  // v10.2.10: broadcaster returns { attempted, delivered, failed, errors }.
+  // Only increments broadcastDelivered when sendMessage resolves. HTML parse
+  // failures are retried once with plain text before counting as failed.
   const broadcaster = async (ca, mc, html, verdict = null) => {
-    if (hunters.size === 0) return;
+    if (hunters.size === 0) return { attempted: 0, delivered: 0, failed: 0, errors: [] };
     const reply_markup = buildKeyboard(ca, mc, verdict);
+    let attempted = 0, delivered = 0, failed = 0;
+    const errors = [];
+
     for (const chatId of hunters) {
+      attempted++;
       try {
         await bot.telegram.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup });
+        delivered++;
+        stats.broadcastDelivered++;
+        stats.lastDeliveredAt = Date.now();
       } catch (e) {
-        // 403 = user blocked the bot → drop them
-        if (e.code === 403 || /blocked|chat not found|user is deactivated/i.test(e.description || e.message || '')) {
-          console.log(`[hunt] dropping unreachable chat ${chatId}: ${e.description || e.message}`);
+        const errMsg   = e.description || e.message || 'unknown';
+        const isBlock  = e.code === 403 || /blocked|chat not found|user is deactivated/i.test(errMsg);
+        const isHtmlFail = /can't parse entities|parse error|bad request.*parse/i.test(errMsg);
+
+        if (isBlock) {
+          console.log(`[hunt] dropping unreachable chat ${chatId}: ${errMsg}`);
           hunters.delete(chatId); saveHunters();
-        } else {
-          console.error('[hunt] broadcast error:', e.message);
+          failed++;
+          stats.broadcastFailed++;
+          const note = `chat ${chatId}: blocked/deactivated`;
+          errors.push(note);
+          stats.lastBroadcastError = note;
+          continue;
         }
+
+        if (isHtmlFail) {
+          // Retry once with plain text — strips all HTML tags
+          try {
+            const plain = html.replace(/<[^>]*>/g, '');
+            await bot.telegram.sendMessage(chatId, plain, { reply_markup });
+            delivered++;
+            stats.broadcastDelivered++;
+            stats.lastDeliveredAt = Date.now();
+            console.warn(`[hunt] HTML_PARSE_FAIL_RETRIED_PLAIN_TEXT for chat ${chatId}`);
+            continue;
+          } catch (e2) {
+            const note2 = `chat ${chatId}: HTML fail + plain retry fail — ${e2.description || e2.message}`;
+            errors.push(note2);
+            stats.lastBroadcastError = note2;
+            console.error('[hunt] broadcast error (plain fallback):', e2.message);
+          }
+        } else {
+          const note = `chat ${chatId}: ${errMsg}`;
+          errors.push(note);
+          stats.lastBroadcastError = note;
+          console.error('[hunt] broadcast error:', errMsg);
+        }
+        failed++;
+        stats.broadcastFailed++;
       }
     }
+
+    stats.broadcastAttempts += attempted;
+    return { attempted, delivered, failed, errors };
   };
   connect(broadcaster);
   startDexFallback(broadcaster);
@@ -685,4 +768,20 @@ async function pingFallback() {
   return { ok: true, delta };
 }
 
-module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect, pingFallback };
+// v10.2.10: direct test of the broadcast path for /hunttest command.
+// Sends a plain test message to a specific chatId using the bot ref from start().
+async function testBroadcast(chatId) {
+  if (!savedBotRef) return { ok: false, reason: 'Hunt engine not started (savedBotRef is null)' };
+  try {
+    await savedBotRef.telegram.sendMessage(
+      chatId,
+      `✅ <b>Hunt broadcaster test delivered to chatId ${chatId}</b>\nBroadcast path is working correctly. If Hunt signals are not arriving, the issue is upstream (filter, WS, or delivery error — check /huntstatus).`,
+      { parse_mode: 'HTML' }
+    );
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: e.description || e.message || 'unknown Telegram error' };
+  }
+}
+
+module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect, pingFallback, testBroadcast };
