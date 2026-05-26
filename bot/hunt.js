@@ -48,7 +48,7 @@ const RECONNECT_BASE_MS  = 2_000;
 const RECONNECT_MAX_MS   = 60_000;
 const PER_CA_COOLDOWN_MS = 5 * 60 * 1000; // don't re-broadcast same CA inside 5min
 const READY_STATE_OPEN   = 1;
-const HEARTBEAT_MS       = 30 * 1000;     // ping every 30s to keep door open
+const HEARTBEAT_MS       = 20 * 1000;     // ping every 20s — Railway proxy cuts idle at ~30s
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -407,8 +407,10 @@ function connect(broadcaster) {
     mySocket = new WS(url, {
       handshakeTimeout: WS_HANDSHAKE_TIMEOUT_MS,
       perMessageDeflate: false,
+      followRedirects: true,
       headers: {
         'User-Agent': WS_USER_AGENT,
+        'Origin':     'https://pumpportal.fun',
       },
     });
     ws = mySocket;
