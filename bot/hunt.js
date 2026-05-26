@@ -198,7 +198,9 @@ async function runScan(job, broadcaster) {
     if (last && Date.now() - last < PER_CA_COOLDOWN_MS) { stats.skipped++; return; }
 
     stats.scanned++;
-    const data = await fetchAll(ca);
+    // quickFilter: skip Birdeye/SolanaTracker when raw vol/liq < 5x — saves
+    // paid API credits on the ~60% of tokens that fail the vol/liq gate anyway.
+    const data = await fetchAll(ca, { quickFilter: true });
     if (!data?.codex) { stats.skipped++; return; }
 
     const result = scan(data);

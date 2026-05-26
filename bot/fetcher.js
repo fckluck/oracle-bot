@@ -691,15 +691,17 @@ async function fetchCodexHolders(ca) {
 
 // ── fetchAll ──────────────────────────────────────────────────────────────────
 
-async function fetchAll(ca) {
+// opts.quickFilter = true → skip Birdeye + SolanaTracker when raw vol/liq is
+// already below the broadcast floor (5x). Adjusted vol/liq ≤ raw vol/liq
+// always, so if raw < 5x the token will be skipped regardless — no point
+// burning paid API credits on it. Used by Hunt mode; manual /scan omits opts.
+async function fetchAll(ca, opts = {}) {
   console.log(`[fetchAll] starting fetch for CA: ${ca}`);
 
-  // Phase 1: parallel market data + Birdeye momentum + SolanaTracker creator
-  const [pump, dex, birdeye, stToken] = await Promise.all([
+  // Phase 1a: cheap market data only (DexScreener + PumpPortal are free)
+  const [pump, dex] = await Promise.all([
     fetchPumpPortal(ca),
     fetchDexScreener(ca),
-    fetchBirdeye(ca),
-    fetchSolanaTrackerToken(ca),
   ]);
 
   console.log(`[fetchAll] PumpPortal: ${pump
@@ -708,6 +710,23 @@ async function fetchAll(ca) {
   console.log(`[fetchAll] DexScreener: ${dex
     ? `OK — lp=$${dex.lp} vol1h=$${dex.volume1h} volLiq=${dex.volLiq.toFixed(2)}x`
     : 'null'}`);
+
+  // Pre-filter: if raw vol/liq is already below broadcast floor, bail before
+  // touching any paid APIs. Adjusted vol/liq can only be lower than raw.
+  const QUICK_FILTER_THRESHOLD = 5; // matches MIN_VOLLIQ_BROADCAST in hunt.js
+  if (opts.quickFilter) {
+    const rawVolLiq = dex?.volLiq ?? 0;
+    if (rawVolLiq < QUICK_FILTER_THRESHOLD) {
+      console.log(`[fetchAll] quick-filter: raw volLiq ${rawVolLiq.toFixed(2)}x < ${QUICK_FILTER_THRESHOLD}x — skipping paid APIs`);
+      return null;
+    }
+  }
+
+  // Phase 1b: paid enrichment — only reached when vol/liq clears the floor
+  const [birdeye, stToken] = await Promise.all([
+    fetchBirdeye(ca),
+    fetchSolanaTrackerToken(ca),
+  ]);
 
   // Build primary market data object
   const isMigrated = pump?.migrated === true;
