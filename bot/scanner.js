@@ -241,11 +241,11 @@ function scan(data) {
   let entryTier = null, verdict, watchReason = null;
 
   // Shared safety predicate for the high tiers (SCRIBBLI / PLUTO).
-  // ALL of: momentum in top 25%, top10 < 15%, wash < 20%, bundle/parent clean,
+  // ALL of: momentum in top 25%, top10 < 25%, wash < 20%, bundle/parent clean,
   // holder health sane (50-200% or unknown), dev not active.
   const highTierSafe = (
     momentumStatus === 'TOP_QUARTER' &&
-    (top10Pct === null || top10Pct < 15) &&
+    (top10Pct === null || top10Pct < 25) && // v10.2.8: 15→25 Goldilocks calibration
     (washPct === null || washPct < 20) &&
     bundleCount <= 7 &&
     !sybilFunded &&
@@ -352,7 +352,7 @@ function scan(data) {
   // verdict back to WATCH_VOL. Treat any trip here as a bug.
   if (verdict === 'BUY') {
     let invariantFail = null;
-    if (top10Pct !== null && top10Pct > 15)                  invariantFail = `INVARIANT: top10 ${top10Pct.toFixed(1)}% > 15`;
+    if (top10Pct !== null && top10Pct > 25)                  invariantFail = `INVARIANT: top10 ${top10Pct.toFixed(1)}% > 25`;
     else if (momentumStatus === 'LOWER_RANGE')               invariantFail = `INVARIANT: momentum LOWER_RANGE`;
     else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION')   invariantFail = `INVARIANT: momentum VOLUMETRIC_DISTRIBUTION`;
     else if (washPct !== null && washPct > 30)               invariantFail = `INVARIANT: wash ${washPct.toFixed(0)}% > 30`;

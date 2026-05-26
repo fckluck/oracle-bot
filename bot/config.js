@@ -10,8 +10,8 @@ const config = {
   LP_MIN_USD:          parseFloat(process.env.LP_MIN_USD          || '10000'),
   AGE_MAX_MIN:         parseFloat(process.env.AGE_MAX_MIN         || '60'),
   VOL_LIQ_RATIO_MIN:  parseFloat(process.env.VOL_LIQ_RATIO_MIN   || '5.0'),
-  TOP10_MAX_PCT:       parseFloat(process.env.TOP10_MAX_PCT        || '15'),  // ideal/clean threshold (UI warning)
-  TOP10_HARD_MAX_PCT:  parseFloat(process.env.TOP10_HARD_MAX_PCT   || '15'), // v10.2.7: tightened 35→15 — Top10 >15% is NO-GO
+  TOP10_MAX_PCT:       parseFloat(process.env.TOP10_MAX_PCT        || '25'),  // v10.2.8: Goldilocks zone — 25% catches early accumulators, still blocks 30-40% dev rugs
+  TOP10_HARD_MAX_PCT:  parseFloat(process.env.TOP10_HARD_MAX_PCT   || '25'), // v10.2.8: hard NO-GO threshold raised 15→25%
   CURVE_MAX_PCT:       parseFloat(process.env.CURVE_MAX_PCT        || '60'),
   CURVE_HARD_SKIP_PCT: parseFloat(process.env.CURVE_HARD_SKIP_PCT || '90'),
   DEV_SCORE_MIN:       parseFloat(process.env.DEV_SCORE_MIN        || '30'),

@@ -279,12 +279,12 @@ function formatVerdict(result, ca) {
     const migrated = dp.migratedCount ?? 0;
     const pct = (migrated / dp.totalLaunches) * 100;
     const pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct).toString();
-    // pump.fun network average migration rate is ~0.5-2% — label accordingly
-    const flag = pct < 0.5  ? ' 🔴 SERIAL RUGGER'
+    // v10.2.8: pump.fun network migration rate ~1.5% — tier labels reflect reality
+    const flag = pct < 0.5  ? ' 🔴 ZERO SURVIVAL'
                : pct < 5    ? ' 🟡 NETWORK AVERAGE'
-               : pct > 20   ? ' 🟢 PRO PILOT'
-               : '';
-    successRate = `${migrated}/${dp.totalLaunches} tokens (${pctDisp}%)${flag}`;
+               : pct < 15   ? ' 🟢 PRO PILOT'
+               :               ' 💎 ELITE DEPLOYER';
+    successRate = `${migrated}/${dp.totalLaunches} (${pctDisp}%)${flag}`;
   } else if (dp.totalLaunches != null) {
     successRate = `0/${dp.totalLaunches} tokens (0%) 🔴 SERIAL RUGGER`;
   }
@@ -330,13 +330,11 @@ function formatVerdict(result, ca) {
     holderDisplay = 'UNVERIFIED';
   }
 
-  // v10.2.7: anything > 15% is FAIL. The old MODERATE/ELEVATED/NEUTRAL tiers
-  // made >15% top10 look acceptable in the UI even though the scanner now
-  // routes it to NO_GO. Display must match scanner truth.
+  // v10.2.8: gate raised to 25% (Goldilocks). Display matches scanner truth.
   const top10Display = signals.top10Pct !== null
     ? `${fmtPct(signals.top10Pct)} (${esc(
-        (isSmallCap && signals.top10Pct <= 15)  ? 'HEALTHY (small-cap)' :
-        signals.top10Pct > 15                   ? 'FAIL'                : 'CLEAN'
+        signals.top10Pct <= 15                  ? 'CLEAN'              :
+        signals.top10Pct <= 25                  ? 'ELEVATED'           : 'FAIL'
       )})`
     : `UNVERIFIED`;
 
