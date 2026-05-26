@@ -631,6 +631,20 @@ async function sendHeartbeat(pos, bot) {
 function startTracker(bot) {
   loadFromDisk();
 
+  // v10.2.8: re-trigger baseline for positions that survived a restart without
+  // one (e.g. bot crashed during the 2-min retry window in the previous session).
+  // Without this, Cluster Exit and Saturation triggers never fire for those
+  // positions because entryTop50Pct / entryHolderCount stay null indefinitely.
+  // Delay 8s so bot.launch() polling is established before we try to send msgs.
+  setTimeout(() => {
+    for (const pos of positions.values()) {
+      if (pos.entryTop50Pct === null || pos.entryHolderCount === null) {
+        console.log(`[tracker] restart: re-triggering baseline for ${pos.ca.slice(0,8)} (no baseline from prior session)`);
+        maybeEstablishBaseline(pos.ca, bot);
+      }
+    }
+  }, 8000);
+
   // Forensic scan — every 60s
   setInterval(async () => {
     if (positions.size === 0) return;

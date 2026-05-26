@@ -148,8 +148,13 @@ function scan(data) {
   const insidersPct    = data.insidersPct  ?? null;
   const stRiskScore    = data.stRiskScore  ?? null;
   const washPct        = rawWashPct != null ? Math.round(rawWashPct * 10) / 10 : null;
-  const organicVol     = (washPct != null && vol1h > 0)
-    ? vol1h * (1 - washPct / 100) : vol1h;
+  // v10.2.8 null-wash fix: when both Birdeye AND SolanaTracker fail to return
+  // wash data, treat volume as 20% suspect (conservative floor). Without this,
+  // a token with fabricated volume + dead APIs appears 100% organic and can
+  // artificially hit PLUTO/HIGH_CONVICTION tier purely from API failure.
+  const WASH_UNVERIFIED_PCT = 20;
+  const effectiveWashPct   = washPct != null ? washPct : WASH_UNVERIFIED_PCT;
+  const organicVol     = vol1h > 0 ? vol1h * (1 - effectiveWashPct / 100) : 0;
   const adjustedVolLiq = lp > 0 ? organicVol / lp : 0;
   const rawVolLiq      = lp > 0 ? vol1h / lp : 0;
 
@@ -357,6 +362,10 @@ function scan(data) {
     else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION')   invariantFail = `INVARIANT: momentum VOLUMETRIC_DISTRIBUTION`;
     else if (washPct !== null && washPct > 30)               invariantFail = `INVARIANT: wash ${washPct.toFixed(0)}% > 30`;
     else if (holderHealthData?.label === 'INFLATED/BOTTED')  invariantFail = `INVARIANT: INFLATED/BOTTED holders`;
+    // v10.2.8: sybil-funded wallets were missing from fuse — HIGH_CONVICTION
+    // (8x-12x) doesn't check highTierSafe, so a sybil bundle with low wash
+    // and low top10 could slip through to BUY. Catch it here as a last resort.
+    else if (sybilFunded)                                    invariantFail = `INVARIANT: sybil-funded wallet detected`;
     if (invariantFail) {
       console.error(`[scanner] ${invariantFail} — forcing BUY → WATCH_VOL (bug in upstream verdict logic)`);
       verdict       = 'WATCH_VOL';

@@ -236,6 +236,24 @@ bot.command('untrack', ctx => {
     : `Untrack failed for <code>${ca.slice(0,6)}...${ca.slice(-4)}</code>.`);
 });
 
+bot.command('watchlist', ctx => {
+  const all = watchlist.list();
+  const mine = all.filter(e => e.chatId === ctx.chat.id);
+  if (!mine.length) return ctx.reply('No tokens on your watchlist. Use the 🔔 ALERT button on any WATCH_VOL result to add one.');
+  const now = Date.now();
+  const lines = mine.map((e, i) => {
+    const ageMin = Math.floor((now - e.addedAt) / 60000);
+    const expiresIn = Math.max(0, Math.floor((e.addedAt + 6 * 60 * 60 * 1000 - now) / 60000));
+    return `${i + 1}. <code>${e.ca.slice(0, 8)}...</code> $${e.symbol} — added ${ageMin}m ago, expires in ${expiresIn}m`;
+  });
+  return ctx.replyWithHTML(
+    `<b>Your Watchlist (${mine.length})</b>\n` +
+    `<i>Waiting for Vol/Liq ≥ 5x + Holder Health ≥ 50%</i>\n\n` +
+    lines.join('\n') +
+    `\n\n<i>Alerts auto-expire after 6 hours.</i>`
+  );
+});
+
 bot.command('tracking', ctx => {
   const positions = tracker.list();
   if (!positions.length) return ctx.reply('No positions currently tracked.');
