@@ -126,11 +126,17 @@ function scan(data) {
   const successRatePct   = (devLaunches != null && devLaunches > 0 && migratedCount != null)
     ? (migratedCount / devLaunches) * 100 : null;
   const isUnproven       = devLaunches != null && devLaunches < 10;
-  const isProPilot       = successRatePct != null && successRatePct > 5  && !isUnproven;
+  // Age Decay: elite/pro volume buffers are meaningless on stale tokens.
+  // A token >60 min old AND still below $50K MC is either abandoned or
+  // slow-bleeding. Strip elite exemptions so the RISKY_RUNNER $100K cap,
+  // DISTRIBUTION→WATCH_VOL override, and top10HardMax 50% don't protect
+  // what is effectively a dead token on a manual /scan.
+  const isStaleElite     = ageMins !== null && ageMins > 60 && mc !== null && mc < 50_000;
+  const isProPilot       = !isStaleElite && successRatePct != null && successRatePct > 5  && !isUnproven;
   // Elite threshold: >10% success rate AND >15 launches.
   // >15 launches ensures statistical significance (a 20% rate on 5 launches is luck,
   // not skill). isUnproven check is implicit — >15 launches always passes !isUnproven.
-  const isEliteDev       = successRatePct != null && successRatePct > 10 && devLaunches != null && devLaunches > 15;
+  const isEliteDev       = !isStaleElite && successRatePct != null && successRatePct > 10 && devLaunches != null && devLaunches > 15;
   const isSerialDeployer = devLaunches !== null && devLaunches > 500;
 
   const holderCount     = holders?.holderCount     ?? null;
@@ -270,7 +276,12 @@ function scan(data) {
       holderHealthData?.healthPct == null
     )
   ) {
-    const isBotted = holderHealthData?.healthPct != null && holderHealthData.healthPct > 250;
+    // Nano-cap (<$25K): natural holder concentration means a handful of wallets
+    // can dominate and inflate the health score without bot activity. Raise the
+    // botted threshold to 400% to reduce false positives at this MC range.
+    // Above $25K: standard 250% — enough MC to attract organic distribution.
+    const bottedThreshold = (mc != null && mc < 25_000) ? 400 : 250;
+    const isBotted = holderHealthData?.healthPct != null && holderHealthData.healthPct > bottedThreshold;
     // Bonding-curve tokens (LP=0): pump.fun coin API never exposes holder count,
     // so holder data is structurally unavailable — not an API failure. Extend the
     // RISKY_RUNNER exception to sub-$100K at the standard BUY floor (5x adjusted).
