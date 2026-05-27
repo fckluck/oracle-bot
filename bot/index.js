@@ -1,7 +1,7 @@
 require('dotenv').config();
 const http     = require('http');
 const { Telegraf } = require('telegraf');
-const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic } = require('./fetcher');
+const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic, fetchMcOnly } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
 const tracker   = require('./tracker');
@@ -9,6 +9,7 @@ const hunt      = require('./hunt');
 const watchlist = require('./watchlist');
 const config    = require('./config');
 const { probeXaiConnection, getSoulReasoning } = require('./reasoning');
+const { recordScan, updatePeaks, getAll, getUnresolved, getPatternMemory } = require('./audit');
 
 // ── Railway health check ───────────────────────────────────────────────────────
 // Railway treats every service as a web service and kills the process if it
@@ -314,6 +315,59 @@ bot.command('watchlist', ctx => {
   );
 });
 
+bot.command('audit', async ctx => {
+  const records = getAll().sort((a, b) => b.scannedAt - a.scannedAt);
+  if (records.length === 0) {
+    return ctx.reply('No audit records yet. Records accumulate from /scan, Hunt Mode, and Watchlist alerts.');
+  }
+
+  const outcomeIcon = { WINNER_10X: '🚀', WINNER_3X: '✅', LOSER_50: '📉', RUG: '🩸', UNRESOLVED: '⏳', EXPIRED: '💤' };
+  const fmt = r => {
+    const ageMin  = Math.round((Date.now() - r.scannedAt) / 60000);
+    const mcStr   = r.scanMc  != null ? `$${(r.scanMc / 1000).toFixed(0)}K`  : '?';
+    const peakStr = r.peakMc  != null ? ` → $${(r.peakMc / 1000).toFixed(0)}K` : '';
+    const mult    = (r.peakMc && r.scanMc) ? ` (${(r.peakMc / r.scanMc).toFixed(1)}x)` : '';
+    const icon    = outcomeIcon[r.outcome] ?? '⏳';
+    return `${icon} <code>$${r.symbol}</code> | ${r.verdict} | ${mcStr}${peakStr}${mult} | ${ageMin}m ago`;
+  };
+
+  const recent   = records.slice(0, 10);
+  const missed   = records.filter(r =>
+    ['NO_GO', 'AVOID', 'WATCH_VOL', 'RISKY_RUNNER'].includes(r.verdict) &&
+    (r.outcome === 'WINNER_3X' || r.outcome === 'WINNER_10X')
+  );
+  const falsePos = records.filter(r => r.verdict === 'BUY' && r.outcome === 'RUG');
+
+  let msg = `🔮 <b>ORACLE AUDIT</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  msg += `<b>📋 RECENT SCANS</b>\n` + recent.map(fmt).join('\n');
+
+  if (missed.length > 0) {
+    msg += `\n\n<b>❌ MISSED WINNERS</b> (NO-GO/WATCH that ran 3x+)\n`;
+    msg += missed.slice(0, 5).map(fmt).join('\n');
+  }
+
+  if (falsePos.length > 0) {
+    msg += `\n\n<b>⚠️ FALSE POSITIVES</b> (BUY → Rug)\n`;
+    msg += falsePos.slice(0, 5).map(fmt).join('\n');
+  }
+
+  const resolved = records.filter(r => r.outcome !== 'UNRESOLVED' && r.outcome !== 'EXPIRED');
+  const wins     = resolved.filter(r => r.outcome === 'WINNER_3X' || r.outcome === 'WINNER_10X').length;
+  const rugs     = resolved.filter(r => r.outcome === 'RUG').length;
+  const buyWins  = records.filter(r => r.verdict === 'BUY' && (r.outcome === 'WINNER_3X' || r.outcome === 'WINNER_10X')).length;
+  const buyResolved = records.filter(r => r.verdict === 'BUY' && resolved.find(x => x.ca === r.ca)).length;
+
+  msg += `\n\n━━━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `📊 Resolved: ${resolved.length} | 🚀 Winners: ${wins} | 🩸 Rugs: ${rugs}\n`;
+  if (buyResolved > 0) {
+    msg += `🎯 BUY accuracy: ${buyWins}/${buyResolved} (${Math.round(buyWins / buyResolved * 100)}%)\n`;
+  }
+  msg += `⏳ Watching: ${records.filter(r => r.outcome === 'UNRESOLVED').length} unresolved`;
+
+  await ctx.reply(msg, { parse_mode: 'HTML' });
+});
+
 bot.command('tracking', ctx => {
   const positions = tracker.list();
   if (!positions.length) return ctx.reply('No positions currently tracked.');
@@ -413,6 +467,7 @@ bot.on('text', async ctx => {
         marketCap:      result.signals?.marketCap,
         verdict:        result.verdict,
         isEliteDev:     result.signals?.isEliteDev,
+        patternMemory:  getPatternMemory(),
       }).then(soul => { result.soulReasoning = soul; }),
     ]);
     result.deFadeVerification = deFade;
@@ -424,6 +479,21 @@ bot.on('text', async ctx => {
 
     const message = formatVerdict(result, ca);
     const mc      = result.signals.marketCap || 0;
+
+    // Audit every completed /scan so /audit can surface missed winners + false positives.
+    recordScan({
+      ca,
+      symbol:         data.codex?.symbol || data.pump?.symbol,
+      verdict:        result.verdict,
+      mc:             result.signals?.marketCap,
+      adjustedVolLiq: result.signals?.adjustedVolLiq,
+      top10Pct:       result.signals?.top10Pct,
+      washPct:        result.signals?.washPct,
+      isEliteDev:     result.signals?.isEliteDev,
+      successRatePct: result.signals?.successRatePct,
+      devLaunches:    result.signals?.totalLaunches,
+      source:         'scan',
+    });
 
     await ctx.telegram.editMessageText(
       ctx.chat.id, scanning.message_id, undefined,
@@ -621,6 +691,33 @@ async function launchWithRetry(maxAttempts = 10, delayMs = 3000) {
     }
   }
 }
+
+// ── Audit peak-update loop ────────────────────────────────────────────────────
+// Every 60 minutes, fetch the current MC for all unresolved audit records and
+// classify them (WINNER_10X / WINNER_3X / LOSER_50 / RUG / EXPIRED).
+// Uses a lightweight single-endpoint Birdeye call — not the heavy fetchAll.
+// Staggered 2-second delay between requests to avoid API rate limits.
+async function runAuditPeakUpdate() {
+  const unresolved = getUnresolved();
+  if (unresolved.length === 0) return;
+  const mcMap = {};
+  for (const rec of unresolved) {
+    try {
+      const result = await fetchMcOnly(rec.ca);
+      if (result?.mc != null) mcMap[rec.ca] = result.mc;
+    } catch { /* ignore individual failures */ }
+    await new Promise(r => setTimeout(r, 2000)); // 2s between requests
+  }
+  updatePeaks(mcMap);
+  console.log(`[audit] peak update: ${Object.keys(mcMap).length}/${unresolved.length} fetched`);
+}
+// First run 5 min after startup (let Railway stabilise), then every 60 min.
+setTimeout(() => {
+  runAuditPeakUpdate().catch(e => console.error('[audit] peak update error:', e.message));
+  setInterval(() => {
+    runAuditPeakUpdate().catch(e => console.error('[audit] peak update error:', e.message));
+  }, 60 * 60 * 1000);
+}, 5 * 60 * 1000);
 
 launchWithRetry().catch(err => console.error('[launch] launchWithRetry unexpected error:', err?.stack || err));
 

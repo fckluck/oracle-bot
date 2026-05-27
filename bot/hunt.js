@@ -24,6 +24,7 @@ const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
 const { scan }             = require('./scanner');
 const { formatVerdict }    = require('./verdict');
 const { getSoulReasoning } = require('./reasoning');
+const { recordScan }       = require('./audit');
 const config               = require('./config');
 
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
@@ -282,6 +283,21 @@ async function runScan(job, broadcaster) {
     };
     lastCandidates.unshift(candidateEntry);
     if (lastCandidates.length > MAX_LAST_CANDIDATES) lastCandidates.pop();
+
+    // Audit every hunt broadcast so /audit can track missed runners from Hunt Mode.
+    recordScan({
+      ca,
+      symbol:         rawSym,
+      verdict:        result.verdict,
+      mc:             result.signals?.marketCap,
+      adjustedVolLiq: result.signals?.adjustedVolLiq,
+      top10Pct:       result.signals?.top10Pct,
+      washPct:        result.signals?.washPct,
+      isEliteDev:     result.signals?.isEliteDev,
+      successRatePct: result.signals?.successRatePct,
+      devLaunches:    result.signals?.totalLaunches,
+      source:         'hunt',
+    });
 
     console.log(`[hunt] broadcast ${ca.slice(0,8)} — delivered:${delivery.delivered} failed:${delivery.failed}${delivery.errors[0] ? ` err:${delivery.errors[0]}` : ''}`);
   } catch (e) {

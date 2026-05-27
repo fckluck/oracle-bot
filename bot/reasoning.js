@@ -3,7 +3,25 @@ const fetch = require('node-fetch');
 const XAI_API_URL = 'https://api.x.ai/v1/chat/completions';
 const TIMEOUT_MS  = 15_000;   // grok-3 p95 latency ~3-8s; 15s gives plenty of headroom
 
-async function getSoulReasoning({ ticker, adjustedVolLiq, top10Pct, successRatePct, socialMentions, marketCap, verdict, isEliteDev } = {}) {
+// Build a compact pattern memory block from audit history.
+// Injected into the Grok prompt so it can reference real past trades.
+// Hard limit: winners + rugs only (no overrides possible — safety gates remain).
+function buildPatternBlock(patternMemory) {
+  if (!patternMemory) return '';
+  const { winners = [], rugs = [] } = patternMemory;
+  if (winners.length === 0 && rugs.length === 0) return '';
+  const fmt = r =>
+    `$${r.symbol}(MC:${r.scanMc != null ? (r.scanMc / 1000).toFixed(0) + 'K' : '?'}` +
+    ` Vol:${r.adjustedVolLiq != null ? r.adjustedVolLiq.toFixed(1) + 'x' : '?'}` +
+    ` Top10:${r.top10Pct != null ? r.top10Pct.toFixed(0) + '%' : '?'}` +
+    ` ${r.outcome})`;
+  const parts = [];
+  if (winners.length) parts.push(`WINNERS:${winners.map(fmt).join('|')}`);
+  if (rugs.length)    parts.push(`RUGS:${rugs.map(fmt).join('|')}`);
+  return `ORACLE PATTERN MEMORY (past resolved trades — reference only, cannot override safety gates): ${parts.join('. ')}. `;
+}
+
+async function getSoulReasoning({ ticker, adjustedVolLiq, top10Pct, successRatePct, socialMentions, marketCap, verdict, isEliteDev, patternMemory } = {}) {
   const key = process.env.XAI_API_KEY;
   if (!key) return null;
 
@@ -20,12 +38,14 @@ async function getSoulReasoning({ ticker, adjustedVolLiq, top10Pct, successRateP
     ? `This developer is 💎 ELITE (${devRt} migration success rate) — they commonly self-bundle to protect the floor. ` +
       `Evaluate whether concentration is protective floor control or genuine rug risk. `
     : '';
+  const patternCtx = buildPatternBlock(patternMemory);
   const prompt =
     `You are Oracle Bot's Soul — a Solana memecoin analyst. ` +
     `Respond in exactly ONE sentence, max 25 words, no preamble or labels. ` +
     `Token: $${ticker ?? 'UNKNOWN'} | MC: ${mcK} | Adj Vol/Liq: ${volLiq} | ` +
     `Top10: ${top10} | Dev success rate: ${devRt} | Social mentions (15m): ${social} | Verdict: ${verdict ?? 'N/A'}. ` +
     eliteCtx +
+    patternCtx +
     `Reference patterns: $STOCKMAN (organic buy pressure, high holder health), ` +
     `$SPEED (low MC nano-cap, volume overrides missing data), ` +
     `$MANNY (sybil-funded rug, fake volume). ` +

@@ -984,4 +984,23 @@ async function fetchForensic(ca) {
   };
 }
 
-module.exports = { fetchAll, fetchForensic, fetchDeFadeVerification, fetchSocialData };
+// Lightweight MC-only fetch used by the audit background loop.
+// Uses Birdeye token_overview (already called in fetchBirdeye) — single request,
+// no heavy multi-API fetchAll. Returns { mc } or null on error/missing key.
+async function fetchMcOnly(ca) {
+  const key = process.env.BIRDEYE_API_KEY;
+  if (!key) return null;
+  try {
+    const headers = { 'X-API-KEY': key, 'x-chain': 'solana' };
+    const res = await fetch(
+      `${BIRDEYE_BASE}/defi/token_overview?address=${ca}`,
+      { headers, timeout: 8000 },
+    );
+    if (!res.ok) return null;
+    const j  = await res.json();
+    const mc = j?.data?.mc ?? j?.data?.marketCap ?? null;
+    return mc != null ? { mc: Number(mc) } : null;
+  } catch { return null; }
+}
+
+module.exports = { fetchAll, fetchForensic, fetchDeFadeVerification, fetchSocialData, fetchMcOnly };

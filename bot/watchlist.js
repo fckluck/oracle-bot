@@ -6,6 +6,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { fetchForensic } = require('./fetcher');
+const { recordScan }    = require('./audit');
 
 // Prefer /data (Railway persistent volume) over local file — same pattern as hunters.json.
 // Falls back to the local bot/ directory when /data is not writable (dev/Replit).
@@ -128,6 +129,22 @@ async function checkEntry(entry, bot) {
           { text: '🐦 X SEARCH',    url: `https://x.com/search?q=${entry.ca}&src=typed_query` },
         ]],
       },
+    });
+
+    // Audit watchlist fires — these are WATCH_VOL tokens that hit entry grade;
+    // /audit will track whether they ultimately ran or rugged.
+    recordScan({
+      ca:             entry.ca,
+      symbol:         entry.symbol,
+      verdict:        'WATCHLIST_FIRED',
+      mc,
+      adjustedVolLiq: volLiq,
+      top10Pct:       null,
+      washPct:        null,
+      isEliteDev:     false,
+      successRatePct: null,
+      devLaunches:    null,
+      source:         'watchlist',
     });
 
     console.log(`[watchlist] FIRED alert for ${entry.ca.slice(0,8)}... — conditions met`);
