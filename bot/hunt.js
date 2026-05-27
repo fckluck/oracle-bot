@@ -18,9 +18,10 @@ const path  = require('path');
 const fetch = require('node-fetch');
 const WS    = require('ws');          // explicit import — never rely on global WebSocket
 const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
-const { scan }          = require('./scanner');
-const { formatVerdict } = require('./verdict');
-const config            = require('./config');
+const { scan }             = require('./scanner');
+const { formatVerdict }    = require('./verdict');
+const { getSoulReasoning } = require('./reasoning');
+const config               = require('./config');
 
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
 const DEX_PROFILES_URL = 'https://api.dexscreener.com/token-profiles/latest/v1';
@@ -33,7 +34,7 @@ function resolveHuntersFile() {
 }
 const HUNTERS_FILE = resolveHuntersFile();
 console.log(`[hunt] hunters file: ${HUNTERS_FILE}`);
-const MIN_VOLLIQ_BROADCAST       = 5;
+const MIN_VOLLIQ_BROADCAST = Number.isFinite(config.MIN_VOLLIQ_BROADCAST) ? config.MIN_VOLLIQ_BROADCAST : 3.0;
 const MIN_MARKET_CAP_SOL_PRESCAN = 30;   // skip dust launches (~$4K)
 const WS_STALE_MS           = Number.isFinite(config.HUNT_WS_STALE_MS)            ? config.HUNT_WS_STALE_MS            : 120_000;
 const FALLBACK_ENABLED      = config.HUNT_FALLBACK_ENABLED !== false;
@@ -206,6 +207,17 @@ async function runScan(job, broadcaster) {
     const result = scan(data);
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
     if (adjustedVolLiq < MIN_VOLLIQ_BROADCAST) { stats.skipped++; return; }
+
+    // Grok soul reasoning — non-blocking; skips silently if XAI_API_KEY absent.
+    result.soulReasoning = await getSoulReasoning({
+      ticker:        data.codex?.symbol || data.pump?.symbol,
+      adjustedVolLiq,
+      top10Pct:      result.signals?.top10Pct,
+      successRatePct:result.signals?.successRatePct,
+      socialMentions:data.social?.mentions15m,
+      marketCap:     result.signals?.marketCap,
+      verdict:       result.verdict,
+    }).catch(() => null);
 
     // Post-scan DeFade verification on BUY candidates only (free-plan quota).
     if (result.verdict === 'BUY') {

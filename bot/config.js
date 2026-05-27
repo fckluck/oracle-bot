@@ -16,10 +16,15 @@ const config = {
   CURVE_HARD_SKIP_PCT: parseFloat(process.env.CURVE_HARD_SKIP_PCT || '90'),
   DEV_SCORE_MIN:       parseFloat(process.env.DEV_SCORE_MIN        || '30'),
 
+  // Broadcast floor (v13.0: lowered 5→3 to catch PRO_PILOT 3x BUYs and early signals)
+  MIN_VOLLIQ_BROADCAST: parseFloat(process.env.MIN_VOLLIQ_BROADCAST || '3.0'),
+
   // Hunt Mode resilience. PumpPortal remains primary; DexScreener latest-profile
   // polling is a low-volume fallback so Hunt Mode does not go blind when WS events
   // are stale, blocked, or payload-shape changed.
-  HUNT_WS_STALE_MS:           parseInt(process.env.HUNT_WS_STALE_MS || String(2 * 60 * 1000), 10),
+  // v13.0: stale threshold lowered 120s→60s (pump.fun launches are frequent;
+  //   60s without a frame is a real stale condition, not normal quiet).
+  HUNT_WS_STALE_MS:           parseInt(process.env.HUNT_WS_STALE_MS || String(60 * 1000), 10),
   HUNT_FALLBACK_ENABLED:      process.env.HUNT_FALLBACK_ENABLED !== 'false',
   HUNT_FALLBACK_POLL_MS:      parseInt(process.env.HUNT_FALLBACK_POLL_MS || String(90 * 1000), 10),
   HUNT_FALLBACK_MAX_PER_POLL: parseInt(process.env.HUNT_FALLBACK_MAX_PER_POLL || '10', 10),

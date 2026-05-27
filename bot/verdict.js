@@ -134,6 +134,15 @@ function formatVerdict(result, ca) {
   const rawVolLiq     = signals.rawVolLiq;
   const L = [];
 
+  // ── Oracle's Soul (Grok reasoning — shown when XAI_API_KEY is configured) ──
+
+  const soulReasoning = result.soulReasoning ?? null;
+  if (soulReasoning) {
+    L.push(`🧠 ${b('ORACLE\'S SOUL')}`);
+    L.push(i(esc(soulReasoning)));
+    L.push('─────────────────────────────');
+  }
+
   // ── Time-window banner ─────────────────────────────────────────────────────
 
   if (timeWindow === 'RESEARCH') {

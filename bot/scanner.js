@@ -126,7 +126,8 @@ function scan(data) {
   const successRatePct   = (devLaunches != null && devLaunches > 0 && migratedCount != null)
     ? (migratedCount / devLaunches) * 100 : null;
   const isUnproven       = devLaunches != null && devLaunches < 10;
-  const isProPilot       = successRatePct != null && successRatePct > 5 && !isUnproven;
+  const isProPilot       = successRatePct != null && successRatePct > 5  && !isUnproven;
+  const isEliteDev       = successRatePct != null && successRatePct >= 15 && !isUnproven;
   const isSerialDeployer = devLaunches !== null && devLaunches > 500;
 
   const holderCount     = holders?.holderCount     ?? null;
@@ -134,11 +135,14 @@ function scan(data) {
   const top10Pct        = holders?.top10Pct        ?? null;
   const holderSource    = holders?.source          ?? null;
 
-  // v12.0: dynamic top10 cap — early-stage tokens (< $100K MC) have naturally
-  // concentrated holders that distribute as price rises. 35% cap allows real
-  // launches through; still blocks obvious dev-wallet rugs at 40-50% top10.
-  // Above $100K MC the stricter 25% applies (established token, no excuse).
-  const top10HardMax = (mc != null && mc < 100_000) ? 35 : 25;
+  // v12.0/v13.0: dynamic top10 cap based on MC and dev track record.
+  // sub-$100K + elite/pro dev (proven track record) → 40% (elite devs often
+  //   front-run liquidity; concentration distributes post-launch naturally).
+  // sub-$100K + unknown dev → 35% (early concentration is still normal).
+  // $100K+ → flat 25% (established token, no excuse for high concentration).
+  const top10HardMax = (mc != null && mc < 100_000)
+    ? (isEliteDev || isProPilot) ? 40 : 35
+    : 25;
 
   const ctoDesc        = detectCtoFromDesc(pump);
   const ctoBehavior    = ctoStatus(pump, walletAge, top10Pct);
@@ -433,7 +437,7 @@ function scan(data) {
       bundleCount, isMeteora, deFadeScore, isDeFadeClean, sybilFunded,
       holderHealth:   holderHealthData,
       isPostCurve:    pump?.migrated === true || (pump == null && codex != null),
-      isProPilot, isUnproven, isSerialDeployer, successRatePct, riskyRunnerReason,
+      isProPilot, isEliteDev, isUnproven, isSerialDeployer, successRatePct, riskyRunnerReason,
       proPilotBuffer: isProPilot && adjustedVolLiq >= 3 && adjustedVolLiq < 5,
     },
   };

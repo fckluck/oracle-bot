@@ -713,7 +713,7 @@ async function fetchAll(ca, opts = {}) {
 
   // Pre-filter: if raw vol/liq is already below broadcast floor, bail before
   // touching any paid APIs. Adjusted vol/liq can only be lower than raw.
-  const QUICK_FILTER_THRESHOLD = 5; // matches MIN_VOLLIQ_BROADCAST in hunt.js
+  const QUICK_FILTER_THRESHOLD = 3; // v13.0: matches MIN_VOLLIQ_BROADCAST=3 in config
   if (opts.quickFilter) {
     const rawVolLiq = dex?.volLiq ?? 0;
     if (rawVolLiq < QUICK_FILTER_THRESHOLD) {
