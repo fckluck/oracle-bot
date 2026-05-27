@@ -164,8 +164,12 @@ function scan(data) {
   const WASH_UNVERIFIED_PCT = 20;
   const effectiveWashPct   = washPct != null ? washPct : WASH_UNVERIFIED_PCT;
   const organicVol     = vol1h > 0 ? vol1h * (1 - effectiveWashPct / 100) : 0;
-  const adjustedVolLiq = lp > 0 ? organicVol / lp : 0;
-  const rawVolLiq      = lp > 0 ? vol1h / lp : 0;
+  // Bonding-curve tokens (LP=0) have no Raydium pool yet — use market cap as the
+  // effective liquidity denominator. vol/MC is numerically equivalent to vol/LP
+  // at pump.fun graduation (LP ≈ MC at migration), so the same tier thresholds apply.
+  const liquidityProxy = lp > 0 ? lp : (mc || 0);
+  const adjustedVolLiq = liquidityProxy > 0 ? organicVol  / liquidityProxy : 0;
+  const rawVolLiq      = liquidityProxy > 0 ? vol1h       / liquidityProxy : 0;
 
   // ── Bundle / DeFade ────────────────────────────────────────────────────────
   const bundleCount  = bundle?.maxInSlot ?? 0;
@@ -207,9 +211,10 @@ function scan(data) {
       headlineType = 'WASH';
     }
   }
-  // 4. Liquidity
-  else if (lp < config.LP_MIN_USD) {
-    noGoReason   = `Low Liquidity (${lp > 0 ? '$' + lp.toLocaleString() : 'N/A'} < $${config.LP_MIN_USD.toLocaleString()})`;
+  // 4. Liquidity — for bonding-curve tokens LP=0, use MC as effective liquidity.
+  // A token with LP=0 but MC >= LP_MIN_USD has enough curve liquidity to enter.
+  else if (lp < config.LP_MIN_USD && !(lp === 0 && mc != null && mc >= config.LP_MIN_USD)) {
+    noGoReason   = `Low Liquidity (${lp > 0 ? '$' + lp.toLocaleString() : (mc > 0 ? 'MC $' + mc.toLocaleString() : 'N/A')} < $${config.LP_MIN_USD.toLocaleString()})`;
     headlineType = 'LIQUIDITY';
   }
   // 5. Migration gap
@@ -240,12 +245,19 @@ function scan(data) {
       holderHealthData?.healthPct == null
     )
   ) {
-    const isBotted   = holderHealthData?.healthPct != null && holderHealthData.healthPct > 250;
-    const isNanoCap  = mc < 40_000;
-    const isHighVol  = adjustedVolLiq >= 8;
-    if (!isBotted && isNanoCap && isHighVol) {
-      // Nano-cap + high organic vol + API failure (not proven botted) →
-      // fall through to verdict ladder, demoted to RISKY_RUNNER below.
+    const isBotted = holderHealthData?.healthPct != null && holderHealthData.healthPct > 250;
+    // Bonding-curve tokens (LP=0): pump.fun coin API never exposes holder count,
+    // so holder data is structurally unavailable — not an API failure. Extend the
+    // RISKY_RUNNER exception to sub-$100K at the standard BUY floor (5x adjusted).
+    // Post-graduation (LP>0): keep original nano-cap (<$40K) at 8x (API-failure only).
+    // LP=0 threshold is 4x adjusted (= 5x raw before the 20% unverified-wash floor).
+    // That equals the BASELINE_ENTRY raw-vol floor, so only genuinely active tokens pass.
+    const riskyRunnerCandidate = !isBotted && mc != null && (
+      lp === 0 ? (mc < 100_000 && adjustedVolLiq >= 4)
+               : (mc < 40_000  && adjustedVolLiq >= 8)
+    );
+    if (riskyRunnerCandidate) {
+      // Fall through to verdict ladder; demoted to RISKY_RUNNER below.
     } else if (isBotted) {
       noGoReason   = `BOTTED WALLETS — Holder Health ${holderHealthData.healthPct}% at $${(mc/1000).toFixed(0)}K MC (>250% threshold)`;
       headlineType = 'INFLATED';
@@ -361,11 +373,18 @@ function scan(data) {
     entryTier    = null;
   }
 
-  // v12.0 RISKY RUNNER: nano-cap (< $40K) + high adjusted vol/liq (≥ 8x) +
-  // holder data unavailable due to API failure (not proven botted).
+  // v12.0 RISKY RUNNER: holder data unavailable + strong volume signal.
+  // Two paths:
+  //   LP=0 (bonding curve): sub-$100K + adjustedVolLiq ≥ 5x — pump.fun API never
+  //     exposes holder count so this is structural, not an API failure.
+  //   LP>0 (graduated): nano-cap (<$40K) + adjustedVolLiq ≥ 8x — API failure only.
   // Bundle, wash, concentration, and liquidity gates above still applied.
   // Position halved vs normal BUY; user must exit by TP1.
-  if (verdict === 'BUY' && holderCount === null && mc != null && mc < 40_000 && adjustedVolLiq >= 8) {
+  const riskyRunnerTrip = holderCount === null && mc != null && (
+    (lp === 0 && mc < 100_000 && adjustedVolLiq >= 4) ||
+    (lp > 0  && mc < 40_000  && adjustedVolLiq >= 8)
+  );
+  if (verdict === 'BUY' && riskyRunnerTrip) {
     verdict           = 'RISKY_RUNNER';
     riskyRunnerReason = 'DATA_PENDING_HIGH_VOL';
     entryTier         = null;

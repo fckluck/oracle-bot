@@ -3,8 +3,8 @@ const fetch = require('node-fetch');
 
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens/';
 const CODEX_GQL       = 'https://graph.codex.io/graphql';
-const PUMPPORTAL_URL  = 'https://pumpportal.fun/api/data/token-stats?mint=';
-const PUMPPORTAL_USER = 'https://pumpportal.fun/api/data/user-stats?user=';
+const PUMPFUN_URL     = 'https://frontend-api.pump.fun/coins/';
+const PUMPFUN_USER    = 'https://frontend-api.pump.fun/coins/user-created-coins/';
 const JUPITER_PRICE   = 'https://price.jup.ag/v4/price?ids=';
 const SOLANA_RPC      = 'https://api.mainnet-beta.solana.com';
 const BIRDEYE_BASE    = 'https://public-api.birdeye.so';
@@ -31,15 +31,18 @@ async function fetchDexScreener(ca) {
     const top = sol.find(p => (p.liquidity?.usd || 0) > 0) || sol[0];
     const lp    = top.liquidity?.usd || 0;
     const vol1h = top.volume?.h1     || 0;
+    const mc    = top.marketCap || 0;
     const dexId = top.dexId || null;
     return {
       pairAddress:   top.pairAddress  || null,
       name:          top.baseToken?.name   || 'UNKNOWN',
       symbol:        top.baseToken?.symbol || '???',
       priceUsd:      parseFloat(top.priceUsd || '0'),
-      marketCap:     top.marketCap || 0,
+      marketCap:     mc,
       lp, volume1h: vol1h,
-      volLiq:        lp > 0 ? vol1h / lp : 0,
+      // Bonding-curve tokens have LP=$0 (no Raydium pool yet).
+      // Use market cap as the denominator so vol/liq is meaningful pre-graduation.
+      volLiq:        lp > 0 ? vol1h / lp : (mc > 0 ? vol1h / mc : 0),
       buyCount:      top.txns?.h1?.buys  || 0,
       sellCount:     top.txns?.h1?.sells || 0,
       uniqueWallets: null,
@@ -329,47 +332,68 @@ async function fetchBundleAndFunding(pairAddress) {
   } catch (e) { console.error('[fetchBundle] error:', e.message); return null; }
 }
 
-// ── PumpPortal token stats ────────────────────────────────────────────────────
+// ── pump.fun token stats (replaces dead PumpPortal REST endpoint) ─────────────
+// GET https://frontend-api.pump.fun/coins/{ca}
+// Returns: name, symbol, creator, complete, raydium_pool, virtual_sol_reserves,
+//          virtual_token_reserves, usd_market_cap, twitter, telegram, website, etc.
+// NOTE: does NOT return holder_count — that comes from Codex/Helius/SolanaTracker.
+
+const PUMPFUN_HEADERS = {
+  'Accept': 'application/json',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+};
 
 async function fetchPumpPortal(ca) {
   try {
-    const res = await fetch(`${PUMPPORTAL_URL}${ca}`, { timeout: 5000 });
+    const res = await fetch(`${PUMPFUN_URL}${ca}`, { headers: PUMPFUN_HEADERS, timeout: 6000 });
     if (!res.ok) { console.log(`[fetchPumpPortal] HTTP ${res.status}`); return null; }
     const data = await res.json();
-    console.log('[fetchPumpPortal] raw:', JSON.stringify(data).slice(0, 500));
+    const migrated = data.complete === true || !!data.raydium_pool;
+    // Approximate bonding-curve progress from virtual reserves.
+    // Pump.fun reserves: initial vToken ≈ 1,073,000,191 × 10^6 raw, graduated at 206,900,000 × 10^6.
+    const curvePct = migrated ? 100 : (() => {
+      const vt = data.virtual_token_reserves;
+      if (!vt) return null;
+      const progress = (1 - (vt - 206_900_000_000_000) / 793_100_000_000_000) * 100;
+      return Math.max(0, Math.min(99, Math.round(progress * 10) / 10));
+    })();
+    console.log(`[fetchPumpPortal] migrated=${migrated} curvePct=${curvePct} mc=$${data.usd_market_cap || data.market_cap || 0}`);
     return {
-      name:           data.name          || 'UNKNOWN',
-      symbol:         data.symbol        || '???',
-      holderCount:    data.holder_count  || null,
-      curvePct:       data.bonding_curve_percentage != null ? data.bonding_curve_percentage : null,
-      migrated:       data.raydium_pool  ? true : (data.vTokensLeftToGraduate === 0),
-      devWallet:      data.creator       || null,
-      marketCap:      data.market_cap    || 0,
+      name:           data.name        || 'UNKNOWN',
+      symbol:         data.symbol      || '???',
+      holderCount:    null,            // not available in pump.fun coin API
+      curvePct,
+      migrated,
+      devWallet:      data.creator     || null,
+      marketCap:      data.usd_market_cap || data.market_cap || 0,
       vSolReserves:   data.virtual_sol_reserves   || 0,
       vTokenReserves: data.virtual_token_reserves || 0,
-      description:    data.description  || '',
-      twitter:        data.twitter      || null,
-      telegram:       data.telegram     || null,
-      website:        data.website      || null,
+      description:    data.description || '',
+      twitter:        data.twitter     || null,
+      telegram:       data.telegram    || null,
+      website:        data.website     || null,
     };
   } catch (e) { console.error('[fetchPumpPortal] error:', e.message); return null; }
 }
 
-// ── PumpPortal dev stats ──────────────────────────────────────────────────────
+// ── pump.fun dev stats (replaces dead PumpPortal user-stats endpoint) ─────────
+// GET https://frontend-api.pump.fun/coins/user-created-coins/{wallet}?offset=0&limit=200
+// Returns array of coin objects; complete=true / raydium_pool!=null = graduated.
 
 async function fetchDevStats(devWallet) {
   if (!devWallet) return null;
   try {
-    const res = await fetch(`${PUMPPORTAL_USER}${devWallet}`, { timeout: 6000 });
+    const res = await fetch(
+      `${PUMPFUN_USER}${devWallet}?offset=0&limit=200`,
+      { headers: PUMPFUN_HEADERS, timeout: 8000 }
+    );
     if (!res.ok) { console.log(`[fetchDevStats] HTTP ${res.status}`); return null; }
     const data = await res.json();
-    const totalLaunches  = data.total_tokens_created ?? data.totalTokensCreated
-                        ?? data.tokens_created       ?? data.tokensCreated
-                        ?? data.total_launches       ?? null;
-    const migratedCount  = data.total_tokens_migrated ?? data.totalTokensMigrated
-                        ?? data.migrations             ?? null;
-    const winRate        = data.win_rate ?? data.winRate ?? null;
-    console.log(`[fetchDevStats] launches=${totalLaunches} migrated=${migratedCount} winRate=${winRate}`);
+    if (!Array.isArray(data)) { console.log('[fetchDevStats] unexpected shape'); return null; }
+    const totalLaunches = data.length;
+    const migratedCount = data.filter(c => c.complete === true || !!c.raydium_pool).length;
+    const winRate       = totalLaunches > 0 ? +(migratedCount / totalLaunches * 100).toFixed(2) : null;
+    console.log(`[fetchDevStats] launches=${totalLaunches} migrated=${migratedCount} winRate=${winRate}%`);
     return { totalLaunches, migratedCount, winRate };
   } catch (e) { console.error('[fetchDevStats] error:', e.message); return null; }
 }
