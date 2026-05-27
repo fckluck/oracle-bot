@@ -184,6 +184,10 @@ function scan(data) {
   // distribution candles. Strict distribution = strict AVOID, no exceptions.
   const momentumStatus = momentumGate(birdeye, adjustedVolLiq);
 
+  // Social data is declared here so it's available to both the kill-shot hierarchy
+  // (Social Necessity gate) and the Social Breakout upgrade block below.
+  const social = data.social ?? null;
+
   // ── Kill-Shot Headline Hierarchy (v8.4) ───────────────────────────────────
   // Priority: Bundle > Momentum > Concentration > Wash > Liquidity > Deployer
   let noGoReason   = null;
@@ -211,6 +215,14 @@ function scan(data) {
       headlineType = 'WASH';
     }
   }
+  // 3b. Social Necessity: >8x adjusted vol with zero social footprint = manufactured volume.
+  // Real retail demand ALWAYS leaves tweets. High vol + silence = bot-wash trap.
+  // Only fires when social data is confirmed available (available=true) to avoid
+  // false-positives from API failures on genuine tokens.
+  else if (adjustedVolLiq > 8 && social?.available === true && (social?.mentions15m ?? 0) < 5) {
+    noGoReason   = `WASH TRADE — ${adjustedVolLiq.toFixed(1)}x vol, <5 social mentions (bot-wash signature)`;
+    headlineType = 'WASH';
+  }
   // 4. Liquidity — for bonding-curve tokens LP=0, use MC as effective liquidity.
   // A token with LP=0 but MC >= LP_MIN_USD has enough curve liquidity to enter.
   else if (lp < config.LP_MIN_USD && !(lp === 0 && mc != null && mc >= config.LP_MIN_USD)) {
@@ -229,6 +241,13 @@ function scan(data) {
     const ctx = deFadeScore !== null ? `DeFade=${deFadeScore}` : 'DeFade unverified';
     noGoReason   = `UNVERIFIED BUNDLE — ${bundleCount}/slot, ${ctx}`;
     headlineType = 'BUNDLE';
+  }
+  // 7b. Zero-Survival Deployer: 10+ launches with ZERO migrations = serial rug artist.
+  // Even if vol looks good, a dev who has never graduated a single token is a hard skip.
+  // Threshold: >10 launches (filters statistical noise — <10 is UNPROVEN, not PROVEN BAD).
+  else if (devLaunches !== null && devLaunches > 10 && migratedCount !== null && migratedCount === 0) {
+    noGoReason   = `RUGGER PROFILE — ${devLaunches} launches, 0 migrations (zero-survival dev)`;
+    headlineType = 'DEPLOYER';
   }
   // 8. Concentration hard cap (v12.0: MC-aware threshold — 35% under $100K, 25% above)
   else if (top10Pct !== null && top10Pct > top10HardMax) {
@@ -332,12 +351,23 @@ function scan(data) {
     verdict = 'SKIP';
   }
 
+  // ── 10-Minute Maturity Gate ────────────────────────────────────────────────
+  // Scammers manufacture 12x "organic-looking" vol + 300 "community-looking"
+  // holders in the first 3-5 minutes specifically to trigger sniper bots.
+  // The wash and holder APIs need time to catch the pattern. Any BUY verdict
+  // at >5x for a token under 10 minutes old is downgraded to WATCH_VOL.
+  // Low-vol tokens (≤5x) are unaffected — they already land on WATCH/SKIP.
+  if (verdict === 'BUY' && ageMins !== null && ageMins < 10 && adjustedVolLiq > 5) {
+    verdict     = 'WATCH_VOL';
+    entryTier   = null;
+    watchReason = `MATURITY PENDING — ${ageMins.toFixed(1)} min old (need ≥10 min). Re-scan after the 10-min mark to confirm vol/liq is still holding.`;
+  }
+
   // ── Social Breakout upgrade (additive, never lowers math floor) ───────────
   // Rules:
   //   1. WATCH_VOL (3x-5x) → BASELINE_ENTRY if social breakout detected
   //   2. Math floor stays locked: SKIP (<3x) cannot be upgraded regardless
   //   3. Hard NO_GO / AVOID / WATCH_WASH kills are never overridden
-  const social = data.social ?? null;
   const socialBreakout = social?.available && social?.isTrending;
   const socialCto      = social?.available && social?.ctoSignal;
 
@@ -355,7 +385,7 @@ function scan(data) {
   // holder health sane, dev not active. Plus an explicit watchReason guard so
   // momentum/wash-cap WATCH states cannot be promoted regardless.
   const watchIsRecoverable = watchReason !== null &&
-    !/momentum fail|safety failed|wash volume/i.test(watchReason);
+    !/momentum fail|safety failed|wash volume|maturity pending/i.test(watchReason);
   if (verdict === 'WATCH_VOL' && socialBreakout && highTierSafe && watchIsRecoverable) {
     verdict       = 'BUY';
     entryTier     = 'BASELINE_ENTRY';
@@ -405,6 +435,10 @@ function scan(data) {
     // (8x-12x) doesn't check highTierSafe, so a sybil bundle with low wash
     // and low top10 could slip through to BUY. Catch it here as a last resort.
     else if (sybilFunded)                                    invariantFail = `INVARIANT: sybil-funded wallet detected`;
+    // Maturity gate: belt-and-suspenders — the gate above runs before social
+    // upgrade, but if any future path re-introduces BUY for a <10m token, catch it.
+    else if (ageMins !== null && ageMins < 10 && adjustedVolLiq > 5)
+                                                             invariantFail = `INVARIANT: maturity pending (age ${ageMins.toFixed(1)} min < 10m)`;
     if (invariantFail) {
       console.error(`[scanner] ${invariantFail} — forcing BUY → WATCH_VOL (bug in upstream verdict logic)`);
       verdict       = 'WATCH_VOL';

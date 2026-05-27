@@ -7,7 +7,7 @@ const config = {
   PUMPPORTAL_API_KEY:  process.env.PUMPPORTAL_API_KEY  || '',
   SESSION_SIZE_SOL: parseFloat(process.env.SESSION_SIZE_SOL || '0.15'),
 
-  LP_MIN_USD:          parseFloat(process.env.LP_MIN_USD          || '10000'),
+  LP_MIN_USD:          parseFloat(process.env.LP_MIN_USD          || '15000'),
   AGE_MAX_MIN:         parseFloat(process.env.AGE_MAX_MIN         || '60'),
   VOL_LIQ_RATIO_MIN:  parseFloat(process.env.VOL_LIQ_RATIO_MIN   || '5.0'),
   TOP10_MAX_PCT:       parseFloat(process.env.TOP10_MAX_PCT        || '25'),  // v10.2.8: Goldilocks zone — 25% catches early accumulators, still blocks 30-40% dev rugs
