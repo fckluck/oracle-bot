@@ -71,11 +71,21 @@ function getTpTargets(entryTier, timeWindow) {
 function momentumDisplay(momentumStatus, birdeye) {
   const range5m = birdeye?.priceChange5m != null ? ` | 5m: ${fmtChange(birdeye.priceChange5m)}` : '';
   const rangePctDisp = birdeye?.rangePct != null ? `${(birdeye.rangePct * 100).toFixed(0)}%` : 'N/A';
+  // Velocity suffix: how much of the last hour's volume landed in the most recent 5m candle.
+  // ≥25% = accelerating (2× the average 5m slice absorbed in one candle).
+  // ≥10% = normal flow. <10% = fading interest.
+  let velSuffix = '';
+  if (birdeye?.volAccel != null) {
+    const pct = birdeye.volAccel * 100;
+    if      (pct >= 25) velSuffix = ` | 🔥 ${pct.toFixed(0)}% vel`;
+    else if (pct >= 10) velSuffix = ` | ⚡ ${pct.toFixed(0)}% vel`;
+    else                velSuffix = ` | 💤 ${pct.toFixed(0)}% vel`;
+  }
   switch (momentumStatus) {
-    case 'VOLUMETRIC_DISTRIBUTION': return `🔴 DISTRIBUTION${range5m} — high vol, falling price`;
-    case 'HEALTHY_DIP':             return `♻️ RECYCLE OPPORTUNITY${range5m} — dip with buy-side dominance`;
-    case 'TOP_QUARTER':             return `🟢 BREAKOUT (${rangePctDisp} of 1H range)${range5m}`;
-    case 'LOWER_RANGE':             return `🟡 STALLED (${rangePctDisp} of 1H range)${range5m}`;
+    case 'VOLUMETRIC_DISTRIBUTION': return `🔴 DISTRIBUTION${range5m}${velSuffix} — high vol, falling price`;
+    case 'HEALTHY_DIP':             return `♻️ RECYCLE OPPORTUNITY${range5m}${velSuffix} — dip with buy-side dominance`;
+    case 'TOP_QUARTER':             return `🟢 BREAKOUT (${rangePctDisp} of 1H range)${range5m}${velSuffix}`;
+    case 'LOWER_RANGE':             return `🟡 STALLED (${rangePctDisp} of 1H range)${range5m}${velSuffix}`;
     default:                        return 'N/A (Birdeye candles unavailable)';
   }
 }

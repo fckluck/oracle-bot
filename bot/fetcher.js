@@ -223,8 +223,16 @@ async function fetchBirdeye(ca) {
     const low1h   = Math.min(...candles.map(c => c.l));
     const rangePct = (high1h > low1h) ? (last.c - low1h) / (high1h - low1h) : null;
 
-    console.log(`[fetchBirdeye] candles=${candles.length} 5mChange=${priceChange5m?.toFixed(2)}% range=${(rangePct != null ? (rangePct*100).toFixed(0) : 'N/A')}%`);
-    return { priceChange5m, high1h, low1h, rangePct, currentClose: last.c };
+    // Velocity: most-recent 5m candle's volume as a share of the last 60 min total.
+    // >25% means the last 5 minutes absorbed more than 2× the average 5m slice —
+    // a genuine acceleration signal. Birdeye OHLCV returns `v` per candle (USD vol).
+    const last12    = candles.slice(-12); // last 60 min = 12 × 5m candles
+    const vol1hTot  = last12.reduce((s, c) => s + (c.v ?? 0), 0);
+    const vol5mLast = last.v ?? 0;
+    const volAccel  = vol1hTot > 0 ? (vol5mLast / vol1hTot) : null; // 0–1 fraction
+
+    console.log(`[fetchBirdeye] candles=${candles.length} 5mChange=${priceChange5m?.toFixed(2)}% range=${(rangePct != null ? (rangePct*100).toFixed(0) : 'N/A')}% velocity=${volAccel != null ? (volAccel*100).toFixed(0)+'%' : 'N/A'}`);
+    return { priceChange5m, high1h, low1h, rangePct, currentClose: last.c, volAccel };
   } catch (e) { console.error('[fetchBirdeye] error:', e.message); return null; }
 }
 
