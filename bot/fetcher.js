@@ -624,8 +624,11 @@ async function fetchDeFadeVerification(ca, oracleSignals = {}) {
     action = 'HARD_SKIP'; reason = `Rug score ${score}/100 ≥ 80`;
   } else if (isFinite(bundlesCount) && bundlesCount >= 3) {
     action = 'HARD_SKIP'; reason = `Bundle manipulation confirmed (${bundlesCount} bundles)`;
-  } else if (isFinite(top10Pct) && top10Pct >= 15) {
-    action = 'HARD_SKIP'; reason = `Holder concentration top10 ${top10Pct}% ≥ 15%`;
+  } else if (isFinite(top10Pct) && top10Pct >= 35) {
+    // Threshold aligned with scanner's minimum cap (35% for sub-$100K, 25% for $100K+).
+    // The old 15% threshold hard-killed every early-stage token the scanner had already
+    // approved — early launches routinely show 20-30% top10 concentration.
+    action = 'HARD_SKIP'; reason = `Holder concentration top10 ${top10Pct}% ≥ 35%`;
   } else if (
     isFinite(dfLiquidityUsd) && oracleSignals.lp > 0 &&
     Math.abs(dfLiquidityUsd - oracleSignals.lp) / oracleSignals.lp > 0.5
@@ -746,11 +749,15 @@ async function fetchAll(ca, opts = {}) {
     }
   }
 
-  // Phase 1b: paid enrichment — only reached when vol/liq clears the floor
-  const [birdeye, stToken] = await Promise.all([
+  // Phase 1b: paid enrichment — only reached when vol/liq clears the floor.
+  // fetchBirdeyeOverview is always fetched here (not deferred into the holder
+  // closure) so wash signals are available regardless of which holder source wins.
+  const [birdeye, stToken, beOverview] = await Promise.all([
     fetchBirdeye(ca),
     fetchSolanaTrackerToken(ca),
+    fetchBirdeyeOverview(ca),
   ]);
+  const beOverviewResult = beOverview; // always available for wash computation
 
   // Build primary market data object
   const isMigrated = pump?.migrated === true;
@@ -762,10 +769,15 @@ async function fetchAll(ca, opts = {}) {
     } else if (pump) {
       const vSol   = (pump.vSolReserves   || 0) / 1e9;
       const vToken = (pump.vTokenReserves || 0) / 1e6;
+      // Bug 5 fix: lp MUST be 0 (not vSol) for pre-migration bonding-curve tokens.
+      // vSol is in SOL units (~30 SOL ≈ $4.5K); the scanner compares lp to
+      // LP_MIN_USD ($10,000 USD) so 30 < 10000 falsely triggered Low Liquidity.
+      // With lp=0 the scanner's MC-proxy path (liquidityProxy = mc when lp=0)
+      // handles liquidity gating correctly via LP gate bypass for MC >= LP_MIN_USD.
       codex = {
         pairAddress: null, name: pump.name, symbol: pump.symbol,
         priceUsd: vToken > 0 ? vSol / vToken : 0, marketCap: pump.marketCap || 0,
-        lp: vSol, volume1h: 0, volLiq: 0, buyCount: null, sellCount: null,
+        lp: 0, volume1h: 0, volLiq: 0, buyCount: null, sellCount: null,
         uniqueWallets: null, change1h: null, ageMinutes: null,
       };
       console.log('[fetchAll] path: pre-migration, PumpPortal reserves');
@@ -791,7 +803,10 @@ async function fetchAll(ca, opts = {}) {
 
   // NOTE: DeFade is no longer in this parallel block — it's called post-scan
   // as a verification step only on BUY candidates (see verifyWithDeFade).
-  let beOverviewResult = null; // hoisted so fetchAll can include wash signals in return
+  //
+  // beOverviewResult is already assigned from Phase 1b above — always populated
+  // regardless of which holder source wins (Bug 6 fix: Birdeye wash signals were
+  // previously skipped whenever Codex or SolanaTracker holder data succeeded).
   const [holders, bundle, devStats, devPeak, walletAge, stDeployer] = await Promise.all([
     (async () => {
       // Holder source precedence (richest → cheapest):
@@ -808,12 +823,8 @@ async function fetchAll(ca, opts = {}) {
       const stHolders = await fetchSolanaTrackerHolders(ca);
       if (stHolders) { console.log(`[fetchAll] holders: SolanaTracker — count=${stHolders.holderCount} top10=${stHolders.top10Pct?.toFixed(1)}%`); return stHolders; }
 
-      // Helius (top10) + Birdeye/PumpPortal (full count + wash signals) in parallel
-      const [helius, beOverview] = await Promise.all([
-        fetchHeliusHolders(ca),
-        fetchBirdeyeOverview(ca),
-      ]);
-      beOverviewResult = beOverview; // hoist for wash signals
+      // Helius (top10) — beOverview already fetched in Phase 1b (in scope via closure)
+      const helius = await fetchHeliusHolders(ca);
 
       if (helius) {
         // Prefer Birdeye full count over PumpPortal; both override Helius's top-20 floor
@@ -954,7 +965,11 @@ async function fetchForensic(ca) {
 
   const lp             = dex.lp || 0;
   const vol1h          = dex.volume1h || 0;
-  const adjustedVolLiq = lp > 0 ? vol1h / lp : 0;
+  // Bug 10 fix: use MC as proxy when LP=0 (bonding-curve tokens), consistent with
+  // scanner.js. The old code returned 0 for LP=0 tokens, making Guardian unable to
+  // monitor any pre-graduation token that was originally scanned as a Hunt candidate.
+  const mcProxy        = lp > 0 ? lp : (dex.marketCap || 0);
+  const adjustedVolLiq = mcProxy > 0 ? vol1h / mcProxy : 0;
 
   return {
     marketCap:      dex.marketCap || 0,

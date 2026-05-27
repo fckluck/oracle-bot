@@ -1,8 +1,8 @@
-// ── Oracle v10.2.6 Predator Hunt Mode ────────────────────────────────────────
+// ── Oracle v14.0 Predator Hunt Mode ─────────────────────────────────────────
 // Persistent WebSocket to wss://pumpportal.fun/api/data. Subscribes to
 // new-token + migration events. Each event triggers a full Oracle scan in
-// a concurrency-limited queue. Verdicts with Vol/Liq ≥ 5x are broadcast to
-// every chat that has opted in via /hunt. Below that, the bot stays silent.
+// a concurrency-limited queue. Verdicts with Adj Vol/Liq ≥ MIN_VOLLIQ_BROADCAST
+// (default 3x) are broadcast to every chat that has opted in via /hunt.
 //
 // v10.2.3: DexScreener fallback poller arms automatically when PumpPortal WS
 // is stale or disconnected. Robust message normalization handles payload-shape
@@ -12,6 +12,9 @@
 // disconnected, ensuring the bot never stays dark. WS handshake timeout and
 // User-Agent header added. hardReconnect() consolidates all reconnect paths.
 // pollDexFallback() accepts { force } to bypass stale-check on demand.
+//
+// v14.0: bonding-curve pipeline (LP=0 MC proxy, pump.fun API), Grok reasoning,
+// HTML escape on symbol header, age gate on Dex-fallback stale candidates.
 
 const fs    = require('fs');
 const path  = require('path');
@@ -208,6 +211,17 @@ async function runScan(job, broadcaster) {
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
     if (adjustedVolLiq < MIN_VOLLIQ_BROADCAST) { stats.skipped++; return; }
 
+    // Age gate for Dex-fallback candidates: DexScreener token-profiles and
+    // community-takeovers endpoints return tokens of ANY age — a CTO posted today
+    // on a 6-month-old token should not fire as a "new launch." WS events from
+    // PumpPortal are always fresh so we only enforce this on fallback sources.
+    const ageMinutes = data.codex?.ageMinutes ?? null;
+    const AGE_MAX_FALLBACK = (config.AGE_MAX_MIN || 60) * 3; // 3h for profile/CTO
+    if (source?.startsWith('dexscreener') && ageMinutes !== null && ageMinutes > AGE_MAX_FALLBACK) {
+      console.log(`[hunt] ${ca} age-gated: ${ageMinutes}m > ${AGE_MAX_FALLBACK}m (${source})`);
+      stats.skipped++; return;
+    }
+
     // Grok soul reasoning — non-blocking; skips silently if XAI_API_KEY absent.
     result.soulReasoning = await getSoulReasoning({
       ticker:        data.codex?.symbol || data.pump?.symbol,
@@ -232,7 +246,9 @@ async function runScan(job, broadcaster) {
 
     const message = formatVerdict(result, ca);
     const mc     = result.signals?.marketCap || 0;
-    const symbol = data.codex?.symbol || data.pump?.symbol || '???';
+    const rawSym = data.codex?.symbol || data.pump?.symbol || '???';
+    // Escape HTML — token symbols can contain <, >, & which break Telegram HTML parse mode.
+    const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>\n` +
                    `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>\n` +
                    `Source: <code>${source}</code>\n\n`;

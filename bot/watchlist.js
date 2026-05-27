@@ -7,7 +7,15 @@ const fs   = require('fs');
 const path = require('path');
 const { fetchForensic } = require('./fetcher');
 
-const PERSIST_FILE  = path.join(__dirname, 'watchlist.json');
+// Prefer /data (Railway persistent volume) over local file — same pattern as hunters.json.
+// Falls back to the local bot/ directory when /data is not writable (dev/Replit).
+function resolveWatchlistFile() {
+  if (process.env.WATCHLIST_FILE) return process.env.WATCHLIST_FILE;
+  try { fs.accessSync('/data', fs.constants.W_OK); return '/data/watchlist.json'; } catch (_) {}
+  return path.join(__dirname, 'watchlist.json');
+}
+const PERSIST_FILE = resolveWatchlistFile();
+console.log(`[watchlist] persist file: ${PERSIST_FILE}`);
 const POLL_INTERVAL = 60 * 1000;
 const MAX_AGE_MS    = 6 * 60 * 60 * 1000; // auto-expire after 6 hours
 const VOL_LIQ_MIN   = 5.0;

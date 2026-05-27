@@ -139,7 +139,7 @@ function formatVerdict(result, ca) {
   const soulReasoning = result.soulReasoning ?? null;
   if (soulReasoning) {
     L.push(`🧠 ${b('ORACLE\'S SOUL')}`);
-    L.push(i(esc(soulReasoning)));
+    L.push(i(soulReasoning));  // i() already calls esc() internally — don't double-escape
     L.push('─────────────────────────────');
   }
 

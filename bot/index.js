@@ -69,7 +69,7 @@ const HELP_MENU =
   `• /help — Show this command menu\n` +
   `• /status — API + Guardian health snapshot\n\n` +
   `<b>── HUNT MODE (Automated) ──</b>\n` +
-  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts on 5x+ Adjusted Vol/Liq launches\n` +
+  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts on 3x+ Adjusted Vol/Liq launches\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
