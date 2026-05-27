@@ -8,6 +8,7 @@ const tracker   = require('./tracker');
 const hunt      = require('./hunt');
 const watchlist = require('./watchlist');
 const config    = require('./config');
+const { probeXaiConnection } = require('./reasoning');
 
 // ── Railway health check ───────────────────────────────────────────────────────
 // Railway treats every service as a web service and kills the process if it
@@ -564,6 +565,10 @@ catch (e) { console.error('[startup] hunt.start error:', e?.stack || e.message);
 
 try { watchlist.start(bot); }
 catch (e) { console.error('[startup] watchlist.start error:', e?.stack || e.message); }
+
+// Non-blocking xAI connectivity check — result appears in Railway logs within ~5s.
+// Look for "[reasoning] PROBE OK" or "[reasoning] PROBE FAILED" to diagnose Grok issues.
+probeXaiConnection().catch(() => {});
 
 console.log('[startup] subsystems started — launching Telegram polling...');
 
