@@ -368,13 +368,13 @@ function formatVerdict(result, ca) {
   L.push(`• ${b('Curve:')} ${curveDisplay}`);
   L.push('');
 
-  // ── GROK NARRATIVE (SocialData — always shown when available) ─────────────
+  // ── SOCIAL INTELLIGENCE (SocialData — always shown when available) ──────────
   const social = result.social ?? null;
   if (social?.available) {
     const trendIcon    = social.isTrending ? '🔥' : '🟡';
     const trendLabel   = social.isTrending ? 'SOCIAL BREAKOUT' : 'NEUTRAL';
     const velocityNote = social.isTrending ? ' ↗ Trending' : '';
-    L.push(b('── GROK NARRATIVE ──'));
+    L.push(b('── SOCIAL INTELLIGENCE ──'));
     L.push(`• ${b('Social Velocity:')} ${trendIcon} ${social.mentions15m} mentions / 15m${velocityNote} | ${social.uniqueAccounts} unique accounts`);
     if (socialCto) {
       L.push(`• ${b('CTO Signal:')} ✅ SOCIAL VERIFIED (${social.ctoSignal ? '3+' : '0'} accounts calling takeover)`);
