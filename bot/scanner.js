@@ -274,12 +274,19 @@ function scan(data) {
     // Bonding-curve tokens (LP=0): pump.fun coin API never exposes holder count,
     // so holder data is structurally unavailable — not an API failure. Extend the
     // RISKY_RUNNER exception to sub-$100K at the standard BUY floor (5x adjusted).
-    // Post-graduation (LP>0): keep original nano-cap (<$40K) at 8x (API-failure only).
-    // LP=0 threshold is 4x adjusted (= 5x raw before the 20% unverified-wash floor).
-    // That equals the BASELINE_ENTRY raw-vol floor, so only genuinely active tokens pass.
+    // LP=0: pump.fun API never exposes holder count — structural, not API failure.
+    //   → sub-$100K at 4x adjusted (all devs).
+    // LP>0 (graduated): holder count missing = API lag.
+    //   → Elite dev (>10% success, >15 launches): sub-$100K at 8x (same as LP=0 cap).
+    //     $ชั้ง autopsy: $58K MC + 9x vol + elite dev → was hard NO-GO because LP>0
+    //     cap was $40K. Raising to $100K for proven devs captures these plays as
+    //     RISKY_RUNNER (half-size, exit by TP1) instead of silencing them entirely.
+    //   → Unknown dev: keep $40K (API failure at sub-$40K nano-cap only).
+    const riskyRunnerLpCap = lp === 0 ? 100_000
+      : isEliteDev ? 100_000
+      : 40_000;
     const riskyRunnerCandidate = !isBotted && mc != null && (
-      lp === 0 ? (mc < 100_000 && adjustedVolLiq >= 4)
-               : (mc < 40_000  && adjustedVolLiq >= 8)
+      mc < riskyRunnerLpCap && adjustedVolLiq >= (lp === 0 ? 4 : 8)
     );
     if (riskyRunnerCandidate) {
       // Fall through to verdict ladder; demoted to RISKY_RUNNER below.
@@ -317,7 +324,17 @@ function scan(data) {
   if (noGoReason) {
     verdict = 'NO_GO';
   } else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION') {
-    verdict      = 'AVOID';
+    // Elite devs: a -5% to -20% 5m candle during high organic vol is a
+    // buy-the-dip, not a dump. $ชั้ง autopsy: -16.96% 5m dip at 9x organic vol
+    // + elite dev = optimal entry. Hard AVOID silenced the hunt alert entirely.
+    // Soften to WATCH_VOL so the alert still fires and the user decides.
+    // Unknown devs keep strict AVOID — no proven track record to justify leniency.
+    if (isEliteDev) {
+      verdict     = 'WATCH_VOL';
+      watchReason = `ELITE DIP — ${birdeye?.priceChange5m != null ? Math.abs(birdeye.priceChange5m).toFixed(1) + '%' : 'unknown'} 5m drop on ${adjustedVolLiq.toFixed(1)}x organic vol. Elite dev (${successRatePct?.toFixed(1) ?? '?'}% success rate) — dip may be snipers exiting, not dev dump. Confirm LP holding before entry.`;
+    } else {
+      verdict = 'AVOID';
+    }
     headlineType = 'MOMENTUM';
   } else if (momentumStatus === 'LOWER_RANGE') {
     // v10.2.7: range <0.75 = momentum fail. Cannot become BUY at any vol tier.
@@ -418,9 +435,10 @@ function scan(data) {
   //   LP>0 (graduated): nano-cap (<$40K) + adjustedVolLiq ≥ 8x — API failure only.
   // Bundle, wash, concentration, and liquidity gates above still applied.
   // Position halved vs normal BUY; user must exit by TP1.
+  // Elite dev LP>0 cap matches LP=0 ($100K) — same reasoning as riskyRunnerCandidate.
   const riskyRunnerTrip = holderCount === null && mc != null && (
     (lp === 0 && mc < 100_000 && adjustedVolLiq >= 4) ||
-    (lp > 0  && mc < 40_000  && adjustedVolLiq >= 8)
+    (lp > 0  && (isEliteDev ? mc < 100_000 : mc < 40_000) && adjustedVolLiq >= 8)
   );
   if (verdict === 'BUY' && riskyRunnerTrip) {
     verdict           = 'RISKY_RUNNER';
