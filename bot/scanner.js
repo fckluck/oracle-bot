@@ -40,14 +40,13 @@ function getPositionUnits(entryTier, lp, mc) {
 function momentumGate(birdeye, volLiq) {
   if (!birdeye) return null;
   const { priceChange5m, rangePct } = birdeye;
-  // v10.2.7 STRICT: ANY negative 5m candle with significant volume = distribution.
-  // The old -10% threshold let obvious dumps through as HIGH_CONVICTION.
-  if (priceChange5m !== null && priceChange5m < 0 && volLiq >= 8) {
+  // v12.0 calibration: -5% threshold replaces "any negative". A 2-4% profit-taking
+  // dip on a high-vol token is normal market action, not distribution. Sustained
+  // selling (-5%+) at significant volume is the real DISTRIBUTION signal.
+  if (priceChange5m !== null && priceChange5m < -5 && volLiq >= 8) {
     return 'VOLUMETRIC_DISTRIBUTION';
   }
   if (rangePct !== null) {
-    // v10.2.7: tightened 0.60 → 0.75 — must be in top 25% of 1H range to qualify
-    // for any BUY tier. LOWER_RANGE is caught explicitly in the verdict ladder.
     return rangePct >= 0.75 ? 'TOP_QUARTER' : 'LOWER_RANGE';
   }
   return null;
@@ -135,6 +134,12 @@ function scan(data) {
   const top10Pct        = holders?.top10Pct        ?? null;
   const holderSource    = holders?.source          ?? null;
 
+  // v12.0: dynamic top10 cap — early-stage tokens (< $100K MC) have naturally
+  // concentrated holders that distribute as price rises. 35% cap allows real
+  // launches through; still blocks obvious dev-wallet rugs at 40-50% top10.
+  // Above $100K MC the stricter 25% applies (established token, no excuse).
+  const top10HardMax = (mc != null && mc < 100_000) ? 35 : 25;
+
   const ctoDesc        = detectCtoFromDesc(pump);
   const ctoBehavior    = ctoStatus(pump, walletAge, top10Pct);
   const holderHealthData = holderHealth(holderCount, mc);
@@ -216,27 +221,34 @@ function scan(data) {
     noGoReason   = `UNVERIFIED BUNDLE — ${bundleCount}/slot, ${ctx}`;
     headlineType = 'BUNDLE';
   }
-  // 8. Concentration hard cap
-  else if (top10Pct !== null && top10Pct > config.TOP10_HARD_MAX_PCT) {
-    noGoReason   = `CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% > ${config.TOP10_HARD_MAX_PCT}%`;
+  // 8. Concentration hard cap (v12.0: MC-aware threshold — 35% under $100K, 25% above)
+  else if (top10Pct !== null && top10Pct > top10HardMax) {
+    noGoReason   = `CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% > ${top10HardMax}%`;
     headlineType = 'CONCENTRATION';
   }
-  // 9. v10.2 Botted Wallets HARD-STOP — extreme inflation at low MC is
-  //     unrecoverable. NO RISKY_RUNNER override allowed for this pattern.
-  //     v10.2.2 fail-safe: when holder health is UNAVAILABLE at low MC, the
-  //     gate also trips — we cannot certify a sub-$100K launch without it.
+  // 9. Botted/missing holders at sub-$100K MC.
+  //    v12.0 exception: if MC < $40K AND adjusted vol/liq ≥ 8x AND data is merely
+  //    unavailable (not proven botted at >250%), fall through to RISKY_RUNNER.
+  //    Bundle, wash, and concentration gates above this still apply.
   else if (
     mc != null && mc < 100000 && (
       (holderHealthData?.healthPct != null && holderHealthData.healthPct > 250) ||
       holderHealthData?.healthPct == null
     )
   ) {
-    if (holderHealthData?.healthPct == null) {
-      noGoReason = `HOLDER DATA UNAVAILABLE — Cannot certify wallet quality at $${(mc/1000).toFixed(0)}K MC (gate 9 fail-safe)`;
+    const isBotted   = holderHealthData?.healthPct != null && holderHealthData.healthPct > 250;
+    const isNanoCap  = mc < 40_000;
+    const isHighVol  = adjustedVolLiq >= 8;
+    if (!isBotted && isNanoCap && isHighVol) {
+      // Nano-cap + high organic vol + API failure (not proven botted) →
+      // fall through to verdict ladder, demoted to RISKY_RUNNER below.
+    } else if (isBotted) {
+      noGoReason   = `BOTTED WALLETS — Holder Health ${holderHealthData.healthPct}% at $${(mc/1000).toFixed(0)}K MC (>250% threshold)`;
+      headlineType = 'INFLATED';
     } else {
-      noGoReason = `BOTTED WALLETS — Holder Health ${holderHealthData.healthPct}% at $${(mc/1000).toFixed(0)}K MC (>250% threshold under $100K)`;
+      noGoReason   = `HOLDER DATA UNAVAILABLE — Cannot certify wallet quality at $${(mc/1000).toFixed(0)}K MC`;
+      headlineType = 'INFLATED';
     }
-    headlineType = 'INFLATED';
   }
 
   // ── Verdict ladder (v10.2.7 — Spine Lock) ─────────────────────────────────
@@ -246,11 +258,11 @@ function scan(data) {
   let entryTier = null, verdict, watchReason = null;
 
   // Shared safety predicate for the high tiers (SCRIBBLI / PLUTO).
-  // ALL of: momentum in top 25%, top10 < 25%, wash < 20%, bundle/parent clean,
-  // holder health sane (50-200% or unknown), dev not active.
+  // ALL of: momentum in top 25%, top10 < cap (MC-aware), wash < 20%,
+  // bundle/parent clean, holder health sane, dev not active.
   const highTierSafe = (
     momentumStatus === 'TOP_QUARTER' &&
-    (top10Pct === null || top10Pct < 25) && // v10.2.8: 15→25 Goldilocks calibration
+    (top10Pct === null || top10Pct < top10HardMax) && // v12.0: MC-aware cap (35% sub-$100K)
     (washPct === null || washPct < 20) &&
     bundleCount <= 7 &&
     !sybilFunded &&
@@ -335,20 +347,24 @@ function scan(data) {
     socialUpgrade = true;
   }
 
-  // ── RISKY RUNNER (v10.2.7: temporarily disabled) ──────────────────────────
-  // The Grok social+pro-pilot override and the INFLATED→RISKY_RUNNER demotion
-  // both produced false signals on obvious rugs in v10.2.6. Disabled until the
-  // base scanner is reliable; inflated holders now go to NO_GO instead.
   let riskyRunnerReason = null;
 
-  // INFLATED/BOTTED demotion: at any MC, synthetic holder count means the
-  // BUY conviction is unearned. v10.2.6 demoted to RISKY_RUNNER; v10.2.7 → NO_GO.
-  // (Gate 9 in the NO_GO ladder already covers MC<$100K; this catches MC>=$100K.)
+  // INFLATED/BOTTED demotion: synthetic holder count means conviction is unearned.
   if (verdict === 'BUY' && holderHealthData?.label === 'INFLATED/BOTTED') {
     verdict      = 'NO_GO';
     noGoReason   = `INFLATED HOLDERS — Health ${holderHealthData.healthPct}% (>200%) — bot wallets suspected.`;
     headlineType = 'INFLATED';
     entryTier    = null;
+  }
+
+  // v12.0 RISKY RUNNER: nano-cap (< $40K) + high adjusted vol/liq (≥ 8x) +
+  // holder data unavailable due to API failure (not proven botted).
+  // Bundle, wash, concentration, and liquidity gates above still applied.
+  // Position halved vs normal BUY; user must exit by TP1.
+  if (verdict === 'BUY' && holderCount === null && mc != null && mc < 40_000 && adjustedVolLiq >= 8) {
+    verdict           = 'RISKY_RUNNER';
+    riskyRunnerReason = 'DATA_PENDING_HIGH_VOL';
+    entryTier         = null;
   }
 
   // ── v10.2.7 invariant fuse (last line of defense) ─────────────────────────
@@ -357,7 +373,7 @@ function scan(data) {
   // verdict back to WATCH_VOL. Treat any trip here as a bug.
   if (verdict === 'BUY') {
     let invariantFail = null;
-    if (top10Pct !== null && top10Pct > 25)                  invariantFail = `INVARIANT: top10 ${top10Pct.toFixed(1)}% > 25`;
+    if (top10Pct !== null && top10Pct > top10HardMax)        invariantFail = `INVARIANT: top10 ${top10Pct.toFixed(1)}% > ${top10HardMax}`;
     else if (momentumStatus === 'LOWER_RANGE')               invariantFail = `INVARIANT: momentum LOWER_RANGE`;
     else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION')   invariantFail = `INVARIANT: momentum VOLUMETRIC_DISTRIBUTION`;
     else if (washPct !== null && washPct > 30)               invariantFail = `INVARIANT: wash ${washPct.toFixed(0)}% > 30`;

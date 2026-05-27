@@ -168,7 +168,10 @@ function formatVerdict(result, ca) {
     L.push(`${esc(watchReason)}`);
   } else if (verdict === 'RISKY_RUNNER') {
     L.push(`🟡 ${b('ORACLE VERDICT: RISKY RUNNER')}`);
-    if (signals.riskyRunnerReason === 'INFLATED_HOLDERS') {
+    if (signals.riskyRunnerReason === 'DATA_PENDING_HIGH_VOL') {
+      L.push(`Nano-cap entry — holder distribution unverified at ${fmtUsd(signals.marketCap)} MC. Organic Vol/Liq: ${b(signals.adjustedVolLiq.toFixed(1) + 'x')} (wash-corrected).`);
+      L.push(`⚠️ ${i('API data incomplete. 0.5x size ONLY. Hard exit at TP1. Bundle and wash gates passed.')}`);
+    } else if (signals.riskyRunnerReason === 'INFLATED_HOLDERS') {
       const hp = signals.holderHealth?.healthPct;
       L.push(`Holder count ${hp != null ? hp + '% of target' : 'inflated'} at ${fmtUsd(signals.marketCap)} MC — botted wallets suspected.`);
       L.push(`⚠️ ${i('Conviction demoted. 0.5x size only. Watch for organic holder growth.')}`);
@@ -330,11 +333,12 @@ function formatVerdict(result, ca) {
     holderDisplay = 'UNVERIFIED';
   }
 
-  // v10.2.8: gate raised to 25% (Goldilocks). Display matches scanner truth.
+  // v12.0: MC-aware top10 threshold — 35% for sub-$100K, 25% above.
+  const top10Threshold = (mc != null && mc < 100_000) ? 35 : 25;
   const top10Display = signals.top10Pct !== null
     ? `${fmtPct(signals.top10Pct)} (${esc(
-        signals.top10Pct <= 15                  ? 'CLEAN'              :
-        signals.top10Pct <= 25                  ? 'ELEVATED'           : 'FAIL'
+        signals.top10Pct <= 15               ? 'CLEAN'    :
+        signals.top10Pct <= top10Threshold   ? 'ELEVATED' : 'FAIL'
       )})`
     : `UNVERIFIED`;
 
