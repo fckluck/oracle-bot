@@ -209,7 +209,11 @@ async function runScan(job, broadcaster) {
 
     const result = scan(data);
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
-    if (adjustedVolLiq < MIN_VOLLIQ_BROADCAST) { stats.skipped++; return; }
+    // Pro/Elite dev floor: 2.0x — see proven devs before they move, not after.
+    // Standard floor (MIN_VOLLIQ_BROADCAST = 3.0x) applies to everyone else.
+    const isPilotDev     = result.signals?.isEliteDev || result.signals?.isProPilot;
+    const broadcastFloor = isPilotDev ? 2.0 : MIN_VOLLIQ_BROADCAST;
+    if (adjustedVolLiq < broadcastFloor) { stats.skipped++; return; }
 
     // Age gate for Dex-fallback candidates: DexScreener token-profiles and
     // community-takeovers endpoints return tokens of ANY age — a CTO posted today

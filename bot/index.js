@@ -8,7 +8,7 @@ const tracker   = require('./tracker');
 const hunt      = require('./hunt');
 const watchlist = require('./watchlist');
 const config    = require('./config');
-const { probeXaiConnection } = require('./reasoning');
+const { probeXaiConnection, getSoulReasoning } = require('./reasoning');
 
 // ── Railway health check ───────────────────────────────────────────────────────
 // Railway treats every service as a web service and kills the process if it
@@ -392,18 +392,34 @@ bot.on('text', async ctx => {
 
     const result  = scan(data);
 
-    // Attach social data to result so verdict formatter can render GROK NARRATIVE
+    // Attach social data to result so verdict formatter can render social signals
     result.social = social;
 
-    // Post-scan DeFade verification — only on BUY candidates (free-plan quota).
-    if (result.verdict === 'BUY') {
-      const v = await fetchDeFadeVerification(ca, { lp: result.signals?.lp });
-      result.deFadeVerification = v;
-      if (v.action === 'HARD_SKIP') {
-        result.verdict = 'NO_GO';
-        result.entryTier = null;
-        result.noGoReason = `DeFade verification: ${v.reason}`;
-      }
+    // Run DeFade verification and Grok soul reasoning in parallel.
+    // DeFade only fires on BUY candidates (free-plan quota guard).
+    // Grok fires on everything so the user always gets a narrative, even on NO-GO.
+    // Grok receives the pre-DeFade verdict — correct in >95% of cases; the rare
+    // DeFade flip (BUY→NO_GO) will still show honest Grok reasoning for the BUY case.
+    const [deFade] = await Promise.all([
+      result.verdict === 'BUY'
+        ? fetchDeFadeVerification(ca, { lp: result.signals?.lp })
+        : Promise.resolve(null),
+      getSoulReasoning({
+        ticker:         data.codex?.symbol || data.pump?.symbol,
+        socialMentions: social?.mentions15m,
+        adjustedVolLiq: result.signals?.adjustedVolLiq,
+        top10Pct:       result.signals?.top10Pct,
+        successRatePct: result.signals?.successRatePct,
+        marketCap:      result.signals?.marketCap,
+        verdict:        result.verdict,
+        isEliteDev:     result.signals?.isEliteDev,
+      }).then(soul => { result.soulReasoning = soul; }),
+    ]);
+    result.deFadeVerification = deFade;
+    if (deFade?.action === 'HARD_SKIP') {
+      result.verdict    = 'NO_GO';
+      result.entryTier  = null;
+      result.noGoReason = `DeFade verification: ${deFade.reason}`;
     }
 
     const message = formatVerdict(result, ca);

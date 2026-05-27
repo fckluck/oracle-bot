@@ -323,14 +323,16 @@ function formatVerdict(result, ca) {
     const healthPct = Math.round((effectiveCount / target) * 100);
     let label, icon;
     if (isFloor) {
-      if (healthPct >= 200)      { label = 'OVERDISTRIBUTED / BOT-LIKELY'; icon = '🔴'; }
-      else if (healthPct >= 50)  { label = 'PASS (floor)';                 icon = '✅'; }
-      else                       { label = 'UNVERIFIED';                   icon = '⚪'; }
+      if (healthPct >= 200 && signals.isEliteDev) { label = 'PRO-CONTROLLED FLOOR'; icon = '💎'; }
+      else if (healthPct >= 200)                  { label = 'OVERDISTRIBUTED / BOT-LIKELY'; icon = '🔴'; }
+      else if (healthPct >= 50)                   { label = 'PASS (floor)';                 icon = '✅'; }
+      else                                        { label = 'UNVERIFIED';                   icon = '⚪'; }
       holderDisplay = `≥${effectiveCount} | Health: ≥${healthPct}% ${icon} ${esc(label)} (target ~${target})`;
     } else {
-      if (healthPct < 50)        { label = 'LOW ORGANIC';                  icon = '🟡'; }
-      else if (healthPct > 200)  { label = 'OVERDISTRIBUTED / BOT-LIKELY'; icon = '🔴'; }
-      else                       { label = 'PASS';                         icon = '✅'; }
+      if (healthPct < 50)                         { label = 'LOW ORGANIC';                  icon = '🟡'; }
+      else if (healthPct > 200 && signals.isEliteDev) { label = 'PRO-CONTROLLED FLOOR';     icon = '💎'; }
+      else if (healthPct > 200)                   { label = 'OVERDISTRIBUTED / BOT-LIKELY'; icon = '🔴'; }
+      else                                        { label = 'PASS';                         icon = '✅'; }
       holderDisplay = `${effectiveCount} | Health: ${healthPct}% ${icon} ${esc(label)} (target ~${target})`;
     }
   } else if (effectiveCount !== null) {

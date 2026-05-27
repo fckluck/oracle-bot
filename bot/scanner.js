@@ -127,7 +127,10 @@ function scan(data) {
     ? (migratedCount / devLaunches) * 100 : null;
   const isUnproven       = devLaunches != null && devLaunches < 10;
   const isProPilot       = successRatePct != null && successRatePct > 5  && !isUnproven;
-  const isEliteDev       = successRatePct != null && successRatePct >= 15 && !isUnproven;
+  // Elite threshold: >10% success rate AND >15 launches.
+  // >15 launches ensures statistical significance (a 20% rate on 5 launches is luck,
+  // not skill). isUnproven check is implicit — >15 launches always passes !isUnproven.
+  const isEliteDev       = successRatePct != null && successRatePct > 10 && devLaunches != null && devLaunches > 15;
   const isSerialDeployer = devLaunches !== null && devLaunches > 500;
 
   const holderCount     = holders?.holderCount     ?? null;
@@ -140,8 +143,11 @@ function scan(data) {
   //   front-run liquidity; concentration distributes post-launch naturally).
   // sub-$100K + unknown dev → 35% (early concentration is still normal).
   // $100K+ → flat 25% (established token, no excuse for high concentration).
+  // Elite devs (>10% success, >15 launches) often self-bundle to protect the floor.
+  // 50% cap allows their typical 40-50% concentration without a false NO-GO.
+  // Pro devs: 40%. Unknown devs sub-$100K: 35%. Post-$100K any dev: 25%.
   const top10HardMax = (mc != null && mc < 100_000)
-    ? (isEliteDev || isProPilot) ? 40 : 35
+    ? isEliteDev ? 50 : isProPilot ? 40 : 35
     : 25;
 
   const ctoDesc        = detectCtoFromDesc(pump);
@@ -396,7 +402,9 @@ function scan(data) {
   let riskyRunnerReason = null;
 
   // INFLATED/BOTTED demotion: synthetic holder count means conviction is unearned.
-  if (verdict === 'BUY' && holderHealthData?.label === 'INFLATED/BOTTED') {
+  // Elite devs exempt from INFLATED demotion: self-bundled floor protection
+  // routinely produces >200% holder health — it's a control mechanism, not botting.
+  if (verdict === 'BUY' && holderHealthData?.label === 'INFLATED/BOTTED' && !isEliteDev) {
     verdict      = 'NO_GO';
     noGoReason   = `INFLATED HOLDERS — Health ${holderHealthData.healthPct}% (>200%) — bot wallets suspected.`;
     headlineType = 'INFLATED';
@@ -430,7 +438,7 @@ function scan(data) {
     else if (momentumStatus === 'LOWER_RANGE')               invariantFail = `INVARIANT: momentum LOWER_RANGE`;
     else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION')   invariantFail = `INVARIANT: momentum VOLUMETRIC_DISTRIBUTION`;
     else if (washPct !== null && washPct > 30)               invariantFail = `INVARIANT: wash ${washPct.toFixed(0)}% > 30`;
-    else if (holderHealthData?.label === 'INFLATED/BOTTED')  invariantFail = `INVARIANT: INFLATED/BOTTED holders`;
+    else if (holderHealthData?.label === 'INFLATED/BOTTED' && !isEliteDev)  invariantFail = `INVARIANT: INFLATED/BOTTED holders`;
     // v10.2.8: sybil-funded wallets were missing from fuse — HIGH_CONVICTION
     // (8x-12x) doesn't check highTierSafe, so a sybil bundle with low wash
     // and low top10 could slip through to BUY. Catch it here as a last resort.
