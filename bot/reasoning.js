@@ -43,6 +43,37 @@ function parseSoulVerdict(text) {
   return null;
 }
 
+function buildPatternMemoryBlock(patternMemory) {
+  if (!patternMemory) return '';
+
+  const fmt = r => {
+    const mc = r.scanMc != null ? `$${(r.scanMc / 1000).toFixed(0)}K` : 'unknown MC';
+    const peak = r.peakMc != null ? `$${(r.peakMc / 1000).toFixed(0)}K` : 'unknown peak';
+    const mult = r.scanMc > 0 && r.peakMc > 0 ? `${(r.peakMc / r.scanMc).toFixed(1)}x` : '?x';
+    const vol = r.adjustedVolLiq != null ? `${r.adjustedVolLiq.toFixed(1)}x vol` : 'unknown vol';
+    const top10 = r.top10Pct != null ? `${r.top10Pct.toFixed(0)}% top10` : 'unknown top10';
+    return `$${r.symbol ?? r.ticker ?? '???'}: ${r.verdict}${r.entryTier ? '/' + r.entryTier : ''}, ${mc} → ${peak} (${mult}), ${vol}, ${top10}`;
+  };
+
+  const parts = [];
+
+  if (patternMemory.missedWinners?.length) {
+    parts.push(`MISSED WINNERS — study these false rejections carefully: ${patternMemory.missedWinners.map(fmt).join(' | ')}`);
+  }
+
+  if (patternMemory.winners?.length) {
+    parts.push(`RECENT WINNERS: ${patternMemory.winners.map(fmt).join(' | ')}`);
+  }
+
+  if (patternMemory.rugs?.length) {
+    parts.push(`RECENT RUGS / FLAT FAILURES: ${patternMemory.rugs.map(fmt).join(' | ')}`);
+  }
+
+  if (!parts.length) return '';
+
+  return `\n\nLIVE ORACLE AUDIT MEMORY:\n${parts.join('\n')}\n`;
+}
+
 async function postGrok(messages, maxTokens = 150, temperature = 0.3) {
   const key = process.env.XAI_API_KEY;
   if (!key) return null;
@@ -77,6 +108,7 @@ async function getSoulVerdict(scanResult, tokenData = {}) {
   }
 
   const { signals = {}, devProfile = {} } = scanResult;
+  const patternMemoryBlock = buildPatternMemoryBlock(tokenData.patternMemory ?? scanResult.patternMemory);
   const ticker = tokenData.codex?.symbol || tokenData.pump?.symbol || tokenData.symbol || 'UNKNOWN';
   const userMessage = `
 Token Analysis Request:
@@ -97,7 +129,7 @@ Does this token match a Winner or Loser blueprint?`;
 
   try {
     const data = await postGrok([
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: SYSTEM_PROMPT + patternMemoryBlock },
       { role: 'user', content: userMessage },
     ]);
     const text = data?.choices?.[0]?.message?.content?.trim() ?? '';
@@ -132,7 +164,10 @@ async function getSoulReasoning(args = {}) {
       topPerformerMultiplier: args.peakMultiplier,
     },
   };
-  const soul = await getSoulVerdict(scanResult, { symbol: args.ticker });
+  const soul = await getSoulVerdict(scanResult, {
+    symbol: args.ticker,
+    patternMemory: args.patternMemory,
+  });
   return soul.reasoning;
 }
 
