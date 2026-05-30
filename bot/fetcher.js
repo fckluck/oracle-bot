@@ -1,5 +1,6 @@
 require('dotenv').config();
 const fetch = require('node-fetch');
+const { markApi } = require('./telemetry');
 
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens/';
 const CODEX_GQL       = 'https://graph.codex.io/graphql';
@@ -22,10 +23,10 @@ async function fetchDexScreener(ca) {
     const res = await fetch(`${DEXSCREENER_URL}${ca}`, {
       headers: { 'Accept': 'application/json' }, timeout: 8000,
     });
-    if (!res.ok) { console.log(`[fetchDexScreener] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('DexScreener', { ok: false, error: `HTTP ${res.status}` }); console.log(`[fetchDexScreener] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const sol = (data.pairs || []).filter(p => p.chainId === 'solana');
-    if (!sol.length) { console.log('[fetchDexScreener] no Solana pairs'); return null; }
+    if (!sol.length) { markApi('DexScreener', { ok: false, error: 'no Solana pairs' }); console.log('[fetchDexScreener] no Solana pairs'); return null; }
     sol.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
     // Prefer the highest-liquidity pair that actually has LP > 0 (avoids Phantom LP / stale pairs)
     const top = sol.find(p => (p.liquidity?.usd || 0) > 0) || sol[0];
@@ -33,6 +34,7 @@ async function fetchDexScreener(ca) {
     const vol1h = top.volume?.h1     || 0;
     const mc    = top.marketCap || 0;
     const dexId = top.dexId || null;
+    markApi('DexScreener', { ok: true, meta: { lp, vol1h, mc, dexId } });
     return {
       pairAddress:   top.pairAddress  || null,
       name:          top.baseToken?.name   || 'UNKNOWN',
@@ -53,7 +55,7 @@ async function fetchDexScreener(ca) {
       dexId,
       isMeteora:     dexId === 'meteora',
     };
-  } catch (e) { console.error('[fetchDexScreener] error:', e.message); return null; }
+  } catch (e) { markApi('DexScreener', { ok: false, error: e.message }); console.error('[fetchDexScreener] error:', e.message); return null; }
 }
 
 // ── SolanaTracker (Truth source for pump.fun creator + dev history) ─────────
@@ -68,13 +70,13 @@ const PUMPFUN_INITIAL_MC_USD = 5000;
 
 async function fetchSolanaTrackerToken(ca) {
   const key = process.env.SOLANATRACKER_API_KEY;
-  if (!key) return null;
+  if (!key) { markApi('SolanaTracker', { skipped: true, meta: { endpoint: 'token', reason: 'missing_key' } }); return null; }
   try {
     const res = await fetch(`${ST_BASE}/tokens/${ca}`, {
       headers: { 'x-api-key': key, 'Accept': 'application/json' },
       timeout: 8000,
     });
-    if (!res.ok) { console.log(`[fetchSolanaTrackerToken] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'token' }, error: `HTTP ${res.status}` }); console.log(`[fetchSolanaTrackerToken] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const creation = data?.token?.creation || null;
     const creator    = creation?.creator    || null;
@@ -87,8 +89,9 @@ async function fetchSolanaTrackerToken(ca) {
     const insidersPct = data?.risk?.insiders?.totalPercentage ?? null;
     const riskScore   = data?.risk?.score ?? null;
     console.log(`[fetchSolanaTrackerToken] creator=${creator || 'null'} holders=${holderCount ?? 'null'} snipers=${snipersPct} risk=${riskScore}`);
+    markApi('SolanaTracker', { ok: true, meta: { endpoint: 'token', creator: !!creator, holders: holderCount, snipersPct, riskScore } });
     return { creator, createdTx, createdAt, holderCount, snipersPct, insidersPct, riskScore };
-  } catch (e) { console.error('[fetchSolanaTrackerToken] error:', e.message); return null; }
+  } catch (e) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'token' }, error: e.message }); console.error('[fetchSolanaTrackerToken] error:', e.message); return null; }
 }
 
 // ── SolanaTracker holders (full count + concentration) ──────────────────────
@@ -97,35 +100,36 @@ async function fetchSolanaTrackerToken(ca) {
 
 async function fetchSolanaTrackerHolders(ca) {
   const key = process.env.SOLANATRACKER_API_KEY;
-  if (!key) return null;
+  if (!key) { markApi('SolanaTracker', { skipped: true, meta: { endpoint: 'holders', reason: 'missing_key' } }); return null; }
   try {
     const res = await fetch(`${ST_BASE}/tokens/${ca}/holders`, {
       headers: { 'x-api-key': key, 'Accept': 'application/json' },
       timeout: 8000,
     });
-    if (!res.ok) { console.log(`[fetchSolanaTrackerHolders] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: `HTTP ${res.status}` }); console.log(`[fetchSolanaTrackerHolders] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const total = typeof data?.total === 'number' ? data.total : null;
-    if (!total) return null;
+    if (!total) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: 'no total holders' }); return null; }
     const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
     const top3Pct  = accounts.slice(0, 3).reduce((s, a)  => s + (a.percentage || 0), 0) || null;
     const top10Pct = accounts.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0) || null;
     const top50Pct = accounts.slice(0, 50).reduce((s, a) => s + (a.percentage || 0), 0) || null;
     console.log(`[fetchSolanaTrackerHolders] total=${total} top10=${top10Pct?.toFixed(1)}% top50=${top50Pct?.toFixed(1)}%`);
+    markApi('SolanaTracker', { ok: true, meta: { endpoint: 'holders', holders: total, top10Pct } });
     return { holderCount: total, top3Pct, top10Pct, top50Pct, source: 'solanatracker-holders' };
-  } catch (e) { console.error('[fetchSolanaTrackerHolders] error:', e.message); return null; }
+  } catch (e) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchSolanaTrackerHolders] error:', e.message); return null; }
 }
 
 async function fetchSolanaTrackerDeployer(wallet) {
-  if (!wallet) return null;
+  if (!wallet) { markApi('SolanaTracker', { skipped: true, meta: { endpoint: 'deployer', reason: 'no_wallet' } }); return null; }
   const key = process.env.SOLANATRACKER_API_KEY;
-  if (!key) return null;
+  if (!key) { markApi('SolanaTracker', { skipped: true, meta: { endpoint: 'deployer', reason: 'missing_key' } }); return null; }
   try {
     const res = await fetch(`${ST_BASE}/deployer/${wallet}`, {
       headers: { 'x-api-key': key, 'Accept': 'application/json' },
       timeout: 10000,
     });
-    if (!res.ok) { console.log(`[fetchSolanaTrackerDeployer] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'deployer' }, error: `HTTP ${res.status}` }); console.log(`[fetchSolanaTrackerDeployer] HTTP ${res.status}`); return null; }
     const r = await res.json();
     // Preserve null for missing fields so scanner can fall back to legacy devStats.
     // Only coerce to numbers when SolanaTracker actually returned the field.
@@ -144,12 +148,13 @@ async function fetchSolanaTrackerDeployer(wallet) {
     const topPerformerMultiplier = peakMc !== null
       ? +(peakMc / PUMPFUN_INITIAL_MC_USD).toFixed(2) : null;
     console.log(`[fetchSolanaTrackerDeployer] launches=${totalLaunches} migrated=${migratedCount} winRate=${winRate}% peakMc=${peakMc} mult=${topPerformerMultiplier}x`);
+    markApi('SolanaTracker', { ok: true, meta: { endpoint: 'deployer', totalLaunches, migratedCount, topPerformerMultiplier } });
     return {
       totalLaunches, migratedCount, winRate,
       peakMc, topPerformerMultiplier,
       assetCount: all.length,
     };
-  } catch (e) { console.error('[fetchSolanaTrackerDeployer] error:', e.message); return null; }
+  } catch (e) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'deployer' }, error: e.message }); console.error('[fetchSolanaTrackerDeployer] error:', e.message); return null; }
 }
 
 // ── Birdeye (Alpha Tier) ──────────────────────────────────────────────────────
@@ -160,11 +165,11 @@ async function fetchSolanaTrackerDeployer(wallet) {
 
 async function fetchBirdeyeOverview(ca) {
   const key = process.env.BIRDEYE_API_KEY;
-  if (!key) return null;
+  if (!key) { markApi('Birdeye', { skipped: true, meta: { endpoint: 'overview', reason: 'missing_key' } }); return null; }
   const headers = { 'X-API-KEY': key, 'Accept': 'application/json', 'x-chain': 'solana' };
   try {
     const res = await fetch(`${BIRDEYE_BASE}/defi/token_overview?address=${ca}`, { headers, timeout: 8000 });
-    if (!res.ok) { console.log(`[fetchBirdeyeOverview] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('Birdeye', { ok: false, meta: { endpoint: 'overview' }, error: `HTTP ${res.status}` }); console.log(`[fetchBirdeyeOverview] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const dd = data?.data ?? {};
     // Birdeye returns holder counts under inconsistent field names — check them all.
@@ -187,7 +192,8 @@ async function fetchBirdeyeOverview(ca) {
     const bw = bestWindow ? bestWindow[1] : null;
     const bwLabel = bestWindow ? bestWindow[0] : null;
     console.log(`[fetchBirdeyeOverview] holders=${holderCount ?? 'null'} bestWindow=${bwLabel ?? 'none'} trade=${bw?.trade ?? 0} unique=${bw?.unique ?? 0}`);
-    if (holderCount == null && !bw) return null;
+    if (holderCount == null && !bw) { markApi('Birdeye', { ok: false, meta: { endpoint: 'overview' }, error: 'no holder or wash fields' }); return null; }
+    markApi('Birdeye', { ok: true, meta: { endpoint: 'overview', holderCount: holderCount != null ? Number(holderCount) : null, washWindow: bwLabel } });
     return {
       holderCount: holderCount != null ? Number(holderCount) : null,
       washWindow:  bwLabel,
@@ -196,12 +202,12 @@ async function fetchBirdeyeOverview(ca) {
       washVUsd:    bw?.vUsd   ?? null,
       washScale:   bw?.scale  ?? null,
     };
-  } catch (e) { console.error('[fetchBirdeyeOverview] error:', e.message); return null; }
+  } catch (e) { markApi('Birdeye', { ok: false, meta: { endpoint: 'overview' }, error: e.message }); console.error('[fetchBirdeyeOverview] error:', e.message); return null; }
 }
 
 async function fetchBirdeye(ca) {
   const key = process.env.BIRDEYE_API_KEY;
-  if (!key) { console.log('[fetchBirdeye] BIRDEYE_API_KEY not set'); return null; }
+  if (!key) { markApi('Birdeye', { skipped: true, meta: { endpoint: 'ohlcv', reason: 'missing_key' } }); console.log('[fetchBirdeye] BIRDEYE_API_KEY not set'); return null; }
   const headers = { 'X-API-KEY': key, 'Accept': 'application/json', 'x-chain': 'solana' };
   const nowTs       = Math.floor(Date.now() / 1000);
   const twoHoursAgo = nowTs - 7200;
@@ -210,10 +216,10 @@ async function fetchBirdeye(ca) {
       `${BIRDEYE_BASE}/defi/ohlcv?address=${ca}&type=5m&time_from=${twoHoursAgo}&time_to=${nowTs}`,
       { headers, timeout: 8000 }
     );
-    if (!res.ok) { console.log(`[fetchBirdeye] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('Birdeye', { ok: false, meta: { endpoint: 'ohlcv' }, error: `HTTP ${res.status}` }); console.log(`[fetchBirdeye] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const candles = data?.data?.items || [];
-    if (!candles.length) { console.log('[fetchBirdeye] no candles'); return null; }
+    if (!candles.length) { markApi('Birdeye', { ok: false, meta: { endpoint: 'ohlcv' }, error: 'no candles' }); console.log('[fetchBirdeye] no candles'); return null; }
 
     const last   = candles[candles.length - 1];
     const prev   = candles[candles.length - 2] || null;
@@ -232,8 +238,9 @@ async function fetchBirdeye(ca) {
     const volAccel  = vol1hTot > 0 ? (vol5mLast / vol1hTot) : null; // 0–1 fraction
 
     console.log(`[fetchBirdeye] candles=${candles.length} 5mChange=${priceChange5m?.toFixed(2)}% range=${(rangePct != null ? (rangePct*100).toFixed(0) : 'N/A')}% velocity=${volAccel != null ? (volAccel*100).toFixed(0)+'%' : 'N/A'}`);
+    markApi('Birdeye', { ok: true, meta: { endpoint: 'ohlcv', priceChange5m, rangePct, volAccel } });
     return { priceChange5m, high1h, low1h, rangePct, currentClose: last.c, volAccel };
-  } catch (e) { console.error('[fetchBirdeye] error:', e.message); return null; }
+  } catch (e) { markApi('Birdeye', { ok: false, meta: { endpoint: 'ohlcv' }, error: e.message }); console.error('[fetchBirdeye] error:', e.message); return null; }
 }
 
 // ── Bundle Detection + Parent Funding Sybil Trace (v6.0) ────────────────────
@@ -354,7 +361,7 @@ const PUMPFUN_HEADERS = {
 async function fetchPumpPortal(ca) {
   try {
     const res = await fetch(`${PUMPFUN_URL}${ca}`, { headers: PUMPFUN_HEADERS, timeout: 6000 });
-    if (!res.ok) { console.log(`[fetchPumpPortal] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('PumpFun', { ok: false, error: `HTTP ${res.status}` }); console.log(`[fetchPumpPortal] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const migrated = data.complete === true || !!data.raydium_pool;
     // Approximate bonding-curve progress from virtual reserves.
@@ -366,6 +373,7 @@ async function fetchPumpPortal(ca) {
       return Math.max(0, Math.min(99, Math.round(progress * 10) / 10));
     })();
     console.log(`[fetchPumpPortal] migrated=${migrated} curvePct=${curvePct} mc=$${data.usd_market_cap || data.market_cap || 0}`);
+    markApi('PumpFun', { ok: true, meta: { migrated, curvePct, mc: data.usd_market_cap || data.market_cap || 0 } });
     return {
       name:           data.name        || 'UNKNOWN',
       symbol:         data.symbol      || '???',
@@ -381,7 +389,7 @@ async function fetchPumpPortal(ca) {
       telegram:       data.telegram    || null,
       website:        data.website     || null,
     };
-  } catch (e) { console.error('[fetchPumpPortal] error:', e.message); return null; }
+  } catch (e) { markApi('PumpFun', { ok: false, error: e.message }); console.error('[fetchPumpPortal] error:', e.message); return null; }
 }
 
 // ── pump.fun dev stats (replaces dead PumpPortal user-stats endpoint) ─────────
@@ -389,28 +397,29 @@ async function fetchPumpPortal(ca) {
 // Returns array of coin objects; complete=true / raydium_pool!=null = graduated.
 
 async function fetchDevStats(devWallet) {
-  if (!devWallet) return null;
+  if (!devWallet) { markApi('PumpFun', { skipped: true, meta: { endpoint: 'devStats', reason: 'no_wallet' } }); return null; }
   try {
     const res = await fetch(
       `${PUMPFUN_USER}${devWallet}?offset=0&limit=200`,
       { headers: PUMPFUN_HEADERS, timeout: 8000 }
     );
-    if (!res.ok) { console.log(`[fetchDevStats] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('PumpFun', { ok: false, meta: { endpoint: 'devStats' }, error: `HTTP ${res.status}` }); console.log(`[fetchDevStats] HTTP ${res.status}`); return null; }
     const data = await res.json();
     if (!Array.isArray(data)) { console.log('[fetchDevStats] unexpected shape'); return null; }
     const totalLaunches = data.length;
     const migratedCount = data.filter(c => c.complete === true || !!c.raydium_pool).length;
     const winRate       = totalLaunches > 0 ? +(migratedCount / totalLaunches * 100).toFixed(2) : null;
     console.log(`[fetchDevStats] launches=${totalLaunches} migrated=${migratedCount} winRate=${winRate}%`);
+    markApi('PumpFun', { ok: true, meta: { endpoint: 'devStats', totalLaunches, migratedCount, winRate } });
     return { totalLaunches, migratedCount, winRate };
-  } catch (e) { console.error('[fetchDevStats] error:', e.message); return null; }
+  } catch (e) { markApi('PumpFun', { ok: false, meta: { endpoint: 'devStats' }, error: e.message }); console.error('[fetchDevStats] error:', e.message); return null; }
 }
 
 // ── Helius — Token Creator fallback ──────────────────────────────────────────
 
 async function fetchTokenCreator(ca) {
   const endpoint = heliusRpc();
-  if (!endpoint) return null;
+  if (!endpoint) { markApi('Helius', { skipped: true, meta: { endpoint: 'tokenCreator', reason: 'missing_key' } }); return null; }
   try {
     // Step 1: DAS getAsset (works for NFTs; often empty for fungible SPL tokens)
     const assetRes = await fetch(endpoint, {
@@ -442,7 +451,7 @@ async function fetchTokenCreator(ca) {
     if (!sigsRes.ok) { console.log(`[fetchTokenCreator] sigs HTTP ${sigsRes.status}`); return null; }
     const sigsData = await sigsRes.json();
     const sigs = sigsData?.result || [];
-    if (!sigs.length) return null;
+    if (!sigs.length) { markApi('Helius', { ok: false, meta: { endpoint: 'tokenCreator' }, error: 'no signatures' }); return null; }
     const oldestSig = sigs[sigs.length - 1].signature;
     const txRes = await fetch(endpoint, {
       method: 'POST',
@@ -454,12 +463,13 @@ async function fetchTokenCreator(ca) {
       }),
       timeout: 8000,
     });
-    if (!txRes.ok) { console.log(`[fetchTokenCreator] tx HTTP ${txRes.status}`); return null; }
+    if (!txRes.ok) { markApi('Helius', { ok: false, meta: { endpoint: 'tokenCreator' }, error: `HTTP ${txRes.status}` }); console.log(`[fetchTokenCreator] tx HTTP ${txRes.status}`); return null; }
     const txData = await txRes.json();
     const creator = txData?.result?.transaction?.message?.accountKeys?.[0] ?? null;
     console.log(`[fetchTokenCreator] from oldest tx: ${creator}`);
+    markApi('Helius', { ok: true, meta: { endpoint: 'tokenCreator', creator: !!creator } });
     return creator;
-  } catch (e) { console.error('[fetchTokenCreator] error:', e.message); return null; }
+  } catch (e) { markApi('Helius', { ok: false, meta: { endpoint: 'tokenCreator' }, error: e.message }); console.error('[fetchTokenCreator] error:', e.message); return null; }
 }
 
 // ── Helius — Dev Top Performer (v6.0) ────────────────────────────────────────
@@ -467,9 +477,9 @@ async function fetchTokenCreator(ca) {
 // computes the dev's historical peak MC. Multiplier = peak / $5K (pump.fun start).
 
 async function fetchDevPeak(devWallet) {
-  if (!devWallet) return null;
+  if (!devWallet) { markApi('Helius', { skipped: true, meta: { endpoint: 'devPeak', reason: 'no_wallet' } }); return null; }
   const endpoint = heliusRpc();
-  if (!endpoint) { console.log('[fetchDevPeak] HELIUS_API_KEY not set'); return null; }
+  if (!endpoint) { markApi('Helius', { skipped: true, meta: { endpoint: 'devPeak', reason: 'missing_key' } }); console.log('[fetchDevPeak] HELIUS_API_KEY not set'); return null; }
   const PUMPFUN_INITIAL_MC = 5000;
 
   try {
@@ -507,14 +517,15 @@ async function fetchDevPeak(devWallet) {
       ? highestMc / PUMPFUN_INITIAL_MC : null;
 
     console.log(`[fetchDevPeak] creator=${creatorItems.length} owner=${ownerItemsRaw.length}(${ownerItemsFiltered.length} as creator) unique=${all.size} peakMc=${highestMc} mult=${topPerformerMultiplier?.toFixed(2)}x`);
+    markApi('Helius', { ok: true, meta: { endpoint: 'devPeak', assetCount: all.size, highestMc, topPerformerMultiplier } });
     return { assetCount: all.size, highestMc, topPerformerMultiplier };
-  } catch (e) { console.error('[fetchDevPeak] error:', e.message); return null; }
+  } catch (e) { markApi('Helius', { ok: false, meta: { endpoint: 'devPeak' }, error: e.message }); console.error('[fetchDevPeak] error:', e.message); return null; }
 }
 
 // ── Wallet Age + Last Activity ────────────────────────────────────────────────
 
 async function fetchWalletAge(devWallet) {
-  if (!devWallet) return null;
+  if (!devWallet) { markApi('Helius', { skipped: true, meta: { endpoint: 'walletAge', reason: 'no_wallet' } }); return null; }
   const endpoint = heliusRpc() || SOLANA_RPC;
   try {
     const res = await fetch(endpoint, {
@@ -527,10 +538,10 @@ async function fetchWalletAge(devWallet) {
       }),
       timeout: 8000,
     });
-    if (!res.ok) { console.log(`[fetchWalletAge] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('Helius', { ok: false, meta: { endpoint: 'walletAge' }, error: `HTTP ${res.status}` }); console.log(`[fetchWalletAge] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const sigs = data?.result || [];
-    if (!sigs.length) return null;
+    if (!sigs.length) { markApi('Helius', { ok: false, meta: { endpoint: 'walletAge' }, error: 'no signatures' }); return null; }
 
     // Newest signature = most recent activity
     const newest    = sigs[0];
@@ -549,8 +560,9 @@ async function fetchWalletAge(devWallet) {
     }
 
     console.log(`[fetchWalletAge] txns=${sigs.length} ageDays=${ageDays} lastActivityMinsAgo=${minutesSinceLastTx}`);
+    markApi('Helius', { ok: true, meta: { endpoint: 'walletAge', txCount: sigs.length, ageDays, minutesSinceLastTx } });
     return { ageDays, ageDisplay, partial, txCount: sigs.length, minutesSinceLastTx, lastActivityBlockTime };
-  } catch (e) { console.error('[fetchWalletAge] error:', e.message); return null; }
+  } catch (e) { markApi('Helius', { ok: false, meta: { endpoint: 'walletAge' }, error: e.message }); console.error('[fetchWalletAge] error:', e.message); return null; }
 }
 
 // ── Jupiter (post-migration fallback) ─────────────────────────────────────────
@@ -593,7 +605,7 @@ async function fetchDeFadeVerification(ca, oracleSignals = {}) {
     action: 'UNAVAILABLE', reason, verified: false,
     score: null, risk: null, factors: null,
   });
-  if (!process.env.DEFADE_API_KEY) return unavailable('DEFADE_API_KEY not configured');
+  if (!process.env.DEFADE_API_KEY) { markApi('DeFade', { skipped: true, meta: { reason: 'missing_key' } }); return unavailable('DEFADE_API_KEY not configured'); }
 
   const base = process.env.DEFADE_BASE_URL || 'https://api.defade.org';
   let data;
@@ -608,11 +620,13 @@ async function fetchDeFadeVerification(ca, oracleSignals = {}) {
     });
     if (!res.ok) {
       console.log(`[DeFade] HTTP ${res.status} — verification UNAVAILABLE`);
+      markApi('DeFade', { ok: false, error: `HTTP ${res.status}` });
       return unavailable(`DeFade HTTP ${res.status}`);
     }
     data = await res.json();
   } catch (e) {
     console.error('[DeFade] error:', e.message);
+    markApi('DeFade', { ok: false, error: e.message });
     return unavailable(`DeFade error: ${e.message}`);
   }
 
@@ -649,6 +663,7 @@ async function fetchDeFadeVerification(ca, oracleSignals = {}) {
   }
 
   console.log(`[DeFade] action=${action} score=${score} risk=${risk} reason="${reason}"`);
+  markApi('DeFade', { ok: true, meta: { action, score, risk } });
   return {
     action, reason, verified: true,
     score: score != null ? Number(score) : null,
@@ -662,7 +677,7 @@ async function fetchDeFadeVerification(ca, oracleSignals = {}) {
 const PUMPFUN_TOTAL_SUPPLY = 1_000_000_000;
 
 async function fetchHeliusHolders(ca) {
-  if (!process.env.HELIUS_API_KEY) return null;
+  if (!process.env.HELIUS_API_KEY) { markApi('Helius', { skipped: true, meta: { endpoint: 'holders', reason: 'missing_key' } }); return null; }
   try {
     const url = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
     const res = await fetch(url, {
@@ -675,16 +690,17 @@ async function fetchHeliusHolders(ca) {
       }),
       timeout: 8000,
     });
-    if (!res.ok) { console.log(`[fetchHeliusHolders] HTTP ${res.status}`); return null; }
+    if (!res.ok) { markApi('Helius', { ok: false, meta: { endpoint: 'holders' }, error: `HTTP ${res.status}` }); console.log(`[fetchHeliusHolders] HTTP ${res.status}`); return null; }
     const data = await res.json();
     const accounts = data?.result?.value || [];
-    if (!accounts.length) return null;
+    if (!accounts.length) { markApi('Helius', { ok: false, meta: { endpoint: 'holders' }, error: 'no accounts' }); return null; }
 
     const top10Balance = accounts.slice(0, 10)
       .reduce((sum, a) => sum + parseFloat(a.uiAmount || 0), 0);
     const top3Balance  = accounts.slice(0, 3)
       .reduce((sum, a) => sum + parseFloat(a.uiAmount || 0), 0);
 
+    markApi('Helius', { ok: true, meta: { endpoint: 'holders', topAccountCount: accounts.length } });
     return {
       // Note: Helius returns up to 20 largest accounts, not the full holder count.
       // We surface it as a *lower bound* via the topAccountCount field; UI labels it accordingly.
@@ -694,13 +710,13 @@ async function fetchHeliusHolders(ca) {
       top3Pct:  (top3Balance  / PUMPFUN_TOTAL_SUPPLY) * 100,
       source: 'helius',
     };
-  } catch (e) { console.error('[fetchHeliusHolders] error:', e.message); return null; }
+  } catch (e) { markApi('Helius', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchHeliusHolders] error:', e.message); return null; }
 }
 
 // ── Codex holders ─────────────────────────────────────────────────────────────
 
 async function fetchCodexHolders(ca) {
-  if (!process.env.CODEX_API_KEY) return null;
+  if (!process.env.CODEX_API_KEY) { markApi('Codex', { skipped: true, meta: { endpoint: 'holders', reason: 'missing_key' } }); return null; }
   try {
     const tokenId = `${ca}:1399811149`;
     const query = `query { holders(input: { tokenId: "${tokenId}" }) { items { walletId balance shiftedBalance } } }`;
@@ -710,18 +726,20 @@ async function fetchCodexHolders(ca) {
       body: JSON.stringify({ query }), timeout: 8000,
     });
     const data = await res.json();
-    if (data.errors) { console.log('[fetchCodexHolders] errors:', JSON.stringify(data.errors)); return null; }
+    if (data.errors) { markApi('Codex', { ok: false, meta: { endpoint: 'holders' }, error: JSON.stringify(data.errors).slice(0, 120) }); console.log('[fetchCodexHolders] errors:', JSON.stringify(data.errors)); return null; }
     const items = data?.data?.holders?.items || [];
-    if (!items.length) return null;
+    if (!items.length) { markApi('Codex', { ok: false, meta: { endpoint: 'holders' }, error: 'no holders' }); return null; }
     const total = items.reduce((s, h) => s + (h.shiftedBalance || 0), 0);
     const top10 = items.slice(0, 10).reduce((s, h) => s + (h.shiftedBalance || 0), 0);
     const top3  = items.slice(0, 3).reduce((s, h)  => s + (h.shiftedBalance || 0), 0);
+    markApi('Codex', { ok: true, meta: { endpoint: 'holders', holders: items.length } });
     return {
       holderCount: items.length,
       top10Pct: total > 0 ? (top10 / total) * 100 : null,
       top3Pct:  total > 0 ? (top3  / total) * 100 : null,
+      source: 'codex',
     };
-  } catch (e) { console.error('[fetchCodexHolders] error:', e.message); return null; }
+  } catch (e) { markApi('Codex', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchCodexHolders] error:', e.message); return null; }
 }
 
 // ── fetchAll ──────────────────────────────────────────────────────────────────
@@ -753,6 +771,11 @@ async function fetchAll(ca, opts = {}) {
     const rawVolLiq = dex?.volLiq ?? 0;
     if (rawVolLiq < QUICK_FILTER_THRESHOLD) {
       console.log(`[fetchAll] quick-filter: raw volLiq ${rawVolLiq.toFixed(2)}x < ${QUICK_FILTER_THRESHOLD}x — skipping paid APIs`);
+      const meta = { reason: 'quick_filter_raw_vol_liq', rawVolLiq };
+      markApi('Birdeye', { skipped: true, meta });
+      markApi('SolanaTracker', { skipped: true, meta });
+      markApi('Helius', { skipped: true, meta });
+      markApi('Codex', { skipped: true, meta });
       return null;
     }
   }
@@ -912,7 +935,7 @@ async function fetchAll(ca, opts = {}) {
 
 async function fetchSocialData(ca) {
   const key = process.env.SOCIALDATA_API_KEY;
-  if (!key) return { available: false };
+  if (!key) { markApi('SocialData', { skipped: true, meta: { reason: 'missing_key' } }); return { available: false }; }
   try {
     // Search recent tweets containing the CA — returns up to 100 results per page
     const query    = encodeURIComponent(`"${ca}" -is:retweet`);
@@ -925,6 +948,7 @@ async function fetchSocialData(ca) {
       timeout: 8000,
     });
     if (!res.ok) {
+      markApi('SocialData', { ok: false, error: `HTTP ${res.status}` });
       console.log(`[fetchSocialData] HTTP ${res.status}`);
       return { available: false };
     }
@@ -948,9 +972,11 @@ async function fetchSocialData(ca) {
 
     const isTrending = mentions15m >= 30;
     console.log(`[fetchSocialData] mentions15m=${mentions15m} unique=${uniqueAccounts} trending=${isTrending} cto=${ctoSignal}`);
+    markApi('SocialData', { ok: true, meta: { mentions15m, uniqueAccounts, ctoSignal, isTrending } });
     return { available: true, mentions15m, uniqueAccounts, isTrending, ctoSignal };
   } catch (e) {
     console.error('[fetchSocialData] error:', e.message);
+    markApi('SocialData', { ok: false, error: e.message });
     return { available: false };
   }
 }

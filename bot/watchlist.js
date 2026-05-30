@@ -7,6 +7,7 @@ const fs   = require('fs');
 const path = require('path');
 const { fetchForensic } = require('./fetcher');
 const { recordScan }    = require('./audit');
+const { formatEt, formatUtc } = require('./time');
 
 // Prefer /data (Railway persistent volume) over local file — same pattern as hunters.json.
 // Falls back to the local bot/ directory when /data is not writable (dev/Replit).
@@ -110,6 +111,7 @@ async function checkEntry(entry, bot) {
     if (healthOk) metLines.push(`Holder Health *${healthPct}%* (≥50% threshold met)`);
 
     const msg =
+      `🕒 *Action Time:* ${formatEt()} | ${formatUtc()}\n\n` +
       `🚀 *ORACLE UPDATE: ${entry.symbol} IS NOW ENTRY GRADE*\n` +
       `CA: \`${shortCa}\`\n\n` +
       `── *CONDITIONS MET* ──\n` +

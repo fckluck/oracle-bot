@@ -20,11 +20,13 @@ const fs    = require('fs');
 const path  = require('path');
 const fetch = require('node-fetch');
 const WS    = require('ws');          // explicit import — never rely on global WebSocket
-const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
+const { fetchAll, fetchDeFadeVerification, fetchSocialData } = require('./fetcher');
 const { scan }             = require('./scanner');
 const { formatVerdict }    = require('./verdict');
 const { getSoulVerdict }   = require('./reasoning');
 const { recordScan, getPatternMemory } = require('./audit');
+const { actionTimeLine } = require('./time');
+const { getApiStats, markApi } = require('./telemetry');
 const config               = require('./config');
 
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
@@ -62,6 +64,56 @@ function buildWsUrl() {
   return key
     ? `${WS_BASE_URL}?api-key=${encodeURIComponent(key)}`
     : WS_BASE_URL;
+}
+
+function getAllowedHuntVerdicts() {
+  if (config.HUNT_ALERT_VERDICTS) {
+    return config.HUNT_ALERT_VERDICTS
+      .split(',')
+      .map(v => v.trim().toUpperCase())
+      .filter(Boolean);
+  }
+  const mode = String(config.HUNT_ALERT_MODE || 'strict').toLowerCase();
+  if (mode === 'all') {
+    return ['BUY', 'RISKY_RUNNER', 'WATCH_VOL', 'WATCH_WASH', 'AVOID', 'NO_GO', 'SKIP'];
+  }
+  if (mode === 'watch') {
+    return ['BUY', 'RISKY_RUNNER', 'WATCH_VOL', 'WATCH_WASH'];
+  }
+  return ['BUY'];
+}
+
+function shouldBroadcastHuntResult(result) {
+  const allowed = getAllowedHuntVerdicts();
+  const verdict = String(result?.verdict || '').toUpperCase();
+  if (!allowed.includes(verdict)) {
+    return { ok: false, reason: `verdict ${verdict || 'UNKNOWN'} not allowed in Hunt alert mode` };
+  }
+  const mode = String(config.HUNT_ALERT_MODE || 'strict').toLowerCase();
+  if (mode === 'strict') {
+    if (verdict !== 'BUY') {
+      return { ok: false, reason: `strict mode requires BUY; got ${verdict}` };
+    }
+    if (!result.entryTier) {
+      return { ok: false, reason: 'strict mode requires BUY with entryTier' };
+    }
+    if (result.noGoReason) {
+      return { ok: false, reason: `strict mode blocked noGoReason: ${result.noGoReason}` };
+    }
+    if (result.watchReason) {
+      return { ok: false, reason: `strict mode blocked watchReason: ${result.watchReason}` };
+    }
+  }
+  return { ok: true, reason: null };
+}
+
+function markSuppressed(ca, result, reason) {
+  stats.skipped++;
+  stats.lastSkipReason = reason;
+  stats.lastSkippedCA = ca;
+  stats.lastSkippedVerdict = result?.verdict ?? null;
+  stats.lastSkippedAt = Date.now();
+  console.log(`[hunt] suppressed ${ca.slice(0, 8)} — ${reason}`);
 }
 
 function isSolanaCA(text) { return typeof text === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,50}$/.test(text.trim()); }
@@ -137,6 +189,10 @@ const stats = {
   lastBroadcastAt: null,
   lastBroadcastError: null,
   lastDeliveredAt: null,
+  lastSkipReason: null,
+  lastSkippedCA: null,
+  lastSkippedVerdict: null,
+  lastSkippedAt: null,
   skipped: 0,
   errors: 0,
   rawEvents: 0,
@@ -203,13 +259,18 @@ async function runScan(job, broadcaster) {
     if (last && Date.now() - last < PER_CA_COOLDOWN_MS) { stats.skipped++; return; }
 
     stats.scanned++;
-    // quickFilter: skip Birdeye/SolanaTracker when raw vol/liq < 5x — saves
-    // paid API credits on the ~60% of tokens that fail the vol/liq gate anyway.
-    const data = await fetchAll(ca, { quickFilter: true });
+    const [data, social] = await Promise.all([
+      fetchAll(ca, { quickFilter: true }),
+      fetchSocialData(ca),
+    ]);
     if (!data?.codex) { stats.skipped++; return; }
+    data.social = social;
 
     const result = scan(data);
+    result.social = social;
+    result.scannedAt = Date.now();
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
+
     // Pro/Elite dev floor: 2.0x — see proven devs before they move, not after.
     // Standard floor (MIN_VOLLIQ_BROADCAST = 3.0x) applies to everyone else.
     const isPilotDev     = result.signals?.isEliteDev || result.signals?.isProPilot;
@@ -217,9 +278,7 @@ async function runScan(job, broadcaster) {
     if (adjustedVolLiq < broadcastFloor) { stats.skipped++; return; }
 
     // Age gate for Dex-fallback candidates: DexScreener token-profiles and
-    // community-takeovers endpoints return tokens of ANY age — a CTO posted today
-    // on a 6-month-old token should not fire as a "new launch." WS events from
-    // PumpPortal are always fresh so we only enforce this on fallback sources.
+    // community-takeovers endpoints return tokens of ANY age.
     const ageMinutes = data.codex?.ageMinutes ?? null;
     const AGE_MAX_FALLBACK = (config.AGE_MAX_MIN || 60) * 3; // 3h for profile/CTO
     if (source?.startsWith('dexscreener') && ageMinutes !== null && ageMinutes > AGE_MAX_FALLBACK) {
@@ -227,57 +286,27 @@ async function runScan(job, broadcaster) {
       stats.skipped++; return;
     }
 
-    // Grok Soul reasoning is additive only; it never flips scanner verdicts.
-    result.soulVerdict = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).catch(() => null);
-    result.soulReasoning = result.soulVerdict?.reasoning ?? null;
+    const rawSym = data.codex?.symbol || data.pump?.symbol || '???';
 
-    // Post-scan DeFade verification on BUY candidates only (free-plan quota).
+    // DeFade must run before final broadcast gate so HARD_SKIP can suppress alerts.
     if (result.verdict === 'BUY') {
       const v = await fetchDeFadeVerification(ca, { lp: result.signals?.lp });
       result.deFadeVerification = v;
       if (v.action === 'HARD_SKIP') {
-        console.log(`[hunt] ${ca} HARD_SKIP by DeFade: ${v.reason}`);
-        recentlyBroadcast.set(ca, Date.now());
-        stats.skipped++; return;
+        result.verdict = 'NO_GO';
+        result.entryTier = null;
+        result.noGoReason = `DeFade verification: ${v.reason}`;
       }
+    } else {
+      markApi('DeFade', { skipped: true, meta: { reason: 'non_buy_verdict', verdict: result.verdict } });
+      result.deFadeVerification = {
+        action: 'SKIPPED',
+        reason: `Skipped because verdict was ${result.verdict}; DeFade only runs on BUY to preserve quota.`,
+        verified: false,
+      };
     }
 
-    const message = formatVerdict(result, ca);
-    const mc     = result.signals?.marketCap || 0;
-    const rawSym = data.codex?.symbol || data.pump?.symbol || '???';
-    // Escape HTML — token symbols can contain <, >, & which break Telegram HTML parse mode.
-    const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>\n` +
-                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>\n` +
-                   `Source: <code>${source}</code>\n\n`;
-
-    // v10.2.10: record candidate BEFORE attempting delivery
-    stats.broadcastCandidates++;
-    stats.broadcast = stats.broadcastCandidates; // keep legacy alias in sync
-    stats.lastBroadcastCA      = ca;
-    stats.lastBroadcastVerdict = result.verdict;
-    stats.lastBroadcastAt      = Date.now();
-
-    const delivery = await broadcaster(ca, mc, header + message, result.verdict);
-    recentlyBroadcast.set(ca, Date.now());
-
-    // Record in ring buffer for /huntlast
-    const candidateEntry = {
-      ca,
-      symbol,
-      adjustedVolLiq,
-      verdict:   result.verdict,
-      mc,
-      attempted: delivery.attempted,
-      delivered: delivery.delivered,
-      failed:    delivery.failed,
-      error:     delivery.errors[0] || null,
-      ts:        Date.now(),
-    };
-    lastCandidates.unshift(candidateEntry);
-    if (lastCandidates.length > MAX_LAST_CANDIDATES) lastCandidates.pop();
-
-    // Audit every hunt broadcast so /audit can track missed runners from Hunt Mode.
+    // Audit every candidate that clears the Hunt vol floor, even when Telegram is suppressed.
     recordScan({
       ca,
       symbol:         rawSym,
@@ -292,6 +321,70 @@ async function runScan(job, broadcaster) {
       devLaunches:    result.signals?.totalLaunches,
       source:         'hunt',
     });
+
+    const finalGate = shouldBroadcastHuntResult(result);
+    if (!finalGate.ok) {
+      markSuppressed(ca, result, finalGate.reason);
+      return;
+    }
+
+    // Grok Soul reasoning is additive only; it never flips scanner verdicts.
+    result.soulVerdict = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).catch(err => ({
+      available: false,
+      verdict: null,
+      reasoning: `⚪ OFFLINE — Grok call failed: ${String(err.message).slice(0, 120)}. Scanner verdict only.`,
+    }));
+    result.soulReasoning = result.soulVerdict?.reasoning ?? null;
+
+    result.dataUsed = {
+      dex: !!data.codex,
+      pump: !!data.pump,
+      birdeye: !!data.birdeye,
+      solanaTracker: !!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders',
+      socialData: !!social?.available,
+      helius: data.holders?.source === 'helius',
+      codex: data.holders?.source === 'codex',
+      deFade: !!result.deFadeVerification && result.deFadeVerification.action !== 'SKIPPED',
+      grok: !!result.soulReasoning,
+    };
+
+    const message = formatVerdict(result, ca);
+    const mc     = result.signals?.marketCap || 0;
+    // Escape HTML — token symbols can contain <, >, & which break Telegram HTML parse mode.
+    const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>
+` +
+                   `${actionTimeLine('Detected At', result.scannedAt)}
+` +
+                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>
+` +
+                   `Source: <code>${source}</code>
+
+`;
+
+    stats.broadcastCandidates++;
+    stats.broadcast = stats.broadcastCandidates; // keep legacy alias in sync
+    stats.lastBroadcastCA      = ca;
+    stats.lastBroadcastVerdict = result.verdict;
+    stats.lastBroadcastAt      = Date.now();
+
+    const delivery = await broadcaster(ca, mc, header + message, result.verdict);
+    recentlyBroadcast.set(ca, Date.now());
+
+    const candidateEntry = {
+      ca,
+      symbol,
+      adjustedVolLiq,
+      verdict:   result.verdict,
+      mc,
+      attempted: delivery.attempted,
+      delivered: delivery.delivered,
+      failed:    delivery.failed,
+      error:     delivery.errors[0] || null,
+      ts:        Date.now(),
+    };
+    lastCandidates.unshift(candidateEntry);
+    if (lastCandidates.length > MAX_LAST_CANDIDATES) lastCandidates.pop();
 
     console.log(`[hunt] broadcast ${ca.slice(0,8)} — delivered:${delivery.delivered} failed:${delivery.failed}${delivery.errors[0] ? ` err:${delivery.errors[0]}` : ''}`);
   } catch (e) {
@@ -684,7 +777,15 @@ function stopDexFallback() {
 
 function status() {
   const staleWs = connectedAt !== null && wsIsStale();
+  const apiStats = getApiStats();
   return {
+    alertMode: config.HUNT_ALERT_MODE || 'strict',
+    allowedVerdicts: getAllowedHuntVerdicts(),
+    socialDataKeyConfigured: !!process.env.SOCIALDATA_API_KEY,
+    socialDataCalls: apiStats.SocialData?.calls ?? 0,
+    grokKeyConfigured: !!process.env.XAI_API_KEY,
+    grokCalls: apiStats.Grok?.calls ?? 0,
+    grokFails: apiStats.Grok?.fail ?? 0,
     connected:  connectedAt !== null,
     staleWs,
     uptimeMs:   connectedAt ? Date.now() - connectedAt : 0,
@@ -828,4 +929,4 @@ async function testBroadcast(chatId) {
   }
 }
 
-module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect, pingFallback, testBroadcast };
+module.exports = { start, stop, addHunter, removeHunter, hunterCount, isHunter, status, listHunters, forceReconnect, pingFallback, testBroadcast, shouldBroadcastHuntResult, getAllowedHuntVerdicts };
