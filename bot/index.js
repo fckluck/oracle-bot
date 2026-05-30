@@ -7,7 +7,7 @@ const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
 const config    = require('./config');
 const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
-const { recordScan, startAuditLoop, getAuditReport } = require('./audit');
+const { recordScan, startAuditLoop, getAuditReport, getPatternMemory } = require('./audit');
 
 function ensureDataDir() {
   const dataDir = process.env.DATA_DIR || '/data';
@@ -427,7 +427,7 @@ bot.on('text', async ctx => {
       result.verdict === 'BUY'
         ? fetchDeFadeVerification(ca, { lp: result.signals?.lp })
         : Promise.resolve(null),
-      getSoulVerdict(result, data).then(soul => {
+      getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).then(soul => {
         result.soulVerdict = soul;
         result.soulReasoning = soul?.reasoning ?? null;
       }),

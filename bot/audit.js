@@ -19,6 +19,8 @@ let auditHistory = [];
 let updateTimer = null;
 
 function normalizeRecord(rec) {
+  const outcome = rec.outcome ?? 'UNRESOLVED';
+
   return {
     ca: rec.ca,
     ticker: rec.ticker ?? rec.symbol ?? '???',
@@ -37,8 +39,11 @@ function normalizeRecord(rec) {
     successRatePct: rec.successRatePct ?? null,
     devLaunches: rec.devLaunches ?? null,
     source: rec.source ?? null,
-    resolved: rec.resolved ?? rec.outcome !== 'UNRESOLVED',
-    outcome: rec.outcome ?? 'UNRESOLVED',
+
+    // v37.1 fix:
+    // If legacy records lack outcome, treat them as unresolved instead of resolved.
+    resolved: rec.resolved ?? outcome !== 'UNRESOLVED',
+    outcome,
   };
 }
 
@@ -79,7 +84,11 @@ function saveAudit() {
 
 function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
   if (!ca || !verdict) return;
-  if (['SKIP', 'NO_GO', 'AVOID'].includes(verdict)) return;
+
+  // v37.1:
+  // Record ALL scanner outcomes, including SKIP / NO_GO / AVOID.
+  // The whole point of Audit Memory is learning from hard misses.
+  // We still only alert later when a rejected/downgraded token proves itself by running.
   loadAudit();
 
   const now = Date.now();
@@ -152,11 +161,21 @@ async function processBatch(bot, fetchMcFn) {
         entry.resolved = true;
         entry.outcome = classify(entry);
         const multiplier = entry.scanMc > 0 ? entry.peakMc / entry.scanMc : null;
-        const wasDowngraded = ['WATCH_VOL', 'RISKY_RUNNER'].includes(entry.verdict);
-        if (wasDowngraded && multiplier != null && multiplier >= 3 && bot && process.env.OWNER_TELEGRAM_ID) {
+        const wasMissedOrDowngraded = [
+          'SKIP',
+          'NO_GO',
+          'AVOID',
+          'WATCH_VOL',
+          'WATCH_WASH',
+          'RISKY_RUNNER',
+        ].includes(entry.verdict);
+
+        if (wasMissedOrDowngraded && multiplier != null && multiplier >= 3 && bot && process.env.OWNER_TELEGRAM_ID) {
           const label = entry.ticker ?? entry.ca.slice(0, 8);
-          const msg = `AUDIT ALERT: Missed ${label} - ${multiplier.toFixed(1)}x from scan (${entry.verdict}). `
-            + `Scan MC: $${(entry.scanMc / 1000).toFixed(1)}K -> Peak: $${(entry.peakMc / 1000).toFixed(1)}K.`;
+          const msg = `🚨 AUDIT ALERT: Missed ${label} — ${multiplier.toFixed(1)}x from scan verdict ${entry.verdict}`
+            + `${entry.entryTier ? ` / ${entry.entryTier}` : ''}. `
+            + `Scan MC: $${(entry.scanMc / 1000).toFixed(1)}K → Peak: $${(entry.peakMc / 1000).toFixed(1)}K. `
+            + `Pattern memory updated.`;
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
         }
         auditHistory.push({ ...entry });
@@ -214,16 +233,24 @@ function getUnresolved() {
 
 function getPatternMemory() {
   loadAudit();
+
   const winners = auditHistory
     .filter(r => r.outcome === 'WINNER' || r.outcome === 'RUNNER')
     .sort((a, b) => b.scanTime - a.scanTime)
-    .slice(0, 5);
+    .slice(0, 8);
+
   const rugs = auditHistory
     .filter(r => r.outcome === 'FLAT_OR_RUG')
     .sort((a, b) => b.scanTime - a.scanTime)
+    .slice(0, 8);
+
+  const missedWinners = winners
+    .filter(r => ['SKIP', 'NO_GO', 'AVOID', 'WATCH_VOL', 'WATCH_WASH', 'RISKY_RUNNER'].includes(r.verdict))
     .slice(0, 5);
-  if (winners.length === 0 && rugs.length === 0) return null;
-  return { winners, rugs };
+
+  if (winners.length === 0 && rugs.length === 0 && missedWinners.length === 0) return null;
+
+  return { winners, rugs, missedWinners };
 }
 
 function updatePeaks(mcMap) {

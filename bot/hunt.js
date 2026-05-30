@@ -24,7 +24,7 @@ const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
 const { scan }             = require('./scanner');
 const { formatVerdict }    = require('./verdict');
 const { getSoulVerdict }   = require('./reasoning');
-const { recordScan }       = require('./audit');
+const { recordScan, getPatternMemory } = require('./audit');
 const config               = require('./config');
 
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
@@ -228,7 +228,7 @@ async function runScan(job, broadcaster) {
     }
 
     // Grok Soul reasoning is additive only; it never flips scanner verdicts.
-    result.soulVerdict = await getSoulVerdict(result, data).catch(() => null);
+    result.soulVerdict = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).catch(() => null);
     result.soulReasoning = result.soulVerdict?.reasoning ?? null;
 
     // Post-scan DeFade verification on BUY candidates only (free-plan quota).
