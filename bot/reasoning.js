@@ -15,25 +15,17 @@ HALL OF SHAME (Rug Signatures):
 - $Bingus: Age >60m, MC <$30K, negative 1H, zero X mentions. Classic stale rug.
 `;
 
-const SYSTEM_PROMPT = `You are the Oracle Soul - a pattern-matching AI, not a security guard.
-Your job is to compare incoming token data to the Hall of Fame imprints and identify
-if this token matches a WINNER or LOSER blueprint.
+const SYSTEM_PROMPT = `You are the Oracle Soul - a pattern-matching risk analyst.
+Your job is to compare incoming token data to prior winner, prior rug/failure, or uncertain patterns.
+You explain risk; you do not override scanner verdicts.
 ${HALL_OF_FAME}
 RULES:
-1. If Dev is Elite AND concentration is 25-45% AND vol is strong, respond with:
-[ BLUEPRINT MATCH: BUY ] - explain which winner it resembles.
-2. If data matches a Rug signature, respond with:
-[ RUG PATTERN: SKIP ] - explain which loser it resembles.
-3. If unclear, respond with:
-[ INCONCLUSIVE ] - one sentence max.
-4. Keep total response under 3 sentences. No bullet points. No hedging.
-5. Never say "I cannot" or "I don't have enough data." Make a call.`;
-
-function isActionable(scanResult = {}) {
-  const actionableVerdicts = ['BUY', 'ELITE_DIP', 'NANO_CAP', 'RISKY_RUNNER', 'WATCH_VOL'];
-  const actionableTiers = ['ELITE_DIP', 'NANO_CAP'];
-  return actionableVerdicts.includes(scanResult.verdict) || actionableTiers.includes(scanResult.entryTier);
-}
+1. If it resembles a prior winner, say [ WINNER PATTERN ] and name the matching imprint.
+2. If it resembles a rug/failure or scanner hard gate, say [ RISK PATTERN ] and explain the danger.
+3. If the scanner hard gate is sybil bundle, wash fail, distribution, top10 fail, or LP fail, explicitly respect that gate.
+4. If unclear, say [ UNCERTAIN PATTERN ] and give the strongest reason.
+5. You may say SOUL OVERRIDE CANDIDATE for human review, but never claim to override hard gates.
+6. Keep total response under 3 sentences. No bullet points. No forced bullishness.`;
 
 function parseSoulVerdict(text) {
   if (!text) return null;
@@ -103,10 +95,6 @@ async function getSoulVerdict(scanResult, tokenData = {}) {
   if (!process.env.XAI_API_KEY) {
     return { available: false, verdict: null, reasoning: null };
   }
-  if (!isActionable(scanResult)) {
-    return { available: false, verdict: null, reasoning: null };
-  }
-
   const { signals = {}, devProfile = {} } = scanResult;
   const patternMemoryBlock = buildPatternMemoryBlock(tokenData.patternMemory ?? scanResult.patternMemory);
   const ticker = tokenData.codex?.symbol || tokenData.pump?.symbol || tokenData.symbol || 'UNKNOWN';
@@ -125,7 +113,8 @@ Token Analysis Request:
 - Is Elite Dev: ${signals.isEliteDev}
 - Bundle Count: ${signals.bundleCount ?? 0}/slot
 - Social mentions (15m): ${scanResult.social?.mentions15m ?? tokenData.social?.mentions15m ?? 'N/A'}
-Does this token match a Winner or Loser blueprint?`;
+- Scanner hard gate/reason: ${scanResult.noGoReason ?? scanResult.watchReason ?? scanResult.headlineType ?? scanResult.momentumStatus ?? 'none'}
+Explain whether this is a prior winner pattern, rug/failure pattern, or uncertain pattern. Respect scanner hard gates.`;
 
   try {
     const data = await postGrok([
