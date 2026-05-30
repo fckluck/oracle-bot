@@ -1,7 +1,9 @@
 require('dotenv').config();
 
 const config = {
-  TELEGRAM_BOT_TOKEN:  process.env.TELEGRAM_BOT_TOKEN  || '',
+  // Accept both names: Railway/live may use TELEGRAM_BOT_TOKEN,
+  // older docs/dev env may use BOT_TOKEN.
+  TELEGRAM_BOT_TOKEN:  process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '',
   GMGN_API_KEY:        process.env.GMGN_API_KEY        || '',
   OWNER_TELEGRAM_ID:   process.env.OWNER_TELEGRAM_ID   || '',
   PUMPPORTAL_API_KEY:  process.env.PUMPPORTAL_API_KEY  || '',
