@@ -43,6 +43,8 @@ function tierName(t) {
     case 'PLUTO':           return 'PLUTO CANDIDATE (12x+ Adjusted)';
     case 'HIGH_CONVICTION': return 'HIGH CONVICTION (8x+ Adjusted)';
     case 'BASELINE_ENTRY':  return 'BUY CANDIDATE (5x+ Adjusted)';
+    case 'ELITE_DIP':       return 'ELITE DIP - BUY THE DIP';
+    case 'NANO_CAP':        return 'NANO-CAP SNIPE (8x+ Adjusted)';
     default:                return '—';
   }
 }
@@ -52,6 +54,8 @@ function tierPositionLabel(entryTier, _positionUnits, slippageWarn) {
     case 'PLUTO':           return '2.0 units';
     case 'HIGH_CONVICTION': return '1.5 units';
     case 'BASELINE_ENTRY':  return '1.0 unit';
+    case 'ELITE_DIP':       return '0.75 unit';
+    case 'NANO_CAP':        return '0.5 unit';
     default:                return '—';
   }
 }
@@ -354,8 +358,10 @@ function formatVerdict(result, ca) {
     holderDisplay = 'UNVERIFIED';
   }
 
-  // v12.0: MC-aware top10 threshold — 35% for sub-$100K, 25% above.
-  const top10Threshold = (mc != null && mc < 100_000) ? 35 : 25;
+  // v37.0: MC-aware top10 display mirrors scanner hard caps.
+  const top10Threshold = (mc != null && mc < 100_000)
+    ? signals.isEliteDev ? 45 : signals.isProPilot ? 42 : 40
+    : 25;
   const top10Display = signals.top10Pct !== null
     ? `${fmtPct(signals.top10Pct)} (${esc(
         signals.top10Pct <= 15               ? 'CLEAN'    :

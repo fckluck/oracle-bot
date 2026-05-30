@@ -23,6 +23,8 @@ function getTimeWindow() {
 // ── Position sizing (v8.4 — adjusted vol/liq based) ──────────────────────────
 
 function getPositionUnits(entryTier, lp, mc) {
+  if (entryTier === 'ELITE_DIP') return 0.75; // 75% - elite dev dip entry
+  if (entryTier === 'NANO_CAP') return 0.5; // Half-size - unverified holder data
   if (entryTier === 'SCRIBBLI') {
     const lpPct = mc > 0 ? (lp / mc) * 100 : 100;
     return lpPct < 15 ? 1.0 : 2.0;
@@ -120,23 +122,22 @@ function scan(data) {
   const migratedCount = stDeployer?.migratedCount ?? devStats?.migratedCount ?? null;
   const timeWindow    = getTimeWindow();
 
-  // Pro Pilot: success rate > 5% AND minimum 10 launches → lower BUY floor to 3x.
-  // Experience floor: devs with <10 launches are UNPROVEN — success rate is
-  // statistically meaningless and the 3x buffer must not activate for them.
+  // v37.0: Pro Pilot requires 15+ launches for statistical significance.
   const successRatePct   = (devLaunches != null && devLaunches > 0 && migratedCount != null)
     ? (migratedCount / devLaunches) * 100 : null;
-  const isUnproven       = devLaunches != null && devLaunches < 10;
-  // Age Decay: elite/pro volume buffers are meaningless on stale tokens.
-  // A token >60 min old AND still below $50K MC is either abandoned or
-  // slow-bleeding. Strip elite exemptions so the RISKY_RUNNER $100K cap,
-  // DISTRIBUTION→WATCH_VOL override, and top10HardMax 50% don't protect
-  // what is effectively a dead token on a manual /scan.
-  const isStaleElite     = ageMins !== null && ageMins > 60 && mc !== null && mc < 50_000;
+  const isUnproven       = devLaunches != null && devLaunches < 15;
+  // v37.0: stale threshold is $100K MC and requires negative 1H change.
+  // Flat/stable tokens keep elite/pro exemptions.
+  const isStaleElite     = ageMins !== null && ageMins > 60
+    && mc !== null && mc < 100_000
+    && (codex?.change1h ?? 0) < 0;
   const isProPilot       = !isStaleElite && successRatePct != null && successRatePct > 5  && !isUnproven;
-  // Elite threshold: >10% success rate AND >15 launches.
-  // >15 launches ensures statistical significance (a 20% rate on 5 launches is luck,
-  // not skill). isUnproven check is implicit — >15 launches always passes !isUnproven.
-  const isEliteDev       = !isStaleElite && successRatePct != null && successRatePct > 10 && devLaunches != null && devLaunches > 15;
+  // v37.0: Elite = >10% success rate OR previous peak >15x.
+  const peakMultiplier   = stDeployer?.topPerformerMultiplier ?? devPeak?.topPerformerMultiplier ?? null;
+  const isEliteDev       = !isStaleElite && devLaunches != null && devLaunches > 15 && (
+    (successRatePct != null && successRatePct > 10) ||
+    (peakMultiplier != null && peakMultiplier >= 15)
+  );
   const isSerialDeployer = devLaunches !== null && devLaunches > 500;
 
   const holderCount     = holders?.holderCount     ?? null;
@@ -144,16 +145,10 @@ function scan(data) {
   const top10Pct        = holders?.top10Pct        ?? null;
   const holderSource    = holders?.source          ?? null;
 
-  // v12.0/v13.0: dynamic top10 cap based on MC and dev track record.
-  // sub-$100K + elite/pro dev (proven track record) → 40% (elite devs often
-  //   front-run liquidity; concentration distributes post-launch naturally).
-  // sub-$100K + unknown dev → 35% (early concentration is still normal).
-  // $100K+ → flat 25% (established token, no excuse for high concentration).
-  // Elite devs (>10% success, >15 launches) often self-bundle to protect the floor.
-  // 50% cap allows their typical 40-50% concentration without a false NO-GO.
-  // Pro devs: 40%. Unknown devs sub-$100K: 35%. Post-$100K any dev: 25%.
+  // v37.0: controlled-floor calibration.
+  // Elite: 45%. Pro Pilot: 42%. Unknown sub-$100K: 40%. Post-$100K: 25%.
   const top10HardMax = (mc != null && mc < 100_000)
-    ? isEliteDev ? 50 : isProPilot ? 40 : 35
+    ? isEliteDev ? 45 : isProPilot ? 42 : 40
     : 25;
 
   const ctoDesc        = detectCtoFromDesc(pump);
@@ -231,7 +226,8 @@ function scan(data) {
   // Real retail demand ALWAYS leaves tweets. High vol + silence = bot-wash trap.
   // Only fires when social data is confirmed available (available=true) to avoid
   // false-positives from API failures on genuine tokens.
-  else if (adjustedVolLiq > 8 && social?.available === true && (social?.mentions15m ?? 0) < 5) {
+  else if (adjustedVolLiq > 8 && social?.available === true
+    && typeof social?.mentions15m === 'number' && social.mentions15m < 5) {
     noGoReason   = `WASH TRADE — ${adjustedVolLiq.toFixed(1)}x vol, <5 social mentions (bot-wash signature)`;
     headlineType = 'WASH';
   }
@@ -323,7 +319,7 @@ function scan(data) {
     momentumStatus === 'TOP_QUARTER' &&
     (top10Pct === null || top10Pct < top10HardMax) && // v12.0: MC-aware cap (35% sub-$100K)
     (washPct === null || washPct < 20) &&
-    bundleCount <= 7 &&
+    bundleCount <= 10 &&
     !sybilFunded &&
     (holderHealthData?.healthPct == null ||
       (holderHealthData.healthPct >= 50 && holderHealthData.healthPct <= 200)) &&
@@ -335,14 +331,14 @@ function scan(data) {
   if (noGoReason) {
     verdict = 'NO_GO';
   } else if (momentumStatus === 'VOLUMETRIC_DISTRIBUTION') {
-    // Elite devs: a -5% to -20% 5m candle during high organic vol is a
-    // buy-the-dip, not a dump. $ชั้ง autopsy: -16.96% 5m dip at 9x organic vol
-    // + elite dev = optimal entry. Hard AVOID silenced the hunt alert entirely.
-    // Soften to WATCH_VOL so the alert still fires and the user decides.
-    // Unknown devs keep strict AVOID — no proven track record to justify leniency.
-    if (isEliteDev) {
+    // v37.0: Elite + 8x vol + distribution dip = BUY THE DIP signal.
+    // 75% position size - dip confirmation reduces conviction slightly.
+    if (isEliteDev && adjustedVolLiq >= 8) {
+      entryTier = 'ELITE_DIP';
+      verdict   = 'BUY';
+    } else if (isEliteDev) {
       verdict     = 'WATCH_VOL';
-      watchReason = `ELITE DIP — ${birdeye?.priceChange5m != null ? Math.abs(birdeye.priceChange5m).toFixed(1) + '%' : 'unknown'} 5m drop on ${adjustedVolLiq.toFixed(1)}x organic vol. Elite dev (${successRatePct?.toFixed(1) ?? '?'}% success rate) — dip may be snipers exiting, not dev dump. Confirm LP holding before entry.`;
+      watchReason = `ELITE DIP — ${birdeye?.priceChange5m != null ? Math.abs(birdeye.priceChange5m).toFixed(1) + '%' : 'unknown'} 5m drop on ${adjustedVolLiq.toFixed(1)}x organic vol. Elite dev — but vol below 8x threshold. Confirm LP holding before entry.`;
     } else {
       verdict = 'AVOID';
     }
@@ -371,6 +367,10 @@ function scan(data) {
     // "Oracle called this rug a BUY" complaints in v10.2.6.
     verdict      = 'WATCH_VOL';
     watchReason  = `PLUTO threshold met (${adjustedVolLiq.toFixed(1)}x) but safety failed — top10/momentum/wash/bundle/holder/dev. WATCH only.`;
+  } else if (mc != null && mc < 35_000 && adjustedVolLiq >= 8 && !noGoReason) {
+    // v37.0 Nano-Cap Bridge: sub-$35K MC + 8x organic vol means volume is
+    // the primary verification signal. Half-size entry, exit by TP1.
+    entryTier    = 'NANO_CAP'; verdict = 'BUY';
   } else if (adjustedVolLiq >= 8) {
     entryTier    = 'HIGH_CONVICTION'; verdict = 'BUY';
   } else if (adjustedVolLiq >= 5) {
@@ -451,7 +451,7 @@ function scan(data) {
     (lp === 0 && mc < 100_000 && adjustedVolLiq >= 4) ||
     (lp > 0  && (isEliteDev ? mc < 100_000 : mc < 40_000) && adjustedVolLiq >= 8)
   );
-  if (verdict === 'BUY' && riskyRunnerTrip) {
+  if (verdict === 'BUY' && entryTier !== 'ELITE_DIP' && entryTier !== 'NANO_CAP' && riskyRunnerTrip) {
     verdict           = 'RISKY_RUNNER';
     riskyRunnerReason = 'DATA_PENDING_HIGH_VOL';
     entryTier         = null;
@@ -461,7 +461,9 @@ function scan(data) {
   // Even if some future change (a new override block, a refactor) re-introduces
   // a path that lets BUY slip past Spine Lock, these invariants force the
   // verdict back to WATCH_VOL. Treat any trip here as a bug.
-  if (verdict === 'BUY') {
+  // v37.0: ELITE_DIP and NANO_CAP intentionally bypass selected standard
+  // safety checks, while still respecting hard NO_GO gates above.
+  if (verdict === 'BUY' && entryTier !== 'ELITE_DIP' && entryTier !== 'NANO_CAP') {
     let invariantFail = null;
     if (top10Pct !== null && top10Pct > top10HardMax)        invariantFail = `INVARIANT: top10 ${top10Pct.toFixed(1)}% > ${top10HardMax}`;
     else if (momentumStatus === 'LOWER_RANGE')               invariantFail = `INVARIANT: momentum LOWER_RANGE`;
@@ -527,7 +529,8 @@ function scan(data) {
       bundleCount, isMeteora, deFadeScore, isDeFadeClean, sybilFunded,
       holderHealth:   holderHealthData,
       isPostCurve:    pump?.migrated === true || (pump == null && codex != null),
-      isProPilot, isEliteDev, isUnproven, isSerialDeployer, successRatePct, riskyRunnerReason,
+      isProPilot, isEliteDev, isUnproven, isSerialDeployer,
+      totalLaunches: devLaunches, successRatePct, peakMultiplier, riskyRunnerReason,
       proPilotBuffer: isProPilot && adjustedVolLiq >= 3 && adjustedVolLiq < 5,
     },
   };

@@ -1,174 +1,250 @@
 'use strict';
-// ── Oracle Audit Engine ───────────────────────────────────────────────────────
-// Tracks every scan lifecycle: verdict at scan time, peak MC observed over the
-// next 72 h, and final outcome classification.
-// Used by: /audit command, Grok pattern memory, background peak loop.
+// Oracle Audit Engine v37.0
+// Batch-updates actionable scans from /data/audit.json. Queue is capped to avoid
+// the unbounded drain problem from earlier designs.
 
 const fs   = require('fs');
 const path = require('path');
 
-const DATA_DIR        = process.env.DATA_DIR || '/data';
-const AUDIT_FILE      = path.join(DATA_DIR, 'audit.json');
-const MAX_RECORDS     = 1000;
-const MAX_AGE_MS      = 7  * 24 * 60 * 60 * 1000;  // 7 days
-const PEAK_WINDOW_MS  = 72 *      60 * 60 * 1000;  // 72 h observation window
+const DATA_DIR      = process.env.DATA_DIR || '/data';
+const AUDIT_FILE    = path.join(DATA_DIR, 'audit.json');
+const MAX_ENTRIES   = 50;
+const HISTORY_LIMIT = 200;
+const BATCH_SIZE    = 5;
+const CYCLE_MS      = 30_000;
+const RESOLVE_MS    = 6 * 60 * 60 * 1000;
 
-// ── Persistence ───────────────────────────────────────────────────────────────
+let auditQueue = [];
+let auditHistory = [];
+let updateTimer = null;
 
-function load() {
-  try {
-    if (!fs.existsSync(AUDIT_FILE)) return [];
-    return JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf8'));
-  } catch { return []; }
+function normalizeRecord(rec) {
+  return {
+    ca: rec.ca,
+    ticker: rec.ticker ?? rec.symbol ?? '???',
+    symbol: rec.symbol ?? rec.ticker ?? '???',
+    verdict: rec.verdict,
+    entryTier: rec.entryTier ?? null,
+    scanMc: rec.scanMc ?? rec.mc ?? null,
+    peakMc: rec.peakMc ?? rec.scanMc ?? rec.mc ?? null,
+    scannedAt: rec.scannedAt ?? rec.scanTime ?? Date.now(),
+    scanTime: rec.scanTime ?? rec.scannedAt ?? Date.now(),
+    lastChecked: rec.lastChecked ?? 0,
+    adjustedVolLiq: rec.adjustedVolLiq ?? null,
+    top10Pct: rec.top10Pct ?? null,
+    washPct: rec.washPct ?? null,
+    isEliteDev: rec.isEliteDev ?? false,
+    successRatePct: rec.successRatePct ?? null,
+    devLaunches: rec.devLaunches ?? null,
+    source: rec.source ?? null,
+    resolved: rec.resolved ?? rec.outcome !== 'UNRESOLVED',
+    outcome: rec.outcome ?? 'UNRESOLVED',
+  };
 }
 
-function save(records) {
+function loadAudit() {
+  try {
+    if (!fs.existsSync(AUDIT_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf8'));
+    if (Array.isArray(raw)) {
+      const records = raw.map(normalizeRecord);
+      auditHistory = records.filter(r => r.outcome !== 'UNRESOLVED').slice(-HISTORY_LIMIT);
+      auditQueue = records.filter(r => r.outcome === 'UNRESOLVED').slice(-MAX_ENTRIES);
+      return;
+    }
+    auditHistory = Array.isArray(raw.history) ? raw.history.map(normalizeRecord).slice(-HISTORY_LIMIT) : [];
+    auditQueue = Array.isArray(raw.queue) ? raw.queue.map(normalizeRecord).slice(-MAX_ENTRIES) : [];
+  } catch (e) {
+    console.warn('[audit] Failed to load audit file:', e.message);
+    auditHistory = [];
+    auditQueue = [];
+  }
+}
+
+function saveAudit() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
+    const payload = {
+      history: auditHistory.slice(-HISTORY_LIMIT),
+      queue: auditQueue.slice(-MAX_ENTRIES),
+      updatedAt: new Date().toISOString(),
+    };
     const tmp = AUDIT_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(records), 'utf8');
-    fs.renameSync(tmp, AUDIT_FILE); // atomic write
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2));
+    fs.renameSync(tmp, AUDIT_FILE);
   } catch (e) {
-    console.error('[audit] save failed:', e.message);
+    console.warn('[audit] Failed to save audit file:', e.message);
   }
 }
 
-function prune(records) {
-  const cutoff = Date.now() - MAX_AGE_MS;
-  return records.filter(r => r.scannedAt > cutoff).slice(-MAX_RECORDS);
+function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
+  if (!ca || !verdict) return;
+  if (['SKIP', 'NO_GO', 'AVOID'].includes(verdict)) return;
+  loadAudit();
+
+  const now = Date.now();
+  const dupeWindowMs = 5 * 60 * 1000;
+  if (auditQueue.some(e => e.ca === ca && now - e.scanTime < dupeWindowMs)) return;
+
+  if (auditQueue.length >= MAX_ENTRIES) auditQueue.shift();
+  auditQueue.push(normalizeRecord({
+    ca,
+    ticker,
+    symbol: ticker,
+    verdict,
+    entryTier,
+    scanMc: scanMc ?? null,
+    peakMc: scanMc ?? null,
+    scannedAt: now,
+    scanTime: now,
+    lastChecked: 0,
+    adjustedVolLiq: extra.adjustedVolLiq,
+    top10Pct: extra.top10Pct,
+    washPct: extra.washPct,
+    isEliteDev: extra.isEliteDev,
+    successRatePct: extra.successRatePct,
+    devLaunches: extra.devLaunches,
+    source: extra.source,
+    resolved: false,
+    outcome: 'UNRESOLVED',
+  }));
+  saveAudit();
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
-
-/**
- * Record a completed scan. De-duplicates within 5 min for the same CA
- * (e.g. rapid /scan re-tries or hunt re-broadcasts of the same token).
- */
 function recordScan({
-  ca, symbol, verdict, mc, adjustedVolLiq, top10Pct, washPct,
+  ca, symbol, verdict, entryTier, mc, adjustedVolLiq, top10Pct, washPct,
   isEliteDev, successRatePct, devLaunches, source,
 }) {
-  if (!ca || !verdict) return;
-  const records = prune(load());
-  const fiveMin = 5 * 60 * 1000;
-  const dupe = records.find(r => r.ca === ca && Date.now() - r.scannedAt < fiveMin);
-  if (dupe) return;
-
-  records.push({
-    ca,
-    symbol:         symbol         ?? '???',
-    scannedAt:      Date.now(),
-    scanMc:         mc             ?? null,
-    verdict,
-    adjustedVolLiq: adjustedVolLiq ?? null,
-    top10Pct:       top10Pct       ?? null,
-    washPct:        washPct        ?? null,
-    isEliteDev:     isEliteDev     ?? false,
-    successRatePct: successRatePct ?? null,
-    devLaunches:    devLaunches    ?? null,
-    source,   // 'scan' | 'hunt' | 'watchlist'
-    peakMc:         null,
-    peakObservedAt: null,
-    // UNRESOLVED → WINNER_10X | WINNER_3X | LOSER_50 | RUG | EXPIRED
-    outcome: 'UNRESOLVED',
+  addToAudit(ca, symbol, verdict, entryTier, mc, {
+    adjustedVolLiq, top10Pct, washPct, isEliteDev, successRatePct, devLaunches, source,
   });
-  save(records);
 }
 
-/**
- * Classify a token's outcome from its peak and current MC vs scan MC.
- * We finalise once we see a definitive peak (10x/3x winners) or a
- * definitive bottom (rug / loser). Unresolved tokens that fall outside
- * the 72 h window are marked EXPIRED on the next updatePeaks call.
- */
-function classify(scanMc, peakMc) {
-  if (scanMc == null || peakMc == null) return 'UNRESOLVED';
-  const ratio = peakMc / scanMc;
-  if (ratio >= 10) return 'WINNER_10X';
-  if (ratio >= 3)  return 'WINNER_3X';
-  return 'UNRESOLVED';
+async function resolveMc(fetchMcFn, ca) {
+  const result = await fetchMcFn(ca);
+  if (typeof result === 'number') return result;
+  return result?.mc ?? null;
 }
 
-function classifyBottom(scanMc, currentMc) {
-  if (scanMc == null || currentMc == null) return 'UNRESOLVED';
-  const ratio = currentMc / scanMc;
-  if (ratio <= 0.2) return 'RUG';
-  if (ratio <= 0.5) return 'LOSER_50';
-  return 'UNRESOLVED';
+function classify(entry) {
+  if (!(entry.scanMc > 0) || !(entry.peakMc > 0)) return 'UNKNOWN';
+  const multiplier = entry.peakMc / entry.scanMc;
+  if (multiplier >= 3) return 'WINNER';
+  if (multiplier >= 1.5) return 'RUNNER';
+  return 'FLAT_OR_RUG';
 }
 
-/**
- * Called by the background loop (every 60 min in index.js).
- * mcMap: { [ca]: currentMc } — only CAs that were successfully fetched.
- */
-function updatePeaks(mcMap) {
-  const records = prune(load());
-  const now     = Date.now();
-  let changed   = false;
+async function processBatch(bot, fetchMcFn) {
+  const pending = auditQueue
+    .filter(e => !e.resolved)
+    .sort((a, b) => (a.lastChecked || 0) - (b.lastChecked || 0))
+    .slice(0, BATCH_SIZE);
+  if (pending.length === 0) return;
 
-  for (const rec of records) {
-    if (rec.outcome !== 'UNRESOLVED') continue;
+  for (const entry of pending) {
+    try {
+      const currentMc = await resolveMc(fetchMcFn, entry.ca);
+      entry.lastChecked = Date.now();
+      if (currentMc == null) continue;
+      if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
 
-    // Expire records older than the 72-h observation window
-    if (now - rec.scannedAt > PEAK_WINDOW_MS) {
-      rec.outcome = 'EXPIRED';
-      changed = true;
-      continue;
-    }
-
-    const currentMc = mcMap[rec.ca] ?? null;
-    if (currentMc == null) continue;
-
-    // Update rolling peak
-    if (rec.peakMc == null || currentMc > rec.peakMc) {
-      rec.peakMc        = currentMc;
-      rec.peakObservedAt = now;
-      changed = true;
-    }
-
-    // Check for winner (based on all-time peak) or loser (based on current)
-    const winOutcome = classify(rec.scanMc, rec.peakMc);
-    if (winOutcome !== 'UNRESOLVED') {
-      rec.outcome = winOutcome;
-      changed = true;
-      continue;
-    }
-    const loseOutcome = classifyBottom(rec.scanMc, currentMc);
-    if (loseOutcome !== 'UNRESOLVED') {
-      rec.outcome = loseOutcome;
-      changed = true;
+      if (Date.now() - entry.scanTime >= RESOLVE_MS) {
+        entry.resolved = true;
+        entry.outcome = classify(entry);
+        const multiplier = entry.scanMc > 0 ? entry.peakMc / entry.scanMc : null;
+        const wasDowngraded = ['WATCH_VOL', 'RISKY_RUNNER'].includes(entry.verdict);
+        if (wasDowngraded && multiplier != null && multiplier >= 3 && bot && process.env.OWNER_TELEGRAM_ID) {
+          const label = entry.ticker ?? entry.ca.slice(0, 8);
+          const msg = `AUDIT ALERT: Missed ${label} - ${multiplier.toFixed(1)}x from scan (${entry.verdict}). `
+            + `Scan MC: $${(entry.scanMc / 1000).toFixed(1)}K -> Peak: $${(entry.peakMc / 1000).toFixed(1)}K.`;
+          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
+        }
+        auditHistory.push({ ...entry });
+      }
+    } catch (e) {
+      console.warn(`[audit] update failed for ${entry.ca?.slice(0, 8) ?? 'unknown'}:`, e.message);
     }
   }
 
-  if (changed) save(records);
+  auditQueue = auditQueue.filter(e => !e.resolved).slice(-MAX_ENTRIES);
+  auditHistory = auditHistory.slice(-HISTORY_LIMIT);
+  saveAudit();
 }
 
-/** All audit records (newest first after sort by caller). */
+function startAuditLoop(bot, fetchMcFn) {
+  if (typeof fetchMcFn !== 'function') {
+    console.warn('[audit] startAuditLoop skipped: fetchMcFn missing');
+    return;
+  }
+  loadAudit();
+  if (updateTimer) clearInterval(updateTimer);
+  updateTimer = setInterval(() => {
+    processBatch(bot, fetchMcFn).catch(e => console.warn('[audit] batch error:', e.message));
+  }, CYCLE_MS);
+  console.log(`[audit] v37 loop started - ${BATCH_SIZE} CA(s) every ${CYCLE_MS / 1000}s, queue cap ${MAX_ENTRIES}`);
+}
+
+function stopAuditLoop() {
+  if (updateTimer) clearInterval(updateTimer);
+  updateTimer = null;
+}
+
+function getAuditReport() {
+  loadAudit();
+  const recent = [...auditHistory].slice(-10).reverse();
+  if (recent.length === 0) {
+    return `AUDIT - No resolved entries yet.\n${auditQueue.length} pending in queue.`;
+  }
+  const lines = recent.map(e => {
+    const mult = e.scanMc > 0 && e.peakMc > 0 ? `${(e.peakMc / e.scanMc).toFixed(1)}x` : '?x';
+    return `${e.outcome} ${e.ticker ?? e.ca.slice(0, 8)} | Scan: $${(e.scanMc / 1000).toFixed(1)}K -> Peak: $${(e.peakMc / 1000).toFixed(1)}K (${mult}) | ${e.verdict}`;
+  });
+  return `AUDIT - Last 10 Resolved\n\n${lines.join('\n')}\n\n${auditQueue.length} pending in queue`;
+}
+
 function getAll() {
-  return prune(load());
+  loadAudit();
+  return [...auditHistory, ...auditQueue].map(normalizeRecord);
 }
 
-/** Unresolved records still within the 72-h observation window. */
 function getUnresolved() {
-  const cutoff = Date.now() - PEAK_WINDOW_MS;
-  return getAll().filter(r => r.outcome === 'UNRESOLVED' && r.scannedAt > cutoff);
+  loadAudit();
+  return auditQueue.filter(e => !e.resolved);
 }
 
-/**
- * Returns the last 5 winners and last 5 rugs for Grok's pattern memory block.
- * Returns null when there is no resolved history yet (avoids polluting the prompt).
- */
 function getPatternMemory() {
-  const records  = getAll();
-  const resolved = records.filter(r => r.outcome !== 'UNRESOLVED' && r.outcome !== 'EXPIRED');
-  const winners  = resolved
-    .filter(r => r.outcome === 'WINNER_10X' || r.outcome === 'WINNER_3X')
-    .sort((a, b) => b.scannedAt - a.scannedAt).slice(0, 5);
-  const rugs = resolved
-    .filter(r => r.outcome === 'RUG')
-    .sort((a, b) => b.scannedAt - a.scannedAt).slice(0, 5);
+  loadAudit();
+  const winners = auditHistory
+    .filter(r => r.outcome === 'WINNER' || r.outcome === 'RUNNER')
+    .sort((a, b) => b.scanTime - a.scanTime)
+    .slice(0, 5);
+  const rugs = auditHistory
+    .filter(r => r.outcome === 'FLAT_OR_RUG')
+    .sort((a, b) => b.scanTime - a.scanTime)
+    .slice(0, 5);
   if (winners.length === 0 && rugs.length === 0) return null;
   return { winners, rugs };
 }
 
-module.exports = { recordScan, updatePeaks, getAll, getUnresolved, getPatternMemory };
+function updatePeaks(mcMap) {
+  loadAudit();
+  for (const entry of auditQueue) {
+    const mc = mcMap?.[entry.ca];
+    if (mc != null && (entry.peakMc == null || mc > entry.peakMc)) entry.peakMc = mc;
+    entry.lastChecked = Date.now();
+  }
+  saveAudit();
+}
+
+module.exports = {
+  addToAudit,
+  recordScan,
+  startAuditLoop,
+  stopAuditLoop,
+  getAuditReport,
+  loadAudit,
+  updatePeaks,
+  getAll,
+  getUnresolved,
+  getPatternMemory,
+};
