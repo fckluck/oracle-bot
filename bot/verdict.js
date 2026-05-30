@@ -305,11 +305,14 @@ function formatVerdict(result, ca) {
     const migrated = dp.migratedCount ?? 0;
     const pct = (migrated / dp.totalLaunches) * 100;
     const pctDisp = pct < 1 ? pct.toFixed(1) : Math.round(pct).toString();
-    // v10.2.8: pump.fun network migration rate ~1.5% — tier labels reflect reality
-    const flag = pct < 0.5  ? ' 🔴 ZERO SURVIVAL'
-               : pct < 5    ? ' 🟡 NETWORK AVERAGE'
-               : pct < 15   ? ' 🟢 PRO PILOT'
-               :               ' 💎 ELITE DEPLOYER';
+    // v37.2: sample size must gate trust labels. A 1/2 or 2/5 deployer can show
+    // a huge percentage by luck; scanner treats <15 launches as unproven too.
+    const flag = dp.totalLaunches < 5  ? ' ⚪ TOO SMALL SAMPLE'
+               : dp.totalLaunches < 15 ? ' 🟡 UNPROVEN SAMPLE'
+               : pct < 0.5             ? ' 🔴 ZERO SURVIVAL'
+               : pct < 5               ? ' 🟡 NETWORK AVERAGE'
+               : pct < 15              ? ' 🟢 PRO PILOT'
+               :                          ' 💎 ELITE DEPLOYER';
     successRate = `${migrated}/${dp.totalLaunches} (${pctDisp}%)${flag}`;
   } else if (dp.totalLaunches != null) {
     successRate = `0/${dp.totalLaunches} tokens (0%) 🔴 SERIAL RUGGER`;
