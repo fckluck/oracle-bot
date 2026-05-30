@@ -1,122 +1,159 @@
 const fetch = require('node-fetch');
 
 const XAI_API_URL = 'https://api.x.ai/v1/chat/completions';
-const TIMEOUT_MS  = 15_000;   // grok-3 p95 latency ~3-8s; 15s gives plenty of headroom
+const TIMEOUT_MS  = 15_000;
 
-// Build a compact pattern memory block from audit history.
-// Injected into the Grok prompt so it can reference real past trades.
-// Hard limit: winners + rugs only (no overrides possible — safety gates remain).
-function buildPatternBlock(patternMemory) {
-  if (!patternMemory) return '';
-  const { winners = [], rugs = [] } = patternMemory;
-  if (winners.length === 0 && rugs.length === 0) return '';
-  const fmt = r =>
-    `$${r.symbol}(MC:${r.scanMc != null ? (r.scanMc / 1000).toFixed(0) + 'K' : '?'}` +
-    ` Vol:${r.adjustedVolLiq != null ? r.adjustedVolLiq.toFixed(1) + 'x' : '?'}` +
-    ` Top10:${r.top10Pct != null ? r.top10Pct.toFixed(0) + '%' : '?'}` +
-    ` ${r.outcome})`;
-  const parts = [];
-  if (winners.length) parts.push(`WINNERS:${winners.map(fmt).join('|')}`);
-  if (rugs.length)    parts.push(`RUGS:${rugs.map(fmt).join('|')}`);
-  return `ORACLE PATTERN MEMORY (past resolved trades — reference only, cannot override safety gates): ${parts.join('. ')}. `;
+const HALL_OF_FAME = `
+WINNERS (Blueprint Signatures):
+- $!ng: Elite Dev, 36% Top10, 9x organic vol -> $2M ATH. Key: high concentration + elite profile.
+- $SOREN: Elite Dev, 34% Top10, 14x vol -> $650K ATH. Key: same controlled-floor pattern.
+- $ballish: Elite Dev, 31% Top10, 15x vol -> $313K ATH. Key: trust the blueprint.
+- $SPEED: $19K MC, 12x organic vol, unverified holders -> $230K ATH. Key: nano-cap vol was the signal.
+- $GRAIL: Elite dev, high vol, managed concentration -> runner confirmed.
+HALL OF SHAME (Rug Signatures):
+- $MANNY: Inflated holders (>250% health), looked organic, was botted.
+- $Bingus: Age >60m, MC <$30K, negative 1H, zero X mentions. Classic stale rug.
+`;
+
+const SYSTEM_PROMPT = `You are the Oracle Soul - a pattern-matching AI, not a security guard.
+Your job is to compare incoming token data to the Hall of Fame imprints and identify
+if this token matches a WINNER or LOSER blueprint.
+${HALL_OF_FAME}
+RULES:
+1. If Dev is Elite AND concentration is 25-45% AND vol is strong, respond with:
+[ BLUEPRINT MATCH: BUY ] - explain which winner it resembles.
+2. If data matches a Rug signature, respond with:
+[ RUG PATTERN: SKIP ] - explain which loser it resembles.
+3. If unclear, respond with:
+[ INCONCLUSIVE ] - one sentence max.
+4. Keep total response under 3 sentences. No bullet points. No hedging.
+5. Never say "I cannot" or "I don't have enough data." Make a call.`;
+
+function isActionable(scanResult = {}) {
+  const actionableVerdicts = ['BUY', 'ELITE_DIP', 'NANO_CAP', 'RISKY_RUNNER', 'WATCH_VOL'];
+  const actionableTiers = ['ELITE_DIP', 'NANO_CAP'];
+  return actionableVerdicts.includes(scanResult.verdict) || actionableTiers.includes(scanResult.entryTier);
 }
 
-async function getSoulReasoning({ ticker, adjustedVolLiq, top10Pct, successRatePct, socialMentions, marketCap, verdict, isEliteDev, patternMemory } = {}) {
+function parseSoulVerdict(text) {
+  if (!text) return null;
+  if (text.includes('BLUEPRINT MATCH: BUY')) return 'BUY';
+  if (text.includes('RUG PATTERN: SKIP')) return 'SKIP';
+  if (text.includes('INCONCLUSIVE')) return 'INCONCLUSIVE';
+  return null;
+}
+
+async function postGrok(messages, maxTokens = 150, temperature = 0.3) {
   const key = process.env.XAI_API_KEY;
   if (!key) return null;
+  const model = process.env.XAI_MODEL || 'grok-2-mini';
+  const res = await fetch(XAI_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+    }),
+    timeout: TIMEOUT_MS,
+  });
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 300);
+    throw new Error(`xAI HTTP ${res.status}: ${body}`);
+  }
+  return res.json();
+}
 
-  // grok-3 (non-reasoning) — fast, OpenAI-compatible, ideal for short structured responses.
-  // grok-3-mini is a reasoning model that can take 20-30s and adds <think> overhead for 25-word outputs.
-  const model  = process.env.XAI_MODEL || 'grok-3';
-  const mcK    = marketCap       != null ? `$${(marketCap / 1000).toFixed(0)}K`  : 'unknown';
-  const volLiq = adjustedVolLiq  != null ? `${adjustedVolLiq.toFixed(1)}x`        : 'N/A';
-  const top10  = top10Pct        != null ? `${top10Pct.toFixed(1)}%`              : 'N/A';
-  const devRt  = successRatePct  != null ? `${successRatePct.toFixed(1)}%`        : 'unknown';
-  const social = socialMentions  != null ? String(socialMentions)                 : 'none';
+async function getSoulVerdict(scanResult, tokenData = {}) {
+  if (!process.env.XAI_API_KEY) {
+    return { available: false, verdict: null, reasoning: null };
+  }
+  if (!isActionable(scanResult)) {
+    return { available: false, verdict: null, reasoning: null };
+  }
 
-  const eliteCtx = isEliteDev
-    ? `This developer is 💎 ELITE (${devRt} migration success rate) — they commonly self-bundle to protect the floor. ` +
-      `Evaluate whether concentration is protective floor control or genuine rug risk. `
-    : '';
-  const patternCtx = buildPatternBlock(patternMemory);
-  const prompt =
-    `You are Oracle Bot's Soul — a Solana memecoin analyst. ` +
-    `Respond in exactly ONE sentence, max 25 words, no preamble or labels. ` +
-    `Token: $${ticker ?? 'UNKNOWN'} | MC: ${mcK} | Adj Vol/Liq: ${volLiq} | ` +
-    `Top10: ${top10} | Dev success rate: ${devRt} | Social mentions (15m): ${social} | Verdict: ${verdict ?? 'N/A'}. ` +
-    eliteCtx +
-    patternCtx +
-    `Reference patterns: $STOCKMAN (organic buy pressure, high holder health), ` +
-    `$SPEED (low MC nano-cap, volume overrides missing data), ` +
-    `$MANNY (sybil-funded rug, fake volume). ` +
-    `State plainly: is this a Community Takeover, Dev Dump, or High-Vol Data Play — and the single strongest reason why.`;
+  const { signals = {}, devProfile = {} } = scanResult;
+  const ticker = tokenData.codex?.symbol || tokenData.pump?.symbol || tokenData.symbol || 'UNKNOWN';
+  const userMessage = `
+Token Analysis Request:
+- Token: $${ticker}
+- Verdict from scanner: ${scanResult.verdict} (${scanResult.entryTier ?? 'N/A'})
+- Market Cap: $${signals.marketCap?.toLocaleString() ?? 'unknown'}
+- Adjusted Vol/Liq: ${signals.adjustedVolLiq?.toFixed(2) ?? 'N/A'}x
+- Top 10 Concentration: ${signals.top10Pct?.toFixed(1) ?? 'N/A'}%
+- Wash %: ${signals.washPct?.toFixed(1) ?? 'unverified'}%
+- Dev Launches: ${devProfile.totalLaunches ?? signals.totalLaunches ?? 'unknown'}
+- Dev Success Rate: ${signals.successRatePct != null ? signals.successRatePct.toFixed(1) + '%' : 'unknown'}
+- Dev Peak Multiplier: ${devProfile.topPerformerMultiplier != null ? devProfile.topPerformerMultiplier + 'x' : (signals.peakMultiplier != null ? signals.peakMultiplier + 'x' : 'unknown')}
+- Token Age: ${signals.ageMinutes?.toFixed(0) ?? 'unknown'} min
+- Is Elite Dev: ${signals.isEliteDev}
+- Bundle Count: ${signals.bundleCount ?? 0}/slot
+- Social mentions (15m): ${scanResult.social?.mentions15m ?? tokenData.social?.mentions15m ?? 'N/A'}
+Does this token match a Winner or Loser blueprint?`;
 
   try {
-    const res = await fetch(XAI_API_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body:    JSON.stringify({
-        model,
-        messages:    [{ role: 'user', content: prompt }],
-        max_tokens:  80,
-        temperature: 0.2,
-      }),
-      timeout: TIMEOUT_MS,
-    });
-
-    if (!res.ok) {
-      const body = (await res.text()).slice(0, 200);
-      console.error(`[reasoning] xAI HTTP ${res.status} for $${ticker}: ${body}`);
-      return null;
-    }
-
-    const data = await res.json();
-    const text = (data?.choices?.[0]?.message?.content ?? '').trim();
-    if (text) {
-      console.log(`[reasoning] $${ticker}: "${text.slice(0, 120)}"`);
-    } else {
-      console.warn(`[reasoning] $${ticker}: empty response from ${model}`);
-    }
-    return text || null;
-  } catch (e) {
-    console.error(`[reasoning] $${ticker} error: ${e.message}`);
-    return null;
+    const data = await postGrok([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userMessage },
+    ]);
+    const text = data?.choices?.[0]?.message?.content?.trim() ?? '';
+    return {
+      available: true,
+      verdict: parseSoulVerdict(text),
+      reasoning: text || null,
+    };
+  } catch (err) {
+    console.warn('[reasoning] Grok call failed:', err.message);
+    return { available: false, verdict: null, reasoning: null };
   }
 }
 
-// Startup probe — call once at boot to confirm xAI key + model are reachable.
-// Logs [reasoning] PROBE OK or a clear error so Railway logs show the issue immediately.
+// Backward-compatible wrapper for older callers. It still returns a string so
+// formatVerdict remains the single place that appends Soul text to alerts.
+async function getSoulReasoning(args = {}) {
+  const scanResult = {
+    verdict: args.verdict,
+    entryTier: args.entryTier,
+    social: { mentions15m: args.socialMentions },
+    signals: {
+      adjustedVolLiq: args.adjustedVolLiq,
+      top10Pct: args.top10Pct,
+      successRatePct: args.successRatePct,
+      marketCap: args.marketCap,
+      isEliteDev: args.isEliteDev,
+      peakMultiplier: args.peakMultiplier,
+    },
+    devProfile: {
+      totalLaunches: args.devLaunches,
+      topPerformerMultiplier: args.peakMultiplier,
+    },
+  };
+  const soul = await getSoulVerdict(scanResult, { symbol: args.ticker });
+  return soul.reasoning;
+}
+
 async function probeXaiConnection() {
-  const key = process.env.XAI_API_KEY;
-  if (!key) {
-    console.log('[reasoning] XAI_API_KEY not set — Oracle\'s Soul disabled');
+  if (!process.env.XAI_API_KEY) {
+    console.log('[reasoning] XAI_API_KEY not set - Oracle Soul disabled');
     return;
   }
-  const model = process.env.XAI_MODEL || 'grok-3';
-  console.log(`[reasoning] probing xAI (model: ${model})…`);
+  const model = process.env.XAI_MODEL || 'grok-2-mini';
+  console.log(`[reasoning] probing xAI (model: ${model})...`);
   try {
-    const res = await fetch(XAI_API_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body:    JSON.stringify({
-        model,
-        messages:    [{ role: 'user', content: 'Reply with the single word: ONLINE' }],
-        max_tokens:  10,
-        temperature: 0,
-      }),
-      timeout: 20_000,
-    });
-    if (!res.ok) {
-      const body = (await res.text()).slice(0, 200);
-      console.error(`[reasoning] PROBE FAILED — xAI HTTP ${res.status}: ${body}`);
-      return;
-    }
-    const data  = await res.json();
+    const data = await postGrok(
+      [{ role: 'user', content: 'Reply with the single word: ONLINE' }],
+      10,
+      0
+    );
     const reply = (data?.choices?.[0]?.message?.content ?? '').trim();
-    console.log(`[reasoning] PROBE OK — model=${model} reply="${reply}"`);
+    console.log(`[reasoning] PROBE OK - model=${model} reply="${reply}"`);
   } catch (e) {
     console.error(`[reasoning] PROBE ERROR: ${e.message}`);
   }
 }
 
-module.exports = { getSoulReasoning, probeXaiConnection };
+module.exports = { getSoulVerdict, getSoulReasoning, probeXaiConnection };

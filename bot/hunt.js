@@ -23,7 +23,7 @@ const WS    = require('ws');          // explicit import — never rely on globa
 const { fetchAll, fetchDeFadeVerification } = require('./fetcher');
 const { scan }             = require('./scanner');
 const { formatVerdict }    = require('./verdict');
-const { getSoulReasoning } = require('./reasoning');
+const { getSoulVerdict }   = require('./reasoning');
 const { recordScan }       = require('./audit');
 const config               = require('./config');
 
@@ -227,16 +227,9 @@ async function runScan(job, broadcaster) {
       stats.skipped++; return;
     }
 
-    // Grok soul reasoning — non-blocking; skips silently if XAI_API_KEY absent.
-    result.soulReasoning = await getSoulReasoning({
-      ticker:        data.codex?.symbol || data.pump?.symbol,
-      adjustedVolLiq,
-      top10Pct:      result.signals?.top10Pct,
-      successRatePct:result.signals?.successRatePct,
-      socialMentions:data.social?.mentions15m,
-      marketCap:     result.signals?.marketCap,
-      verdict:       result.verdict,
-    }).catch(() => null);
+    // Grok Soul reasoning is additive only; it never flips scanner verdicts.
+    result.soulVerdict = await getSoulVerdict(result, data).catch(() => null);
+    result.soulReasoning = result.soulVerdict?.reasoning ?? null;
 
     // Post-scan DeFade verification on BUY candidates only (free-plan quota).
     if (result.verdict === 'BUY') {
@@ -289,6 +282,7 @@ async function runScan(job, broadcaster) {
       ca,
       symbol:         rawSym,
       verdict:        result.verdict,
+      entryTier:      result.entryTier,
       mc:             result.signals?.marketCap,
       adjustedVolLiq: result.signals?.adjustedVolLiq,
       top10Pct:       result.signals?.top10Pct,

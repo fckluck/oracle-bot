@@ -137,6 +137,7 @@ async function checkEntry(entry, bot) {
       ca:             entry.ca,
       symbol:         entry.symbol,
       verdict:        'WATCHLIST_FIRED',
+      entryTier:      'BASELINE_ENTRY',
       mc,
       adjustedVolLiq: volLiq,
       top10Pct:       null,

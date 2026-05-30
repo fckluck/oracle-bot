@@ -1,15 +1,35 @@
 require('dotenv').config();
+const fs       = require('fs');
 const http     = require('http');
 const { Telegraf } = require('telegraf');
 const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic, fetchMcOnly } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
+const config    = require('./config');
+const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
+const { recordScan, startAuditLoop, getAuditReport } = require('./audit');
+
+function ensureDataDir() {
+  const dataDir = process.env.DATA_DIR || '/data';
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    if (dataDir === '/data') {
+      const rootDev = fs.statSync('/').dev;
+      const dataDev = fs.statSync('/data').dev;
+      if (rootDev === dataDev) {
+        console.warn('[startup] /data exists but appears to share the root filesystem. Configure Railway volume oracle-data mounted at /data for persistence.');
+      }
+    }
+  } catch (e) {
+    console.warn(`[startup] failed to prepare ${dataDir}: ${e.message}`);
+  }
+}
+
+ensureDataDir();
+
 const tracker   = require('./tracker');
 const hunt      = require('./hunt');
 const watchlist = require('./watchlist');
-const config    = require('./config');
-const { probeXaiConnection, getSoulReasoning } = require('./reasoning');
-const { recordScan, updatePeaks, getAll, getUnresolved, getPatternMemory } = require('./audit');
 
 // ── Railway health check ───────────────────────────────────────────────────────
 // Railway treats every service as a web service and kills the process if it
@@ -22,7 +42,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'ok',
-    bot:    'Oracle v10.2.7',
+    bot:    'Oracle v37.0.0',
     uptime: Math.floor(process.uptime()),
   }));
 }).listen(HEALTH_PORT, () => {
@@ -63,8 +83,8 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v10.2.7 — Spine Lock)</b>\n` +
-  `<i>The spine is aligned. The Predator is hunting.</i>\n\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (v37.0 - Blueprint Predator)</b>\n` +
+  `<i>Blueprint Predator is hunting.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
   `• /help — Show this command menu\n` +
@@ -316,56 +336,7 @@ bot.command('watchlist', ctx => {
 });
 
 bot.command('audit', async ctx => {
-  const records = getAll().sort((a, b) => b.scannedAt - a.scannedAt);
-  if (records.length === 0) {
-    return ctx.reply('No audit records yet. Records accumulate from /scan, Hunt Mode, and Watchlist alerts.');
-  }
-
-  const outcomeIcon = { WINNER_10X: '🚀', WINNER_3X: '✅', LOSER_50: '📉', RUG: '🩸', UNRESOLVED: '⏳', EXPIRED: '💤' };
-  const fmt = r => {
-    const ageMin  = Math.round((Date.now() - r.scannedAt) / 60000);
-    const mcStr   = r.scanMc  != null ? `$${(r.scanMc / 1000).toFixed(0)}K`  : '?';
-    const peakStr = r.peakMc  != null ? ` → $${(r.peakMc / 1000).toFixed(0)}K` : '';
-    const mult    = (r.peakMc && r.scanMc) ? ` (${(r.peakMc / r.scanMc).toFixed(1)}x)` : '';
-    const icon    = outcomeIcon[r.outcome] ?? '⏳';
-    return `${icon} <code>$${r.symbol}</code> | ${r.verdict} | ${mcStr}${peakStr}${mult} | ${ageMin}m ago`;
-  };
-
-  const recent   = records.slice(0, 10);
-  const missed   = records.filter(r =>
-    ['NO_GO', 'AVOID', 'WATCH_VOL', 'RISKY_RUNNER'].includes(r.verdict) &&
-    (r.outcome === 'WINNER_3X' || r.outcome === 'WINNER_10X')
-  );
-  const falsePos = records.filter(r => r.verdict === 'BUY' && r.outcome === 'RUG');
-
-  let msg = `🔮 <b>ORACLE AUDIT</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-  msg += `<b>📋 RECENT SCANS</b>\n` + recent.map(fmt).join('\n');
-
-  if (missed.length > 0) {
-    msg += `\n\n<b>❌ MISSED WINNERS</b> (NO-GO/WATCH that ran 3x+)\n`;
-    msg += missed.slice(0, 5).map(fmt).join('\n');
-  }
-
-  if (falsePos.length > 0) {
-    msg += `\n\n<b>⚠️ FALSE POSITIVES</b> (BUY → Rug)\n`;
-    msg += falsePos.slice(0, 5).map(fmt).join('\n');
-  }
-
-  const resolved = records.filter(r => r.outcome !== 'UNRESOLVED' && r.outcome !== 'EXPIRED');
-  const wins     = resolved.filter(r => r.outcome === 'WINNER_3X' || r.outcome === 'WINNER_10X').length;
-  const rugs     = resolved.filter(r => r.outcome === 'RUG').length;
-  const buyWins  = records.filter(r => r.verdict === 'BUY' && (r.outcome === 'WINNER_3X' || r.outcome === 'WINNER_10X')).length;
-  const buyResolved = records.filter(r => r.verdict === 'BUY' && resolved.find(x => x.ca === r.ca)).length;
-
-  msg += `\n\n━━━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `📊 Resolved: ${resolved.length} | 🚀 Winners: ${wins} | 🩸 Rugs: ${rugs}\n`;
-  if (buyResolved > 0) {
-    msg += `🎯 BUY accuracy: ${buyWins}/${buyResolved} (${Math.round(buyWins / buyResolved * 100)}%)\n`;
-  }
-  msg += `⏳ Watching: ${records.filter(r => r.outcome === 'UNRESOLVED').length} unresolved`;
-
-  await ctx.reply(msg, { parse_mode: 'HTML' });
+  await ctx.reply(getAuditReport());
 });
 
 bot.command('tracking', ctx => {
@@ -449,26 +420,17 @@ bot.on('text', async ctx => {
     // Attach social data to result so verdict formatter can render social signals
     result.social = social;
 
-    // Run DeFade verification and Grok soul reasoning in parallel.
+    // Run DeFade verification and Grok Soul reasoning in parallel.
     // DeFade only fires on BUY candidates (free-plan quota guard).
-    // Grok fires on everything so the user always gets a narrative, even on NO-GO.
-    // Grok receives the pre-DeFade verdict — correct in >95% of cases; the rare
-    // DeFade flip (BUY→NO_GO) will still show honest Grok reasoning for the BUY case.
+    // Grok is additive only and never overrides scanner verdicts.
     const [deFade] = await Promise.all([
       result.verdict === 'BUY'
         ? fetchDeFadeVerification(ca, { lp: result.signals?.lp })
         : Promise.resolve(null),
-      getSoulReasoning({
-        ticker:         data.codex?.symbol || data.pump?.symbol,
-        socialMentions: social?.mentions15m,
-        adjustedVolLiq: result.signals?.adjustedVolLiq,
-        top10Pct:       result.signals?.top10Pct,
-        successRatePct: result.signals?.successRatePct,
-        marketCap:      result.signals?.marketCap,
-        verdict:        result.verdict,
-        isEliteDev:     result.signals?.isEliteDev,
-        patternMemory:  getPatternMemory(),
-      }).then(soul => { result.soulReasoning = soul; }),
+      getSoulVerdict(result, data).then(soul => {
+        result.soulVerdict = soul;
+        result.soulReasoning = soul?.reasoning ?? null;
+      }),
     ]);
     result.deFadeVerification = deFade;
     if (deFade?.action === 'HARD_SKIP') {
@@ -485,6 +447,7 @@ bot.on('text', async ctx => {
       ca,
       symbol:         data.codex?.symbol || data.pump?.symbol,
       verdict:        result.verdict,
+      entryTier:      result.entryTier,
       mc:             result.signals?.marketCap,
       adjustedVolLiq: result.signals?.adjustedVolLiq,
       top10Pct:       result.signals?.top10Pct,
@@ -662,13 +625,13 @@ async function launchWithRetry(maxAttempts = 10, delayMs = 3000) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       await bot.launch({ dropPendingUpdates: true });
-      console.log(`Oracle Bot v10.2.8 (Safe Calibration) started — polling active (attempt ${attempt})`);
+      console.log(`Oracle Bot v37.0.0 (Blueprint Predator) started — polling active (attempt ${attempt})`);
 
       // Startup ping — hunters already loaded by hunt.start() above.
       const hunters = hunt.listHunters();
       const startupMsg =
-        `🚀 <b>Oracle v10.2.8 Online — Safe Calibration</b>\n` +
-        `Top10 gate: 25% | Spine Lock: active\n` +
+        `🚀 <b>Oracle v37.0.0 Online — Blueprint Predator</b>\n` +
+        `Top10 gate: v37 MC-aware | Soul + Audit: active\n` +
         `Hunt engine: running | Use /huntstatus to verify.`;
       for (const chatId of hunters) {
         try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
@@ -692,32 +655,8 @@ async function launchWithRetry(maxAttempts = 10, delayMs = 3000) {
   }
 }
 
-// ── Audit peak-update loop ────────────────────────────────────────────────────
-// Every 60 minutes, fetch the current MC for all unresolved audit records and
-// classify them (WINNER_10X / WINNER_3X / LOSER_50 / RUG / EXPIRED).
-// Uses a lightweight single-endpoint Birdeye call — not the heavy fetchAll.
-// Staggered 2-second delay between requests to avoid API rate limits.
-async function runAuditPeakUpdate() {
-  const unresolved = getUnresolved();
-  if (unresolved.length === 0) return;
-  const mcMap = {};
-  for (const rec of unresolved) {
-    try {
-      const result = await fetchMcOnly(rec.ca);
-      if (result?.mc != null) mcMap[rec.ca] = result.mc;
-    } catch { /* ignore individual failures */ }
-    await new Promise(r => setTimeout(r, 2000)); // 2s between requests
-  }
-  updatePeaks(mcMap);
-  console.log(`[audit] peak update: ${Object.keys(mcMap).length}/${unresolved.length} fetched`);
-}
-// First run 5 min after startup (let Railway stabilise), then every 60 min.
-setTimeout(() => {
-  runAuditPeakUpdate().catch(e => console.error('[audit] peak update error:', e.message));
-  setInterval(() => {
-    runAuditPeakUpdate().catch(e => console.error('[audit] peak update error:', e.message));
-  }, 60 * 60 * 1000);
-}, 5 * 60 * 1000);
+try { startAuditLoop(bot, fetchMcOnly); }
+catch (e) { console.error('[startup] audit loop error:', e?.stack || e.message); }
 
 launchWithRetry().catch(err => console.error('[launch] launchWithRetry unexpected error:', err?.stack || err));
 
