@@ -35,6 +35,8 @@ console.log(`[tracker] persist file: ${PERSIST_FILE}`);
 //   alertedFlags: Set<string>,          // dedup — don't re-alert same signal
 // }
 const positions = new Map();
+const { formatEt, formatUtc } = require('./time');
+function actionTimeMarkdown(label = 'Action Time') { return `🕒 *${label}:* ${formatEt()} | ${formatUtc()}`; }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
@@ -178,7 +180,7 @@ async function establishBaseline(pos, bot, { silent = false } = {}) {
     try {
       const sent = await bot.telegram.sendMessage(
         pos.chatId,
-        `🔄 *GUARDIAN BASELINE PENDING*\n\`${shortCa}\` — Holder data unavailable at entry. Retrying every 10s (up to 2 min)...`,
+        `${actionTimeMarkdown('Guardian Time')}\n\n🔄 *GUARDIAN BASELINE PENDING*\n\`${shortCa}\` — Holder data unavailable at entry. Retrying every 10s (up to 2 min)...`,
         { parse_mode: 'Markdown' }
       );
       pendingMsgId = sent.message_id;
@@ -215,7 +217,7 @@ async function establishBaseline(pos, bot, { silent = false } = {}) {
         saveToDisk();
         console.log(`[tracker] baseline established for ${pos.ca.slice(0,8)} — holders=${pos2.entryHolderCount} top50=${pos2.entryTop50Pct.toFixed(1)}%`);
         const confirmText =
-          `✅ *GUARDIAN BASELINE SET*\n` +
+          `${actionTimeMarkdown('Guardian Time')}\n\n✅ *GUARDIAN BASELINE SET*\n` +
           `\`${shortCa}\`\n` +
           `• Holders: ${pos2.entryHolderCount}\n` +
           `• Top 50: ${pos2.entryTop50Pct.toFixed(1)}%\n` +
@@ -294,7 +296,7 @@ async function syncBaseline(ca, chatId, bot) {
   const pos = positions.get(ca);
   if (!pos) return { found: false };
   if (pos.chatId !== chatId) return { found: false }; // security: only the tracker's chat
-  await bot.telegram.sendMessage(chatId, `🔄 *SYNC STARTED* — Re-fetching baseline for \`${ca.slice(0,6)}...${ca.slice(-4)}\``, { parse_mode: 'Markdown' });
+  await bot.telegram.sendMessage(chatId, `${actionTimeMarkdown('Sync Time')}\n\n🔄 *SYNC STARTED* — Re-fetching baseline for \`${ca.slice(0,6)}...${ca.slice(-4)}\``, { parse_mode: 'Markdown' });
   // Reset so establishBaseline doesn't early-exit due to already-set fields
   pos.entryHolderCount = null;
   pos.entryTop10Pct    = null;
@@ -540,7 +542,7 @@ async function checkPosition(pos, bot) {
       ? (lp - pos.entryLp) : null;
 
     const lines = [
-      `🛡️ *ORACLE GUARDIAN ALERT*`,
+      `${actionTimeMarkdown('Guardian Alert Time')}\n\n🛡️ *ORACLE GUARDIAN ALERT*`,
       `CA: \`${shortCa}\` | Tracking: ${ageMin}m`,
       ``,
       `── *LIVE DIVERGENCE* ──`,
@@ -595,7 +597,7 @@ async function sendHeartbeat(pos, bot) {
       ? (lp - pos.entryLp) : null;
 
     const lines = [
-      `🛡️ *GUARDIAN HEARTBEAT*`,
+      `${actionTimeMarkdown('Heartbeat Time')}\n\n🛡️ *GUARDIAN HEARTBEAT*`,
       `CA: \`${shortCa}\` | ${ageMin}m tracked`,
       ``,
       holdersAdded != null

@@ -21,6 +21,14 @@ const config = {
   // Broadcast floor (v13.0: lowered 5→3 to catch PRO_PILOT 3x BUYs and early signals)
   MIN_VOLLIQ_BROADCAST: parseFloat(process.env.MIN_VOLLIQ_BROADCAST || '3.0'),
 
+  // Hunt alert mode:
+  // strict = only final BUY verdicts are broadcast
+  // watch = BUY + RISKY_RUNNER + WATCH_VOL/WATCH_WASH
+  // all = legacy debug behavior; broadcasts anything over Vol/Liq floor
+  HUNT_ALERT_MODE: process.env.HUNT_ALERT_MODE || 'strict',
+  // Optional comma-separated override, e.g. "BUY,RISKY_RUNNER".
+  HUNT_ALERT_VERDICTS: process.env.HUNT_ALERT_VERDICTS || '',
+
   // Hunt Mode resilience. PumpPortal remains primary; DexScreener latest-profile
   // polling is a low-volume fallback so Hunt Mode does not go blind when WS events
   // are stale, blocked, or payload-shape changed.

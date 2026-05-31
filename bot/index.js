@@ -5,6 +5,8 @@ const { Telegraf } = require('telegraf');
 const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic, fetchMcOnly } = require('./fetcher');
 const { scan }     = require('./scanner');
 const { formatVerdict } = require('./verdict');
+const { actionTimeLine } = require('./time');
+const { apiStatusHtml, markApi } = require('./telemetry');
 const config    = require('./config');
 const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
 const { recordScan, startAuditLoop, getAuditReport, getPatternMemory } = require('./audit');
@@ -88,13 +90,15 @@ const HELP_MENU =
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
   `• /help — Show this command menu\n` +
-  `• /status — API + Guardian health snapshot\n\n` +
+  `• /status — API + Guardian health snapshot\n` +
+  `• /apistatus — API truth panel (keys/calls/failures/skips)\n\n` +
   `<b>── HUNT MODE (Automated) ──</b>\n` +
   `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts on 3x+ Adjusted Vol/Liq launches\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
   `• /huntping — Force one Dex fallback poll and report results\n` +
+  `• /huntmode [strict|watch|all] — Set Hunt alert filtering mode\n` +
   `• /window — Current trading mode (Discovery / Dead Zone / Research)\n\n` +
   `<b>── POSITION TRACKING (Guardian) ──</b>\n` +
   `• /tracking — List all tracked tokens + live state\n` +
@@ -114,21 +118,25 @@ bot.command('status', ctx => {
     ? `🎯 Hunt: <b>${h.staleWs ? 'STALE' : 'ACTIVE'}</b> | ${h.hunters} hunter(s) | scanned ${h.scanned} | broadcast ${h.broadcast} | queue ${h.queueDepth}`
     : `🎯 Hunt: <b>OFFLINE</b> (reconnecting)`;
   return ctx.replyWithHTML(
-    `<b>Bot Status: ONLINE</b>\n\nData: DexScreener | PumpPortal${h.fallbackEnabled ? ' + Dex fallback' : ''} | Birdeye | Helius${process.env.DEFADE_API_KEY ? ' | DeFade' : ''}\n` +
+    `${actionTimeLine('Status Time')}\n\n<b>Bot Status: ONLINE</b>\n\nData: DexScreener | PumpPortal${h.fallbackEnabled ? ' + Dex fallback' : ''} | Birdeye | Helius${process.env.DEFADE_API_KEY ? ' | DeFade' : ''}\n` +
     `Guardian: ${tracker.list().length} position(s) tracked\nSession: ${config.SESSION_SIZE_SOL} SOL\n${huntLine}`
   );
+});
+
+bot.command('apistatus', ctx => {
+  return ctx.replyWithHTML(`${actionTimeLine('API Status Time')}\n\n${apiStatusHtml()}`);
 });
 
 bot.command('hunt', ctx => {
   const added = hunt.addHunter(ctx.chat.id);
   return ctx.replyWithHTML(added
-    ? `🎯 <b>Hunt Mode: ON</b>\nYou'll receive a full scorecard for every new launch / migration with Adjusted Vol/Liq ≥ 5x.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
-    : `🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
+    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nYou'll receive a full scorecard for every new launch / migration with Adjusted Vol/Liq ≥ 5x.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
+    : `${actionTimeLine('Hunt Time')}\n\n🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
 });
 
 bot.command('unhunt', ctx => {
   const removed = hunt.removeHunter(ctx.chat.id);
-  return ctx.reply(removed ? '🎯 Hunt Mode: OFF for this chat.' : 'Hunt Mode was not active for this chat.');
+  return ctx.replyWithHTML(removed ? `${actionTimeLine('Hunt Time')}\n\n🎯 Hunt Mode: OFF for this chat.` : `${actionTimeLine('Hunt Time')}\n\nHunt Mode was not active for this chat.`);
 });
 
 // v10.2.7: forces one Dex fallback poll on demand and reports the stat delta,
@@ -136,7 +144,7 @@ bot.command('unhunt', ctx => {
 // for the next scheduled poll. Distinguishes "fallback never runs" from
 // "fallback runs but never finds usable launches".
 bot.command('huntping', async ctx => {
-  await ctx.reply('🛰️ Forcing one Dex fallback poll...');
+  await ctx.replyWithHTML(`${actionTimeLine('Hunt Ping Time')}\n\n🛰️ Forcing one Dex fallback poll...`);
   const r = await hunt.pingFallback();
   if (!r.ok) return ctx.replyWithHTML(`⚠️ /huntping failed: ${r.reason}`);
   const d = r.delta;
@@ -144,7 +152,7 @@ bot.command('huntping', async ctx => {
     ? '⚠️ Fallback polled DexScreener but found no new launches passing dust filter (this is normal in quiet windows).'
     : '✅ Fallback enqueued tokens for scanning.';
   return ctx.replyWithHTML(
-    `<b>/huntping result (delta this call)</b>\n` +
+    `${actionTimeLine('Hunt Ping Time')}\n\n<b>/huntping result (delta this call)</b>\n` +
     `attempts:  ${d.attempts}\n` +
     `polls:     ${d.polls}\n` +
     `enqueued:  ${d.enqueued}\n` +
@@ -153,6 +161,19 @@ bot.command('huntping', async ctx => {
     `skipped:   ${d.skipped}\n` +
     `errors:    ${d.errors}\n\n${note}`
   );
+});
+
+bot.command('huntmode', ctx => {
+  const mode = (ctx.message.text.trim().split(/\s+/)[1] || '').toLowerCase();
+  if (!['strict', 'watch', 'all'].includes(mode)) {
+    return ctx.replyWithHTML(`Usage: <code>/huntmode strict</code> | <code>watch</code> | <code>all</code>
+Current: <b>${config.HUNT_ALERT_MODE}</b>`);
+  }
+  config.HUNT_ALERT_MODE = mode;
+  config.HUNT_ALERT_VERDICTS = '';
+  return ctx.replyWithHTML(`${actionTimeLine('Hunt Mode Change')}
+
+Hunt alert mode set to <b>${mode}</b>.`);
 });
 
 bot.command('huntstatus', ctx => {
@@ -184,6 +205,15 @@ bot.command('huntstatus', ctx => {
     `Scanned:   ${h.scanned}\n` +
     `Skipped:   ${h.skipped}\n` +
     `Errors:    ${h.errors}\n\n` +
+    `<b>Hunt Alert Gate</b>\n` +
+    `Alert mode: ${h.alertMode}\n` +
+    `Allowed verdicts: ${(h.allowedVerdicts || []).join(', ') || 'none'}\n` +
+    `Last suppressed CA: ${h.lastSkippedCA ? `<code>${h.lastSkippedCA.slice(0,8)}...</code>` : 'none'}\n` +
+    `Last suppressed verdict: ${h.lastSkippedVerdict || 'none'}\n` +
+    `Last suppressed reason: ${h.lastSkipReason || 'none'}\n` +
+    `Last suppressed at: ${ago(h.lastSkippedAt)}\n` +
+    `SocialData key configured: ${h.socialDataKeyConfigured ? 'yes' : 'no'} | calls: ${h.socialDataCalls ?? 0}\n` +
+    `Grok key configured: ${h.grokKeyConfigured ? 'yes' : 'no'} | calls: ${h.grokCalls ?? 0} | fails: ${h.grokFails ?? 0}\n\n` +
     `<b>Broadcast delivery</b>\n` +
     `Candidates (passed filter): ${h.broadcastCandidates ?? h.broadcast ?? 0}\n` +
     `Telegram attempts:  ${h.broadcastAttempts ?? 0}\n` +
@@ -241,7 +271,7 @@ bot.command('huntlast', ctx => {
     );
   });
   return ctx.replyWithHTML(
-    `<b>Hunt Last ${candidates.length} Candidate(s)</b>\n\n` + lines.join('\n\n')
+    `${actionTimeLine('Hunt Last Time')}\n\n<b>Hunt Last ${candidates.length} Candidate(s)</b>\n\n` + lines.join('\n\n')
   );
 });
 
@@ -336,7 +366,7 @@ bot.command('watchlist', ctx => {
 });
 
 bot.command('audit', async ctx => {
-  await ctx.reply(getAuditReport());
+  await ctx.replyWithHTML(`${actionTimeLine('Audit Time')}\n\n${getAuditReport()}`);
 });
 
 bot.command('tracking', ctx => {
@@ -346,7 +376,7 @@ bot.command('tracking', ctx => {
     const baselineOk = p.entryTop50Pct !== null && p.entryHolderCount !== null;
     return `${i+1}. <code>${p.ca.slice(0,8)}...</code> — entry MC: $${(p.entryMc/1000).toFixed(1)}K | peak: $${(p.peakMc/1000).toFixed(1)}K${baselineOk ? '' : ' ⚠️ baseline pending'}`;
   });
-  return ctx.replyWithHTML(`<b>Tracked Positions (${positions.length}):</b>\n\n${lines.join('\n')}\n\n<i>Use /sync &lt;CA&gt; to re-establish a pending baseline.</i>`);
+  return ctx.replyWithHTML(`${actionTimeLine('Tracking Time')}\n\n<b>Tracked Positions (${positions.length}):</b>\n\n${lines.join('\n')}\n\n<i>Use /sync &lt;CA&gt; to re-establish a pending baseline.</i>`);
 });
 
 bot.command('sync', async ctx => {
@@ -416,22 +446,20 @@ bot.on('text', async ctx => {
     data.social = social;
 
     const result  = scan(data);
+    result.scannedAt = Date.now();
 
     // Attach social data to result so verdict formatter can render social signals
     result.social = social;
 
-    // Run DeFade verification and Grok Soul reasoning in parallel.
+    // DeFade runs before Soul so Grok sees the final scanner/verification verdict.
     // DeFade only fires on BUY candidates (free-plan quota guard).
-    // Grok is additive only and never overrides scanner verdicts.
-    const [deFade] = await Promise.all([
-      result.verdict === 'BUY'
-        ? fetchDeFadeVerification(ca, { lp: result.signals?.lp })
-        : Promise.resolve(null),
-      getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).then(soul => {
-        result.soulVerdict = soul;
-        result.soulReasoning = soul?.reasoning ?? null;
-      }),
-    ]);
+    const deFade = result.verdict === 'BUY'
+      ? await fetchDeFadeVerification(ca, { lp: result.signals?.lp })
+      : (markApi('DeFade', { skipped: true, meta: { reason: 'non_buy_verdict', verdict: result.verdict } }), {
+          action: 'SKIPPED',
+          reason: `Skipped because verdict was ${result.verdict}; DeFade only runs on BUY to preserve quota.`,
+          verified: false,
+        });
     result.deFadeVerification = deFade;
     if (deFade?.action === 'HARD_SKIP') {
       result.verdict    = 'NO_GO';
@@ -439,7 +467,22 @@ bot.on('text', async ctx => {
       result.noGoReason = `DeFade verification: ${deFade.reason}`;
     }
 
-    const message = formatVerdict(result, ca);
+    const soul = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() });
+    result.soulVerdict = soul;
+    result.soulReasoning = soul?.reasoning ?? null;
+
+    result.dataUsed = {
+      dex: !!data.codex,
+      pump: !!data.pump,
+      birdeye: !!data.birdeye,
+      solanaTracker: !!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders',
+      socialData: !!social?.available,
+      helius: data.holders?.source === 'helius',
+      codex: data.holders?.source === 'codex',
+      deFade: !!result.deFadeVerification && result.deFadeVerification.action !== 'SKIPPED',
+      grok: !!result.soulReasoning,
+    };
+
     const mc      = result.signals.marketCap || 0;
 
     // Audit every completed /scan so /audit can surface missed winners + false positives.
@@ -457,6 +500,8 @@ bot.on('text', async ctx => {
       devLaunches:    result.signals?.totalLaunches,
       source:         'scan',
     });
+
+    const message = formatVerdict(result, ca);
 
     await ctx.telegram.editMessageText(
       ctx.chat.id, scanning.message_id, undefined,

@@ -1,4 +1,6 @@
 const config = require('./config');
+const { actionTimeLine } = require('./time');
+const { dataUsedHtml } = require('./telemetry');
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
@@ -147,6 +149,9 @@ function formatVerdict(result, ca) {
   const adjustedVolLiq= signals.adjustedVolLiq;
   const rawVolLiq     = signals.rawVolLiq;
   const L = [];
+
+  L.push(actionTimeLine('Scan Time', result.scannedAt || Date.now()));
+  L.push('');
 
   // ── Oracle's Soul (Grok reasoning — shown when XAI_API_KEY is configured) ──
 
@@ -416,6 +421,7 @@ function formatVerdict(result, ca) {
     const tag = dv.action === 'PASS'      ? '✅ PASS'
               : dv.action === 'FLAG'      ? '🟡 FLAG'
               : dv.action === 'HARD_SKIP' ? '🛑 HARD SKIP'
+              : dv.action === 'SKIPPED'   ? '⚪ SKIPPED'
               :                             '⚪ UNAVAILABLE';
     L.push(b('── VERIFICATION ──'));
     L.push(`• ${b('DeFade:')} ${tag}`);
@@ -442,6 +448,12 @@ function formatVerdict(result, ca) {
     L.push(`TP3: ${fmtUsd(tps.tp3)}  (${(tps.tp3/m).toFixed(1)}x)`);
     L.push(`SL:  ${tps.slPct}% retrace from ATH | hard exit if LP &lt; $5K`);
     L.push('');
+  }
+
+  if (result.dataUsed) {
+    L.push('');
+    L.push(`<b>── DATA USED ──</b>`);
+    L.push(dataUsedHtml(result.dataUsed));
   }
 
   L.push(`CA: ${code(ca)}`);

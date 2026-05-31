@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+const { markApi } = require('./telemetry');
 
 const XAI_API_URL = 'https://api.x.ai/v1/chat/completions';
 const TIMEOUT_MS  = 15_000;
@@ -29,9 +30,9 @@ RULES:
 
 function parseSoulVerdict(text) {
   if (!text) return null;
-  if (text.includes('BLUEPRINT MATCH: BUY')) return 'BUY';
-  if (text.includes('RUG PATTERN: SKIP')) return 'SKIP';
-  if (text.includes('INCONCLUSIVE')) return 'INCONCLUSIVE';
+  if (text.includes('WINNER PATTERN') || text.includes('BLUEPRINT MATCH: BUY')) return 'BUY';
+  if (text.includes('RISK PATTERN') || text.includes('RUG PATTERN: SKIP')) return 'SKIP';
+  if (text.includes('UNCERTAIN PATTERN') || text.includes('INCONCLUSIVE')) return 'INCONCLUSIVE';
   return null;
 }
 
@@ -93,7 +94,12 @@ async function postGrok(messages, maxTokens = 150, temperature = 0.3) {
 
 async function getSoulVerdict(scanResult, tokenData = {}) {
   if (!process.env.XAI_API_KEY) {
-    return { available: false, verdict: null, reasoning: null };
+    markApi('Grok', { skipped: true, meta: { reason: 'missing_key' } });
+    return {
+      available: false,
+      verdict: null,
+      reasoning: '⚪ OFFLINE — XAI_API_KEY missing or billing unavailable. Scanner verdict only.',
+    };
   }
   const { signals = {}, devProfile = {} } = scanResult;
   const patternMemoryBlock = buildPatternMemoryBlock(tokenData.patternMemory ?? scanResult.patternMemory);
@@ -122,6 +128,7 @@ Explain whether this is a prior winner pattern, rug/failure pattern, or uncertai
       { role: 'user', content: userMessage },
     ]);
     const text = data?.choices?.[0]?.message?.content?.trim() ?? '';
+    markApi('Grok', { ok: true, meta: { verdict: scanResult.verdict, hasReasoning: !!text } });
     return {
       available: true,
       verdict: parseSoulVerdict(text),
@@ -129,7 +136,12 @@ Explain whether this is a prior winner pattern, rug/failure pattern, or uncertai
     };
   } catch (err) {
     console.warn('[reasoning] Grok call failed:', err.message);
-    return { available: false, verdict: null, reasoning: null };
+    markApi('Grok', { ok: false, error: err.message });
+    return {
+      available: false,
+      verdict: null,
+      reasoning: `⚪ OFFLINE — Grok call failed: ${String(err.message).slice(0, 120)}. Scanner verdict only.`,
+    };
   }
 }
 
