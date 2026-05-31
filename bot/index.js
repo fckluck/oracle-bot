@@ -483,7 +483,6 @@ bot.on('text', async ctx => {
       grok: !!result.soulReasoning,
     };
 
-    const message = formatVerdict(result, ca);
     const mc      = result.signals.marketCap || 0;
 
     // Audit every completed /scan so /audit can surface missed winners + false positives.
@@ -501,6 +500,8 @@ bot.on('text', async ctx => {
       devLaunches:    result.signals?.totalLaunches,
       source:         'scan',
     });
+
+    const message = formatVerdict(result, ca);
 
     await ctx.telegram.editMessageText(
       ctx.chat.id, scanning.message_id, undefined,
