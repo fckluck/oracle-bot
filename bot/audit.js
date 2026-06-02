@@ -306,8 +306,7 @@ function getAuditPendingReport() {
     const ageMin = Math.floor((now - e.scanTime) / 60000);
     const resolveIn = Math.max(0, Math.floor((RESOLVE_MS - (now - e.scanTime)) / 60000));
     return `${idx + 1}. ${e.ticker} | ${e.verdict} | scan:$${Math.round((e.scanMc || 0) / 1000)}K | current:$${Math.round((current || 0) / 1000)}K | peak:$${Math.round((peak || 0) / 1000)}K | multiple:${mult}x | age:${ageMin}m | resolve:${resolveIn}m | learned:${e.missedType || 'none'}`;
-  }).join('
-');
+  }).join('\n');
 }
 
 function matchLearnedPattern(result) {
