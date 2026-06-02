@@ -21,10 +21,10 @@ const path  = require('path');
 const fetch = require('node-fetch');
 const WS    = require('ws');          // explicit import — never rely on global WebSocket
 const { fetchAll, fetchDeFadeVerification, fetchSocialData } = require('./fetcher');
-const { scan }             = require('./scanner');
+const { scan, evaluateRequiredStack } = require('./scanner');
 const { formatVerdict }    = require('./verdict');
 const { getSoulVerdict }   = require('./reasoning');
-const { recordScan, getPatternMemory } = require('./audit');
+const { recordScan, getPatternMemory, matchLearnedPattern } = require('./audit');
 const { actionTimeLine } = require('./time');
 const { getApiStats, markApi } = require('./telemetry');
 const config               = require('./config');
@@ -73,36 +73,17 @@ function getAllowedHuntVerdicts() {
       .map(v => v.trim().toUpperCase())
       .filter(Boolean);
   }
-  const mode = String(config.HUNT_ALERT_MODE || 'strict').toLowerCase();
-  if (mode === 'all') {
-    return ['BUY', 'RISKY_RUNNER', 'WATCH_VOL', 'WATCH_WASH', 'AVOID', 'NO_GO', 'SKIP'];
-  }
-  if (mode === 'watch') {
-    return ['BUY', 'RISKY_RUNNER', 'WATCH_VOL', 'WATCH_WASH'];
-  }
-  return ['BUY'];
+  return ['ORACLE_BUY', 'DIRTY_RUNNER_WATCH'];
 }
 
 function shouldBroadcastHuntResult(result) {
   const allowed = getAllowedHuntVerdicts();
-  const verdict = String(result?.verdict || '').toUpperCase();
-  if (!allowed.includes(verdict)) {
-    return { ok: false, reason: `verdict ${verdict || 'UNKNOWN'} not allowed in Hunt alert mode` };
+  const alertClass = String(result?.oracleScore?.class || '').toUpperCase();
+  if (!allowed.includes(alertClass)) {
+    return { ok: false, reason: `class ${alertClass || 'UNKNOWN'} not allowed in Hunt` };
   }
-  const mode = String(config.HUNT_ALERT_MODE || 'strict').toLowerCase();
-  if (mode === 'strict') {
-    if (verdict !== 'BUY') {
-      return { ok: false, reason: `strict mode requires BUY; got ${verdict}` };
-    }
-    if (!result.entryTier) {
-      return { ok: false, reason: 'strict mode requires BUY with entryTier' };
-    }
-    if (result.noGoReason) {
-      return { ok: false, reason: `strict mode blocked noGoReason: ${result.noGoReason}` };
-    }
-    if (result.watchReason) {
-      return { ok: false, reason: `strict mode blocked watchReason: ${result.watchReason}` };
-    }
+  if (alertClass === 'ORACLE_BUY' && result.noGoReason) {
+    return { ok: false, reason: `blocked noGoReason: ${result.noGoReason}` };
   }
   return { ok: true, reason: null };
 }
@@ -260,7 +241,15 @@ async function runScan(job, broadcaster) {
 
     stats.scanned++;
     const [data, social] = await Promise.all([
-      fetchAll(ca, { quickFilter: true }),
+      fetchAll(ca, {
+        quickFilter: true,
+        huntMode: true,
+        skipBirdeye: true,
+        skipDeFade: true,
+        skipGrok: true,
+        skipGMGN: true,
+        skipCodex: config.CODEX_MODE === 'off',
+      }),
       fetchSocialData(ca),
     ]);
     if (!data?.codex) { stats.skipped++; return; }
@@ -269,6 +258,7 @@ async function runScan(job, broadcaster) {
     const result = scan(data);
     result.social = social;
     result.scannedAt = Date.now();
+    result.patternMatch = matchLearnedPattern(result);
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
 
     // Pro/Elite dev floor: 2.0x — see proven devs before they move, not after.
@@ -289,19 +279,22 @@ async function runScan(job, broadcaster) {
     const rawSym = data.codex?.symbol || data.pump?.symbol || '???';
 
     // DeFade must run before final broadcast gate so HARD_SKIP can suppress alerts.
-    if (result.verdict === 'BUY') {
-      const v = await fetchDeFadeVerification(ca, { lp: result.signals?.lp });
+    if (result.oracleScore?.class === 'ORACLE_BUY') {
+      const v = await fetchDeFadeVerification(ca, { lp: result.signals?.lp }, { huntMode: true, buyCandidate: true });
       result.deFadeVerification = v;
       if (v.action === 'HARD_SKIP') {
         result.verdict = 'NO_GO';
         result.entryTier = null;
         result.noGoReason = `DeFade verification: ${v.reason}`;
+        if (!Array.isArray(result.oracleScore.hardBlocks)) result.oracleScore.hardBlocks = [];
+        result.oracleScore.hardBlocks.push('defade_hard_skip');
+        result.oracleScore.class = 'NO_GO';
       }
     } else {
-      markApi('DeFade', { skipped: true, meta: { reason: 'non_buy_verdict', verdict: result.verdict } });
+      markApi('DeFade', { skipped: true, meta: { reason: 'not_oracle_buy', class: result.oracleScore?.class || result.verdict } });
       result.deFadeVerification = {
         action: 'SKIPPED',
-        reason: `Skipped because verdict was ${result.verdict}; DeFade only runs on BUY to preserve quota.`,
+        reason: `Skipped because class was ${result.oracleScore?.class || result.verdict}; DeFade only runs on ORACLE_BUY candidates.`,
         verified: false,
       };
     }
@@ -310,7 +303,7 @@ async function runScan(job, broadcaster) {
     recordScan({
       ca,
       symbol:         rawSym,
-      verdict:        result.verdict,
+      verdict:        result.oracleScore?.class || result.verdict,
       entryTier:      result.entryTier,
       mc:             result.signals?.marketCap,
       adjustedVolLiq: result.signals?.adjustedVolLiq,
@@ -322,66 +315,87 @@ async function runScan(job, broadcaster) {
       source:         'hunt',
     });
 
-    const finalGate = shouldBroadcastHuntResult(result);
-    if (!finalGate.ok) {
-      markSuppressed(ca, result, finalGate.reason);
+    const requiredStack = evaluateRequiredStack(result, data, getApiStats());
+    result.requiredStack = requiredStack;
+    if (!requiredStack.pass) {
+      markSuppressed(ca, result, `required stack failed: ${requiredStack.reasons.join(', ')}`);
       return;
     }
 
-    // Grok Soul reasoning is additive only; it never flips scanner verdicts.
-    result.soulVerdict = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).catch(err => ({
-      available: false,
-      verdict: null,
-      reasoning: `⚪ OFFLINE — Grok call failed: ${String(err.message).slice(0, 120)}. Scanner verdict only.`,
-    }));
-    result.soulReasoning = result.soulVerdict?.reasoning ?? null;
+    const finalGate = shouldBroadcastHuntResult(result);
+    if (!finalGate.ok) {
+      if (result.patternMatch?.matched &&
+          result.patternMatch?.confidence >= (config.DIRTY_RUNNER_MIN_CONFIDENCE || 0.7) &&
+          !(result.oracleScore?.hardBlocks || []).length) {
+        result.oracleScore.class = 'DIRTY_RUNNER_WATCH';
+        result.verdict = 'DIRTY_RUNNER_WATCH';
+      } else {
+        markSuppressed(ca, result, finalGate.reason);
+        return;
+      }
+    }
+
+    // Grok executes only after final gate and only when Telegram attempts will occur.
+    if (config.GROK_HUNT_ONLY_SENT && hunterCount() === 0) {
+      markApi('Grok', { skipped: true, meta: { reason: 'no_telegram_attempts' } });
+      result.soulVerdict = { available: false, verdict: null, reasoning: '⚪ NOT REQUIRED — no hunt recipients.' };
+      result.soulReasoning = null;
+    } else {
+      result.soulVerdict = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() }).catch(err => ({
+        available: false,
+        verdict: null,
+        reasoning: `⚪ OFFLINE — Grok call failed: ${String(err.message).slice(0, 120)}. Scanner verdict only.`,
+      }));
+      result.soulReasoning = result.soulVerdict?.reasoning ?? null;
+    }
 
     result.dataUsed = {
-      dex: !!data.codex,
-      pump: !!data.pump,
-      birdeye: !!data.birdeye,
-      solanaTracker: !!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders',
-      socialData: !!social?.available,
-      helius: data.holders?.source === 'helius',
-      codex: data.holders?.source === 'codex',
-      deFade: !!result.deFadeVerification && result.deFadeVerification.action !== 'SKIPPED',
-      grok: !!result.soulReasoning,
+      dex: { status: data.codex ? 'ok' : 'failed' },
+      pump: { status: data.pump ? 'ok' : 'failed' },
+      birdeye: { status: 'skipped', reason: 'hunt_hard_block' },
+      solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
+      socialData: { status: social?.available ? 'ok' : 'skipped', reason: social?.available ? null : 'candidate_threshold_or_unavailable' },
+      helius: { status: data.holders?.source === 'helius' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' ? null : 'not_primary_holder_source' },
+      codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
+      deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason || 'optional' },
+      grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || (config.GROK_REQUIRED_FOR_BUY ? 'required_missing' : 'not_required') },
+      gmgn: { status: 'skipped', reason: 'audit_only' },
+      rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
     };
 
     const message = formatVerdict(result, ca);
-    const mc     = result.signals?.marketCap || 0;
-    // Escape HTML — token symbols can contain <, >, & which break Telegram HTML parse mode.
+    const mc = result.signals?.marketCap || 0;
     const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>
 ` +
                    `${actionTimeLine('Detected At', result.scannedAt)}
 ` +
-                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b>
+                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b> | Class: <b>${result.oracleScore?.class || 'WATCH'}</b>
 ` +
                    `Source: <code>${source}</code>
 
 `;
 
     stats.broadcastCandidates++;
-    stats.broadcast = stats.broadcastCandidates; // keep legacy alias in sync
-    stats.lastBroadcastCA      = ca;
-    stats.lastBroadcastVerdict = result.verdict;
-    stats.lastBroadcastAt      = Date.now();
+    stats.broadcast = stats.broadcastCandidates;
+    stats.lastBroadcastCA = ca;
+    stats.lastBroadcastVerdict = result.oracleScore?.class || result.verdict;
+    stats.lastBroadcastAt = Date.now();
 
-    const delivery = await broadcaster(ca, mc, header + message, result.verdict);
+    const delivery = await broadcaster(ca, mc, header + message, result.oracleScore?.class || result.verdict);
     recentlyBroadcast.set(ca, Date.now());
 
     const candidateEntry = {
       ca,
       symbol,
       adjustedVolLiq,
-      verdict:   result.verdict,
+      verdict: result.oracleScore?.class || result.verdict,
       mc,
       attempted: delivery.attempted,
       delivered: delivery.delivered,
-      failed:    delivery.failed,
-      error:     delivery.errors[0] || null,
-      ts:        Date.now(),
+      failed: delivery.failed,
+      error: delivery.errors[0] || null,
+      ts: Date.now(),
     };
     lastCandidates.unshift(candidateEntry);
     if (lastCandidates.length > MAX_LAST_CANDIDATES) lastCandidates.pop();
@@ -779,7 +793,7 @@ function status() {
   const staleWs = connectedAt !== null && wsIsStale();
   const apiStats = getApiStats();
   return {
-    alertMode: config.HUNT_ALERT_MODE || 'strict',
+    alertMode: 'strict-v38',
     allowedVerdicts: getAllowedHuntVerdicts(),
     socialDataKeyConfigured: !!process.env.SOCIALDATA_API_KEY,
     socialDataCalls: apiStats.SocialData?.calls ?? 0,

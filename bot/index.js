@@ -2,14 +2,14 @@ require('dotenv').config();
 const fs       = require('fs');
 const http     = require('http');
 const { Telegraf } = require('telegraf');
-const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic, fetchMcOnly } = require('./fetcher');
-const { scan }     = require('./scanner');
+const { fetchAll, fetchDeFadeVerification, fetchSocialData, fetchForensic, fetchMcOnly, runDeFadeTest } = require('./fetcher');
+const { scan, evaluateRequiredStack } = require('./scanner');
 const { formatVerdict } = require('./verdict');
 const { actionTimeLine } = require('./time');
 const { apiStatusHtml, markApi } = require('./telemetry');
 const config    = require('./config');
 const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
-const { recordScan, startAuditLoop, getAuditReport, getPatternMemory } = require('./audit');
+const { recordScan, startAuditLoop, getAuditReport, getPatternMemory, getAuditPendingReport, processPendingOnce } = require('./audit');
 
 function ensureDataDir() {
   const dataDir = process.env.DATA_DIR || '/data';
@@ -44,7 +44,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'ok',
-    bot:    'Oracle v37.0.0',
+    bot:    config.ORACLE_VERSION,
     uptime: Math.floor(process.uptime()),
   }));
 }).listen(HEALTH_PORT, () => {
@@ -85,20 +85,25 @@ function buildKeyboard(ca, currentMc, verdict) {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
-  `🛠️ <b>ORACLE COMMAND CENTER (v37.0 - Blueprint Predator)</b>\n` +
-  `<i>Blueprint Predator is hunting.</i>\n\n` +
+  `🛠️ <b>ORACLE COMMAND CENTER (${config.ORACLE_VERSION})</b>\n` +
+  `<i>Reupholster mode active: free Hunt scan, narrow trusted alerts.</i>\n\n` +
   `<b>── CORE ──</b>\n` +
   `• /start — Re-initialize the Oracle interface\n` +
   `• /help — Show this command menu\n` +
   `• /status — API + Guardian health snapshot\n` +
-  `• /apistatus — API truth panel (keys/calls/failures/skips)\n\n` +
+  `• /apistatus — API truth panel (modes/calls/failures/skips)\n` +
+  `• /audit — Run audit pass + report\n` +
+  `• /auditpending — Show unresolved audit entries\n` +
+  `• /auditnow — Force one cheap pending-pass now\n` +
+  `• /auditdeep — Deeper learning pass with larger caps\n` +
+  `• /defadetest [CA] — DeFade endpoint/cache/action test\n\n` +
   `<b>── HUNT MODE (Automated) ──</b>\n` +
-  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts on 3x+ Adjusted Vol/Liq launches\n` +
+  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts only for ORACLE_BUY / DIRTY_RUNNER_WATCH\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
   `• /huntping — Force one Dex fallback poll and report results\n` +
-  `• /huntmode [strict|watch|all] — Set Hunt alert filtering mode\n` +
+  `• /huntmode [strict|watch|all] — Legacy toggle (v38 still enforces class gates)\n` +
   `• /window — Current trading mode (Discovery / Dead Zone / Research)\n\n` +
   `<b>── POSITION TRACKING (Guardian) ──</b>\n` +
   `• /tracking — List all tracked tokens + live state\n` +
@@ -118,7 +123,7 @@ bot.command('status', ctx => {
     ? `🎯 Hunt: <b>${h.staleWs ? 'STALE' : 'ACTIVE'}</b> | ${h.hunters} hunter(s) | scanned ${h.scanned} | broadcast ${h.broadcast} | queue ${h.queueDepth}`
     : `🎯 Hunt: <b>OFFLINE</b> (reconnecting)`;
   return ctx.replyWithHTML(
-    `${actionTimeLine('Status Time')}\n\n<b>Bot Status: ONLINE</b>\n\nData: DexScreener | PumpPortal${h.fallbackEnabled ? ' + Dex fallback' : ''} | Birdeye | Helius${process.env.DEFADE_API_KEY ? ' | DeFade' : ''}\n` +
+    `${actionTimeLine('Status Time')}\n\n<b>Bot Status: ONLINE</b>\n\nData: DexScreener | PumpPortal${h.fallbackEnabled ? ' + Dex fallback' : ''} | Birdeye(hunt blocked) | Helius${process.env.DEFADE_API_KEY ? ' | DeFade' : ''}\n` +
     `Guardian: ${tracker.list().length} position(s) tracked\nSession: ${config.SESSION_SIZE_SOL} SOL\n${huntLine}`
   );
 });
@@ -130,7 +135,7 @@ bot.command('apistatus', ctx => {
 bot.command('hunt', ctx => {
   const added = hunt.addHunter(ctx.chat.id);
   return ctx.replyWithHTML(added
-    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nYou'll receive a full scorecard for every new launch / migration with Adjusted Vol/Liq ≥ 5x.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
+    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts are narrowed to ORACLE_BUY and DIRTY_RUNNER_WATCH only.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
     : `${actionTimeLine('Hunt Time')}\n\n🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
 });
 
@@ -366,7 +371,92 @@ bot.command('watchlist', ctx => {
 });
 
 bot.command('audit', async ctx => {
-  await ctx.replyWithHTML(`${actionTimeLine('Audit Time')}\n\n${getAuditReport()}`);
+  const processed = await processPendingOnce(fetchMcOnly, {
+    limit: config.AUDIT_BIRDEYE_MAX_PER_RUN,
+    allowBirdeye: true,
+    deepMode: false,
+  });
+  await ctx.replyWithHTML(
+    `${actionTimeLine('Audit Time')}\n\n` +
+    `<b>/audit pass complete</b>\n` +
+    `Checked: ${processed.checked} | Resolved: ${processed.resolved}\n\n` +
+    `${getAuditReport()}`
+  );
+});
+
+
+bot.command('auditdeep', async ctx => {
+  const processed = await processPendingOnce(fetchMcOnly, {
+    limit: config.AUDITDEEP_BIRDEYE_MAX_PER_RUN,
+    allowBirdeye: true,
+    deepMode: true,
+  });
+  await ctx.replyWithHTML(
+    `${actionTimeLine('Audit Deep Time')}
+
+` +
+    `<b>/auditdeep pass complete</b>
+` +
+    `Checked: ${processed.checked} | Resolved: ${processed.resolved}
+` +
+    `Caps: Birdeye ${config.AUDITDEEP_BIRDEYE_MAX_PER_RUN}, Grok ${config.AUDITDEEP_GROK_MAX_PER_RUN}
+
+` +
+    `${getAuditReport()}`
+  );
+});
+
+bot.command('auditnow', async ctx => {
+  const processed = await processPendingOnce(fetchMcOnly, {
+    limit: 10,
+    allowBirdeye: false,
+    deepMode: false,
+  });
+  await ctx.replyWithHTML(
+    `${actionTimeLine('Audit Now Time')}
+
+` +
+    `<b>/auditnow cheap pass complete</b>
+` +
+    `Checked: ${processed.checked} | Resolved: ${processed.resolved}
+` +
+    `Birdeye calls: disabled for this forced cheap pass.`
+  );
+});
+
+bot.command('auditpending', async ctx => {
+  await ctx.replyWithHTML(`${actionTimeLine('Audit Pending Time')}
+
+${getAuditPendingReport()}`);
+});
+
+bot.command('defadetest', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const ca = parts[1];
+  if (!ca || !isSolanaCA(ca)) {
+    return ctx.replyWithHTML('Usage: <code>/defadetest &lt;CA&gt;</code>');
+  }
+  const r = await runDeFadeTest(ca);
+  return ctx.replyWithHTML(
+    `${actionTimeLine('DeFade Test Time')}
+
+` +
+    `<b>DeFade Test</b>
+` +
+    `CA: <code>${ca}</code>
+` +
+    `Endpoint: ${r.endpoint}
+` +
+    `HTTP: ${r.httpStatus ?? 'n/a'}
+` +
+    `Cache: ${r.cache}
+` +
+    `Rug score: ${r.rugScore ?? 'n/a'}
+` +
+    `Action: ${r.action}
+` +
+    `Reason: ${r.reason}`
+  );
 });
 
 bot.command('tracking', ctx => {
@@ -429,7 +519,11 @@ bot.on('text', async ctx => {
     // Social fetch runs in parallel with the main data fetch to avoid adding latency.
     // fetchAll is the expensive chain; social is a single fast endpoint.
     const [data, social] = await Promise.all([
-      fetchAll(ca),
+      fetchAll(ca, {
+        manualMode: true,
+        skipCodex: config.CODEX_MODE === 'off',
+        skipGMGN: true,
+      }),
       fetchSocialData(ca),
     ]);
 
@@ -453,11 +547,11 @@ bot.on('text', async ctx => {
 
     // DeFade runs before Soul so Grok sees the final scanner/verification verdict.
     // DeFade only fires on BUY candidates (free-plan quota guard).
-    const deFade = result.verdict === 'BUY'
-      ? await fetchDeFadeVerification(ca, { lp: result.signals?.lp })
-      : (markApi('DeFade', { skipped: true, meta: { reason: 'non_buy_verdict', verdict: result.verdict } }), {
+    const deFade = result.oracleScore?.class === 'ORACLE_BUY'
+      ? await fetchDeFadeVerification(ca, { lp: result.signals?.lp }, { manualMode: true, buyCandidate: true })
+      : (markApi('DeFade', { skipped: true, meta: { reason: 'not_oracle_buy', class: result.oracleScore?.class || result.verdict } }), {
           action: 'SKIPPED',
-          reason: `Skipped because verdict was ${result.verdict}; DeFade only runs on BUY to preserve quota.`,
+          reason: `Skipped because class was ${result.oracleScore?.class || result.verdict}; DeFade only runs on ORACLE_BUY candidates.`,
           verified: false,
         });
     result.deFadeVerification = deFade;
@@ -465,22 +559,33 @@ bot.on('text', async ctx => {
       result.verdict    = 'NO_GO';
       result.entryTier  = null;
       result.noGoReason = `DeFade verification: ${deFade.reason}`;
+      if (!Array.isArray(result.oracleScore.hardBlocks)) result.oracleScore.hardBlocks = [];
+      result.oracleScore.hardBlocks.push('defade_hard_skip');
+      result.oracleScore.class = 'NO_GO';
     }
+    if (result.oracleScore?.class === 'DIRTY_RUNNER_WATCH') {
+      result.verdict = 'DIRTY_RUNNER_WATCH';
+      result.entryTier = null;
+    }
+
+    result.requiredStack = evaluateRequiredStack(result, data);
 
     const soul = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() });
     result.soulVerdict = soul;
     result.soulReasoning = soul?.reasoning ?? null;
 
     result.dataUsed = {
-      dex: !!data.codex,
-      pump: !!data.pump,
-      birdeye: !!data.birdeye,
-      solanaTracker: !!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders',
-      socialData: !!social?.available,
-      helius: data.holders?.source === 'helius',
-      codex: data.holders?.source === 'codex',
-      deFade: !!result.deFadeVerification && result.deFadeVerification.action !== 'SKIPPED',
-      grok: !!result.soulReasoning,
+      dex: { status: data.codex ? 'ok' : 'failed' },
+      pump: { status: data.pump ? 'ok' : 'failed' },
+      birdeye: data.birdeye ? { status: 'ok' } : { status: 'skipped', reason: 'mode_or_context' },
+      solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
+      socialData: { status: social?.available ? 'ok' : 'failed' },
+      helius: { status: data.holders?.source === 'helius' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' ? null : 'not_primary_holder_source' },
+      codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
+      deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason },
+      grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || null },
+      gmgn: { status: 'skipped', reason: 'audit_only_or_not_wired' },
+      rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
     };
 
     const mc      = result.signals.marketCap || 0;
@@ -489,7 +594,7 @@ bot.on('text', async ctx => {
     recordScan({
       ca,
       symbol:         data.codex?.symbol || data.pump?.symbol,
-      verdict:        result.verdict,
+      verdict:        result.oracleScore?.class || result.verdict,
       entryTier:      result.entryTier,
       mc:             result.signals?.marketCap,
       adjustedVolLiq: result.signals?.adjustedVolLiq,
@@ -568,7 +673,7 @@ bot.on('callback_query', async ctx => {
     let entryTier = null, timeWindow = 'DISCOVERY';
     let devWallet = null, holderCount = null, top10Pct = null, top50Pct = null, entryLp = null;
     try {
-      const scanData = await fetchAll(ca);
+      const scanData = await fetchAll(ca, { manualMode: true, skipCodex: config.CODEX_MODE === 'off', skipGMGN: true });
       const result   = scan(scanData);
       entryTier   = result.entryTier;
       timeWindow  = result.timeWindow;
@@ -670,13 +775,13 @@ async function launchWithRetry(maxAttempts = 10, delayMs = 3000) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       await bot.launch({ dropPendingUpdates: true });
-      console.log(`Oracle Bot v37.0.0 (Blueprint Predator) started — polling active (attempt ${attempt})`);
+      console.log(`${config.ORACLE_VERSION} started — polling active (attempt ${attempt})`);
 
       // Startup ping — hunters already loaded by hunt.start() above.
       const hunters = hunt.listHunters();
       const startupMsg =
-        `🚀 <b>Oracle v37.0.0 Online — Blueprint Predator</b>\n` +
-        `Top10 gate: v37 MC-aware | Soul + Audit: active\n` +
+        `🚀 <b>${config.ORACLE_VERSION} Online</b>\n` +
+        `Modes: Hunt free scan | Birdeye hunt hard-block | Grok sent-alert-only\n` +
         `Hunt engine: running | Use /huntstatus to verify.`;
       for (const chatId of hunters) {
         try { await bot.telegram.sendMessage(chatId, startupMsg, { parse_mode: 'HTML' }); }
