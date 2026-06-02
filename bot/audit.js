@@ -5,6 +5,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const config = require('./config');
 
 const DATA_DIR      = process.env.DATA_DIR || '/data';
 const AUDIT_FILE    = path.join(DATA_DIR, 'audit.json');
@@ -245,7 +246,7 @@ function getPatternMemory() {
     .slice(0, 8);
 
   const missedWinners = winners
-    .filter(r => ['SKIP', 'NO_GO', 'AVOID', 'WATCH_VOL', 'WATCH_WASH', 'RISKY_RUNNER'].includes(r.verdict))
+    .filter(r => ['SKIP', 'NO_GO', 'AVOID', 'WATCH_VOL', 'WATCH_WASH', 'RISKY_RUNNER', 'DIRTY_RUNNER_WATCH'].includes(r.verdict))
     .slice(0, 5);
 
   if (winners.length === 0 && rugs.length === 0 && missedWinners.length === 0) return null;
@@ -263,6 +264,76 @@ function updatePeaks(mcMap) {
   saveAudit();
 }
 
+
+
+async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false, deepMode = false } = {}) {
+  loadAudit();
+  const pending = auditQueue
+    .filter(e => !e.resolved)
+    .sort((a, b) => (a.lastChecked || 0) - (b.lastChecked || 0))
+    .slice(0, Math.max(1, limit));
+  if (!pending.length) return { checked: 0, resolved: 0 };
+
+  let resolved = 0;
+  for (const entry of pending) {
+    const currentMc = await resolveMc((ca) => fetchMcFn(ca, { allowBirdeye, deepMode }), entry.ca);
+    entry.lastChecked = Date.now();
+    if (currentMc == null) continue;
+    entry.currentMc = currentMc;
+    if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
+    if (Date.now() - entry.scanTime >= RESOLVE_MS) {
+      entry.resolved = true;
+      entry.outcome = classify(entry);
+      resolved++;
+      auditHistory.push({ ...entry });
+    }
+  }
+  auditQueue = auditQueue.filter(e => !e.resolved).slice(-MAX_ENTRIES);
+  auditHistory = auditHistory.slice(-HISTORY_LIMIT);
+  saveAudit();
+  return { checked: pending.length, resolved };
+}
+
+function getAuditPendingReport() {
+  loadAudit();
+  const now = Date.now();
+  const pending = auditQueue.filter(e => !e.resolved);
+  if (!pending.length) return 'No unresolved audit entries.';
+  return pending.slice(0, 30).map((e, idx) => {
+    const current = e.currentMc ?? e.scanMc ?? 0;
+    const peak = e.peakMc ?? current;
+    const mult = e.scanMc > 0 && current > 0 ? (current / e.scanMc).toFixed(2) : 'N/A';
+    const ageMin = Math.floor((now - e.scanTime) / 60000);
+    const resolveIn = Math.max(0, Math.floor((RESOLVE_MS - (now - e.scanTime)) / 60000));
+    return `${idx + 1}. ${e.ticker} | ${e.verdict} | scan:$${Math.round((e.scanMc || 0) / 1000)}K | current:$${Math.round((current || 0) / 1000)}K | peak:$${Math.round((peak || 0) / 1000)}K | multiple:${mult}x | age:${ageMin}m | resolve:${resolveIn}m | learned:${e.missedType || 'none'}`;
+  }).join('
+');
+}
+
+function matchLearnedPattern(result) {
+  const memory = getPatternMemory();
+  if (!memory?.missedWinners?.length) {
+    return { matched: false, action: null, type: null, confidence: 0, reason: 'No learned runner patterns yet.' };
+  }
+  const s = result?.signals || {};
+  const candidate = {
+    mc: Number(s.marketCap || 0),
+    top10: Number(s.top10Pct || 0),
+    wash: Number(s.washPct || 0),
+    vol: Number(s.adjustedVolLiq || 0),
+  };
+  const confidence = candidate.mc > 0 && candidate.mc < 100000 && candidate.vol >= 5 && candidate.wash <= 35 && candidate.top10 >= 20
+    ? 0.74
+    : 0.55;
+  return {
+    matched: confidence >= (config.DIRTY_RUNNER_MIN_CONFIDENCE || 0.7),
+    action: 'DIRTY_RUNNER_WATCH',
+    type: 'CONCENTRATION_RUNNER',
+    confidence,
+    reason: 'Matches prior missed 3x+ concentration runners: sub-$100K, organic vol, elevated top10, low wash.',
+  };
+}
+
 module.exports = {
   addToAudit,
   recordScan,
@@ -274,4 +345,7 @@ module.exports = {
   getAll,
   getUnresolved,
   getPatternMemory,
+  getAuditPendingReport,
+  processPendingOnce,
+  matchLearnedPattern,
 };

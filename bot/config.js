@@ -4,10 +4,45 @@ const config = {
   // Accept both names: Railway/live may use TELEGRAM_BOT_TOKEN,
   // older docs/dev env may use BOT_TOKEN.
   TELEGRAM_BOT_TOKEN:  process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '',
+  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v38.0 — Reupholster',
   GMGN_API_KEY:        process.env.GMGN_API_KEY        || '',
   OWNER_TELEGRAM_ID:   process.env.OWNER_TELEGRAM_ID   || '',
   PUMPPORTAL_API_KEY:  process.env.PUMPPORTAL_API_KEY  || '',
   SESSION_SIZE_SOL: parseFloat(process.env.SESSION_SIZE_SOL || '0.15'),
+
+  HUNT_DATA_MODE: process.env.HUNT_DATA_MODE || 'free',
+
+  BIRDEYE_MODE: process.env.BIRDEYE_MODE || 'audit_only',
+  BIRDEYE_HUNT_ENABLED: process.env.BIRDEYE_HUNT_ENABLED === 'true',
+
+  DEFADE_MODE: process.env.DEFADE_MODE || 'buy_only_timed',
+  DEFADE_MIN_INTERVAL_MS: parseInt(process.env.DEFADE_MIN_INTERVAL_MS || '6000', 10),
+  DEFADE_DAILY_MAX_CALLS: parseInt(process.env.DEFADE_DAILY_MAX_CALLS || '100', 10),
+  DEFADE_CACHE_TTL_MS: parseInt(process.env.DEFADE_CACHE_TTL_MS || '300000', 10),
+  DEFADE_DISABLE_ON_AUTH_FAIL: process.env.DEFADE_DISABLE_ON_AUTH_FAIL !== 'false',
+
+  GROK_MODE: process.env.GROK_MODE || 'audit_learning',
+  GROK_HUNT_ONLY_SENT: process.env.GROK_HUNT_ONLY_SENT !== 'false',
+  XAI_MODEL: process.env.XAI_MODEL || 'grok-4.3',
+
+  GMGN_MODE: process.env.GMGN_MODE || 'audit_only',
+  CODEX_MODE: process.env.CODEX_MODE || 'off',
+  RUGCHECK_MODE: process.env.RUGCHECK_MODE || 'pre_alert_optional',
+
+  AUDIT_BIRDEYE_MAX_PER_RUN: parseInt(process.env.AUDIT_BIRDEYE_MAX_PER_RUN || '10', 10),
+  AUDIT_GROK_MAX_PER_RUN: parseInt(process.env.AUDIT_GROK_MAX_PER_RUN || '5', 10),
+  AUDITDEEP_BIRDEYE_MAX_PER_RUN: parseInt(process.env.AUDITDEEP_BIRDEYE_MAX_PER_RUN || '25', 10),
+  AUDITDEEP_GROK_MAX_PER_RUN: parseInt(process.env.AUDITDEEP_GROK_MAX_PER_RUN || '10', 10),
+
+  DIRTY_RUNNER_WATCH_ENABLED: process.env.DIRTY_RUNNER_WATCH_ENABLED !== 'false',
+  DIRTY_RUNNER_MIN_CONFIDENCE: parseFloat(process.env.DIRTY_RUNNER_MIN_CONFIDENCE || '0.70'),
+
+  GROK_REQUIRED_FOR_BUY: process.env.GROK_REQUIRED_FOR_BUY === 'true',
+  DEFADE_REQUIRED_FOR_BUY: process.env.DEFADE_REQUIRED_FOR_BUY === 'true',
+  BIRDEYE_REQUIRED_FOR_HUNT: false,
+  PUMPFUN_REQUIRED_FOR_HUNT: false,
+  CODEX_REQUIRED_FOR_HUNT: false,
+  GMGN_REQUIRED_FOR_HUNT: false,
 
   LP_MIN_USD:          parseFloat(process.env.LP_MIN_USD          || '15000'),
   AGE_MAX_MIN:         parseFloat(process.env.AGE_MAX_MIN         || '60'),

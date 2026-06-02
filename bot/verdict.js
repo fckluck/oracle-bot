@@ -190,7 +190,19 @@ function formatVerdict(result, ca) {
     const bufferNote  = signals.proPilotBuffer ? ` ${i('| PRO PILOT BUFFER (3x floor)')}` : '';
     const socialNote  = socialUpgrade          ? ` ${i('| SOCIAL BREAKOUT UPGRADE')}` : '';
     const socialCtoNote = !socialUpgrade && socialCto && effectiveCto ? ` ${i('| SOCIAL CTO DETECTED')}` : '';
-    L.push(`${b('BUY CANDIDATE')} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})${bufferNote}${socialNote}${socialCtoNote}`);
+    const buyTitle = signals.proPilotBuffer ? 'BUY CANDIDATE — PRO PILOT BUFFER' : (signals.isEliteDev && entryTier === 'BASELINE_ENTRY' ? 'BUY CANDIDATE — ELITE DEV BUFFER' : 'BUY CANDIDATE — 5x+ ADJUSTED');
+    L.push(`${b(buyTitle)} — ${positionSizeSol} SOL (${tierPositionLabel(entryTier, positionUnits, scribbliSlippageWarning)})${bufferNote}${socialNote}${socialCtoNote}`);
+  } else if (verdict === 'DIRTY_RUNNER_WATCH' || result.oracleScore?.class === 'DIRTY_RUNNER_WATCH') {
+    L.push(`⚠️ ${b('DIRTY RUNNER WATCH — NOT A CLEAN BUY')}`);
+    L.push(`Original verdict: ${b(result.verdict || 'WATCH')}`);
+    const flags = [
+      signals.washPct != null ? `wash ${fmtPct(signals.washPct, 0)}` : null,
+      signals.top10Pct != null ? `top10 ${fmtPct(signals.top10Pct, 1)}` : null,
+      signals.bundleCount != null ? `slot ${signals.bundleCount}/slot` : null,
+    ].filter(Boolean).join(', ');
+    L.push(`Risk flags: ${esc(flags || 'elevated concentration / runner profile')}`);
+    L.push(`Why shown: ${esc(result.patternMatch?.reason || 'matched dirty-runner pattern with sufficient confidence')}`);
+    L.push(`Sizing: scout only / human discretion`);
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
     L.push(`${esc(watchReason)}`);
@@ -212,6 +224,15 @@ function formatVerdict(result, ca) {
     L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below 5x minimum`);
   }
   L.push(`Mode: ${b(timeWindow)}${timeWindow === 'DEAD_ZONE' ? ' ' + i('(TP1 $50K | SL 25% | Min 5x Adjusted)') : ''}`);
+  if (result.oracleScore) {
+    L.push(`Oracle Score: ${b(`${result.oracleScore.total}/100`)} | Class: ${b(result.oracleScore.class)}`);
+    if (result.oracleScore.hardBlocks?.length) {
+      L.push(`Hard blocks: ${esc(result.oracleScore.hardBlocks.join(', '))}`);
+    }
+    if (result.oracleScore.softWarnings?.length) {
+      L.push(`Soft warnings: ${esc(result.oracleScore.softWarnings.slice(0, 4).join(', '))}`);
+    }
+  }
   L.push('');
 
   // ── VOLUME QUALITY ─────────────────────────────────────────────────────────
@@ -429,6 +450,43 @@ function formatVerdict(result, ca) {
     L.push('');
   }
 
+  // ── TRUST STATUS ─────────────────────────────────────────────────────────
+  const oracleClass = result.oracleScore?.class || (verdict === 'BUY' ? 'ORACLE_BUY' : verdict);
+  const coreScanner = oracleClass === 'ORACLE_BUY'
+    ? '✅ VALID'
+    : oracleClass === 'DIRTY_RUNNER_WATCH' || String(verdict).startsWith('WATCH')
+      ? '⚠️ WATCH'
+      : '🚫 NO-GO';
+  const requiredStack = result.requiredStack?.pass ? '✅ PASS' : '🔴 FAIL';
+  const paidVerification = !dv || dv.action === 'SKIPPED'
+    ? '⚪ SKIPPED'
+    : dv.action === 'PASS'
+      ? '✅ VERIFIED'
+      : dv.action === 'UNAVAILABLE' || dv.action === 'NOT_INDEXED'
+        ? '⚪ OPTIONAL OFFLINE'
+        : dv.action === 'AUTH_FAIL' || dv.action === 'PLAN_RESTRICTED' || dv.action === 'HARD_SKIP'
+          ? '🔴 FAIL'
+          : '⚪ OPTIONAL OFFLINE';
+  const reasoningStatus = result.soulVerdict?.available
+    ? '✅ GROK ONLINE'
+    : (config.GROK_REQUIRED_FOR_BUY ? '⚪ OFFLINE' : '⚪ NOT REQUIRED');
+  const apiIntegrity = (() => {
+    const used = result.dataUsed || {};
+    const statuses = Object.values(used).map(v => typeof v === 'object' ? String(v.status || '') : (v ? 'ok' : 'failed'));
+    const fail = statuses.filter(st => st === 'failed').length;
+    const ok = statuses.filter(st => st === 'ok').length;
+    if (fail === 0 && ok >= 4) return '✅ FULL';
+    if (fail <= 2) return '🟡 PARTIAL';
+    return '🔴 DEGRADED';
+  })();
+  L.push(b('── TRUST STATUS ──'));
+  L.push(`Core Scanner: ${coreScanner}`);
+  L.push(`Required Stack: ${requiredStack}`);
+  L.push(`Paid Verification: ${paidVerification}`);
+  L.push(`Reasoning Layer: ${reasoningStatus}`);
+  L.push(`API Integrity: ${apiIntegrity}`);
+  L.push('');
+
   // ── LIVE METRICS ──────────────────────────────────────────────────────────
 
   L.push(b('── LIVE METRICS ──'));
@@ -437,16 +495,36 @@ function formatVerdict(result, ca) {
   L.push(`• ${b('Age:')} ${signals.ageMinutes != null ? signals.ageMinutes + 'min' : 'N/A'} | ${b('Buys/Sells:')} ${signals.buyCount ?? 'N/A'}/${signals.sellCount ?? 'N/A'}`);
   L.push('');
 
-  // ── TPs (BUY only) ────────────────────────────────────────────────────────
+  // ── TPs (class-calibrated) ───────────────────────────────────────────────
 
-  if (verdict === 'BUY') {
-    const tps = getTpTargets(entryTier, timeWindow);
-    const m = (mc > 0) ? mc : 1;
+  if (oracleClass === 'ORACLE_BUY' || oracleClass === 'DIRTY_RUNNER_WATCH' || verdict === 'BUY' || verdict === 'DIRTY_RUNNER_WATCH') {
     L.push(b('── TAKE PROFITS ──'));
-    L.push(`TP1: ${fmtUsd(tps.tp1)}  (${(tps.tp1/m).toFixed(1)}x)`);
-    L.push(`TP2: ${fmtUsd(tps.tp2)}  (${(tps.tp2/m).toFixed(1)}x)`);
-    L.push(`TP3: ${fmtUsd(tps.tp3)}  (${(tps.tp3/m).toFixed(1)}x)`);
-    L.push(`SL:  ${tps.slPct}% retrace from ATH | hard exit if LP &lt; $5K`);
+    if (oracleClass === 'DIRTY_RUNNER_WATCH' || verdict === 'DIRTY_RUNNER_WATCH') {
+      L.push('TP1: 2x');
+      L.push('TP2: 5x');
+      L.push('TP3: 10x');
+      L.push('Trail: 35–50% ATH retrace');
+      L.push('Sizing: smaller scout');
+      if (signals.isSerialDeployer) {
+        L.push('Serial deployer note: faster TP cadence, smaller scout, moonbag only after principal removed');
+      }
+    } else if (mc > 0 && mc < 50000) {
+      L.push('TP1: $100K');
+      L.push('TP2: $250K');
+      L.push('TP3: $500K');
+      L.push('TP4: $1M');
+      L.push('Moonbag: 10–20%');
+    } else if (mc >= 50000 && mc <= 100000) {
+      L.push('TP1: 2x');
+      L.push('TP2: 5x');
+      L.push('TP3: 10x');
+      L.push('TP4: $1M if momentum holds');
+      L.push('Moonbag: 10–20%');
+    } else {
+      L.push(`TP1: ${fmtUsd(config.TP1_MC)}`);
+      L.push(`TP2: ${fmtUsd(config.TP2_MC)}`);
+      L.push(`TP3: ${fmtUsd(config.TP3_MC)}`);
+    }
     L.push('');
   }
 
@@ -454,6 +532,26 @@ function formatVerdict(result, ca) {
     L.push('');
     L.push(`<b>── DATA USED ──</b>`);
     L.push(dataUsedHtml(result.dataUsed));
+
+    L.push('');
+    L.push(b('── REQUIRED STACK ──'));
+    L.push(result.dataUsed.dex?.status === 'ok' ? '✅ Dex' : '🔴 Dex');
+    L.push(result.dataUsed.solanaTracker?.status === 'ok' ? '✅ SolanaTracker' : '🔴 SolanaTracker');
+    L.push(result.dataUsed.socialData?.status === 'ok' ? '✅ SocialData' : '🔴 SocialData');
+    L.push(!(result.oracleScore?.hardBlocks || []).includes('confirmed_sybil') ? '✅ Bundle Heuristic' : '🔴 Bundle Heuristic');
+    L.push(`Result: ${result.requiredStack?.pass ? '✅ REQUIRED STACK PASS' : `🔴 REQUIRED STACK FAIL (${esc((result.requiredStack?.reasons || []).join(', '))})`}`);
+
+    L.push('');
+    L.push(b('── OPTIONAL STACK ──'));
+    L.push('⚪ Birdeye skipped: hunt hard block');
+    if (dv && (dv.action === 'PASS' || dv.action === 'FLAG')) L.push('✅ DeFade verified optional');
+    else if (dv && dv.action === 'HARD_SKIP') L.push('🔴 DeFade hard fail');
+    else L.push('⚪ DeFade skipped/offline optional');
+    L.push('⚪ GMGN audit-only');
+    L.push(`⚪ Codex ${config.CODEX_MODE === 'off' ? 'off' : 'optional'}`);
+    L.push(`⚪ RugCheck ${config.RUGCHECK_MODE}`);
+    if (result.soulVerdict?.available) L.push('✅ Grok');
+    else L.push(config.GROK_REQUIRED_FOR_BUY ? '🔴 Grok required missing' : '⚪ Grok not required');
   }
 
   L.push(`CA: ${code(ca)}`);

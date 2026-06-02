@@ -1,5 +1,6 @@
 const fetch = require('node-fetch');
 const { markApi } = require('./telemetry');
+const config = require('./config');
 
 const XAI_API_URL = 'https://api.x.ai/v1/chat/completions';
 const TIMEOUT_MS  = 15_000;
@@ -70,7 +71,7 @@ function buildPatternMemoryBlock(patternMemory) {
 async function postGrok(messages, maxTokens = 150, temperature = 0.3) {
   const key = process.env.XAI_API_KEY;
   if (!key) return null;
-  const model = process.env.XAI_MODEL || 'grok-2-mini';
+  const model = config.XAI_MODEL || 'grok-4.3';
   const res = await fetch(XAI_API_URL, {
     method: 'POST',
     headers: {
@@ -87,6 +88,12 @@ async function postGrok(messages, maxTokens = 150, temperature = 0.3) {
   });
   if (!res.ok) {
     const body = (await res.text()).slice(0, 300);
+    if (/model|unsupported|unknown model|does not exist|not found/i.test(body)) {
+      const err = new Error(`MODEL_INVALID:${model}`);
+      err.code = 'MODEL_INVALID';
+      err.model = model;
+      throw err;
+    }
     throw new Error(`xAI HTTP ${res.status}: ${body}`);
   }
   return res.json();
@@ -136,6 +143,14 @@ Explain whether this is a prior winner pattern, rug/failure pattern, or uncertai
     };
   } catch (err) {
     console.warn('[reasoning] Grok call failed:', err.message);
+    if (err?.code === 'MODEL_INVALID') {
+      markApi('Grok', { skipped: true, meta: { reason: 'invalid_model', model: err.model || config.XAI_MODEL } });
+      return {
+        available: false,
+        verdict: null,
+        reasoning: `⚪ OFFLINE — Grok model invalid: [${err.model || config.XAI_MODEL}]. Set XAI_MODEL.`,
+      };
+    }
     markApi('Grok', { ok: false, error: err.message });
     return {
       available: false,
@@ -177,7 +192,7 @@ async function probeXaiConnection() {
     console.log('[reasoning] XAI_API_KEY not set - Oracle Soul disabled');
     return;
   }
-  const model = process.env.XAI_MODEL || 'grok-2-mini';
+  const model = config.XAI_MODEL || 'grok-4.3';
   console.log(`[reasoning] probing xAI (model: ${model})...`);
   try {
     const data = await postGrok(

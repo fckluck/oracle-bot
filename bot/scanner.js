@@ -106,6 +106,92 @@ function washQualityLabel(washPct) {
   return 'WASH-HEAVY';
 }
 
+
+
+function clampScore(n) {
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function buildOracleScore(result, data = {}) {
+  const signals = result?.signals || {};
+  const social = data.social || result.social || {};
+  const hardBlocks = [];
+  const softWarnings = [];
+  const components = {
+    volumeQuality: 0,
+    devTrust: 0,
+    holderHealth: 0,
+    concentration: 0,
+    momentum: 0,
+    social: 0,
+    bundleRisk: 0,
+    liquidity: 0,
+    age: 0,
+  };
+
+  const adj = Number(signals.adjustedVolLiq || 0);
+  const wash = signals.washPct;
+  const top10 = signals.top10Pct;
+  const maxInSlot = signals.bundleCount || 0;
+
+  components.volumeQuality = adj >= 12 ? 14 : adj >= 8 ? 12 : adj >= 5 ? 9 : adj >= 3 ? 6 : 2;
+  components.devTrust = (signals.successRatePct ?? 0) >= 10 ? 12 : (signals.successRatePct ?? 0) >= 5 ? 9 : 5;
+  components.holderHealth = signals.holderHealth?.healthPct == null ? 6 : signals.holderHealth.healthPct > 250 ? 2 : 10;
+  components.concentration = top10 == null ? 6 : top10 <= 20 ? 10 : top10 <= 35 ? 6 : 2;
+  components.momentum = signals.momentumStatus === 'TOP_QUARTER' ? 12 : signals.momentumStatus === 'LOWER_RANGE' ? 6 : 4;
+  components.social = social?.available ? (social.isTrending ? 12 : 7) : 5;
+  components.bundleRisk = maxInSlot <= 5 ? 10 : maxInSlot <= 10 ? 7 : maxInSlot <= 20 ? 4 : 2;
+  components.liquidity = (signals.lp || signals.marketCap || 0) >= config.LP_MIN_USD ? 10 : 4;
+  components.age = signals.ageMinutes != null && signals.ageMinutes <= 15 ? 10 : 6;
+
+  if (signals.sybilFunded) hardBlocks.push('confirmed_sybil');
+  if (wash != null && wash > 50) hardBlocks.push('wash_over_50');
+  if (signals.marketCap == null || !Number.isFinite(Number(signals.marketCap)) || Number(signals.marketCap) <= 0) hardBlocks.push('malformed_or_missing_market_cap');
+  if (signals.holderHealth?.healthPct != null && signals.holderHealth.healthPct > 350) hardBlocks.push('severe_holder_spoofing');
+  if ((signals.lp || signals.marketCap || 0) <= 0) hardBlocks.push('liquidity_malformed');
+
+  if (maxInSlot >= 6) softWarnings.push('slot_cluster_suspicious');
+  if (maxInSlot > 10) softWarnings.push('bundle_risk');
+  if (top10 != null && top10 > 20) softWarnings.push('top10_elevated');
+  if (wash != null && wash > 30) softWarnings.push('wash_elevated');
+
+  let total = clampScore(Object.values(components).reduce((a, b) => a + b, 0));
+  let cls = 'WATCH';
+  if (hardBlocks.length) cls = 'NO_GO';
+  else if (total >= 72) cls = 'ORACLE_BUY';
+  else if (config.DIRTY_RUNNER_WATCH_ENABLED && total >= 58) cls = 'DIRTY_RUNNER_WATCH';
+  else if (total < 45) cls = 'NO_GO';
+
+  return { total, class: cls, components, hardBlocks, softWarnings };
+}
+
+function evaluateRequiredStack(result, data) {
+  const reasons = [];
+  const cls = result?.oracleScore?.class || 'WATCH';
+  const dexOk = !!data?.codex;
+  const stOk = !!data?.stToken || !!data?.stDeployer || data?.holders?.source === 'solanatracker-holders';
+  const socialOk = !!(result?.social?.available || data?.social?.available);
+  const bundleDone = !!result?.signals?.bundle;
+  const sybil = !!result?.signals?.sybilFunded;
+  const wash = result?.signals?.washPct;
+
+  if (!dexOk) reasons.push('dex_missing');
+  if (!stOk) reasons.push('solanatracker_missing');
+  if (!bundleDone) reasons.push('bundle_heuristic_incomplete');
+  if (sybil) reasons.push('confirmed_sybil');
+  if (wash != null && wash > 50) reasons.push('wash_over_50');
+
+  if (cls === 'ORACLE_BUY') {
+    if (!socialOk) reasons.push('socialdata_missing');
+    if (config.GROK_REQUIRED_FOR_BUY && !(result?.soulVerdict?.available)) reasons.push('grok_required_missing');
+    if (config.DEFADE_REQUIRED_FOR_BUY) {
+      const a = result?.deFadeVerification?.action;
+      if (!a || ['SKIPPED', 'UNAVAILABLE', 'AUTH_FAIL', 'PLAN_RESTRICTED'].includes(a)) reasons.push('defade_required_missing');
+    }
+  }
+
+  return { pass: reasons.length === 0, reasons };
+}
 // ── Main scan (v8.4 Anti-Wash Predator) ──────────────────────────────────────
 
 function scan(data) {
@@ -210,9 +296,16 @@ function scan(data) {
     noGoReason   = `SYBIL BUNDLE — ${bundle.uniqueSigners} buyers, ${bundle.fundingSources} funding source(s)`;
     headlineType = 'BUNDLE';
   }
-  else if (bundleCount > 10) {
-    noGoReason   = `BUNDLE RISK — ${bundleCount} txns in single slot`;
-    headlineType = 'BUNDLE';
+  else if (bundleCount > 20) {
+    const severeFlags =
+      (washPct !== null && washPct > 35 ? 1 : 0) +
+      (top10Pct !== null && top10Pct > top10HardMax ? 1 : 0) +
+      (holderHealthData?.healthPct != null && holderHealthData.healthPct > 250 ? 1 : 0) +
+      (isSerialDeployer ? 1 : 0);
+    if (severeFlags >= 2) {
+      noGoReason   = `CONFIRMED BUNDLE RISK — ${bundleCount}/slot with multiple severe risk flags`;
+      headlineType = 'BUNDLE';
+    }
   }
   // 3. Hard wash gate (>50%)
   else if (washPct !== null && washPct > 50) {
@@ -246,9 +339,7 @@ function scan(data) {
   // 7. Moderate bundle without DeFade clean — threshold raised to >7 (6-7/slot is borderline
   //    on a hot token; real bot clusters are 10+/slot; DeFade runs post-scan on BUY only)
   else if (bundleCount > 7 && !isDeFadeClean) {
-    const ctx = deFadeScore !== null ? `DeFade=${deFadeScore}` : 'DeFade unverified';
-    noGoReason   = `UNVERIFIED BUNDLE — ${bundleCount}/slot, ${ctx}`;
-    headlineType = 'BUNDLE';
+    // Slot clustering is a soft warning only unless sybil/other hard evidence exists.
   }
   // 7b. Zero-Survival Deployer: 10+ launches with ZERO migrations = serial rug artist.
   // Even if vol looks good, a dev who has never graduated a single token is a hard skip.
@@ -503,14 +594,38 @@ function scan(data) {
     ctoBehavior,
   };
 
+  const provisional = {
+    signals: {
+      adjustedVolLiq,
+      washPct,
+      top10Pct,
+      bundleCount,
+      sybilFunded,
+      marketCap: mc,
+      lp,
+      ageMinutes: ageMins,
+      successRatePct,
+      holderHealth: holderHealthData,
+      momentumStatus,
+    },
+    social,
+  };
+  const oracleScore = buildOracleScore(provisional, { social });
+  if (verdict === 'BUY' && oracleScore.class !== 'NO_GO') oracleScore.class = 'ORACLE_BUY';
+  if (['RISKY_RUNNER', 'WATCH_VOL', 'WATCH_WASH'].includes(verdict) && oracleScore.class === 'WATCH' && config.DIRTY_RUNNER_WATCH_ENABLED) {
+    oracleScore.class = 'DIRTY_RUNNER_WATCH';
+  }
+  if (['NO_GO', 'AVOID', 'SKIP'].includes(verdict) && oracleScore.class === 'WATCH') oracleScore.class = 'NO_GO';
+
   return {
     verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
     pressureLabel, momentumStatus, ctoBehavior,
     devProfile,
+    oracleScore,
     socialUpgrade, socialBreakout, socialCto, effectiveCto,
     signals: {
-      lp, ageMinutes: ageMins,
+      lp, ageMinutes: ageMins, momentumStatus,
       volume1h:       codex?.volume1h     ?? null,
       rawVolLiq, adjustedVolLiq, washPct, washVolumeUsd, washSource,
       washQuality:    washQualityLabel(washPct),
@@ -536,4 +651,4 @@ function scan(data) {
   };
 }
 
-module.exports = { scan };
+module.exports = { scan, evaluateRequiredStack };

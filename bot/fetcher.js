@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fetch = require('node-fetch');
 const { markApi } = require('./telemetry');
+const config = require('./config');
 
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens/';
 const CODEX_GQL       = 'https://graph.codex.io/graphql';
@@ -10,6 +11,37 @@ const JUPITER_PRICE   = 'https://price.jup.ag/v4/price?ids=';
 const SOLANA_RPC      = 'https://api.mainnet-beta.solana.com';
 const BIRDEYE_BASE    = 'https://public-api.birdeye.so';
 const SOCIALDATA_BASE = 'https://api.socialdata.tools';
+
+
+const defadeCache = new Map();
+let defadeDailyCounter = { day: new Date().toISOString().slice(0, 10), calls: 0 };
+let defadeLastCallAt = 0;
+let defadeAutoDisabledReason = null;
+
+function resetDefadeDailyIfNeeded() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (defadeDailyCounter.day !== day) {
+    defadeDailyCounter = { day, calls: 0 };
+  }
+}
+
+function getFetchContext(opts = {}) {
+  if (opts.huntMode) return 'hunt';
+  if (opts.deepMode) return 'auditdeep';
+  if (opts.auditMode) return 'audit';
+  if (opts.manualMode) return 'manual';
+  return 'unknown';
+}
+
+function birdeyeAllowed(opts = {}) {
+  if (opts.huntMode && !config.BIRDEYE_HUNT_ENABLED) return false;
+  if (opts.skipBirdeye) return false;
+  if (config.BIRDEYE_MODE === 'off') return false;
+  if (config.BIRDEYE_MODE === 'all') return true;
+  if (config.BIRDEYE_MODE === 'manual_and_audit') return !!(opts.manualMode || opts.auditMode || opts.deepMode);
+  if (config.BIRDEYE_MODE === 'audit_only') return !!(opts.auditMode || opts.deepMode);
+  return false;
+}
 
 function heliusRpc() {
   const key = process.env.HELIUS_API_KEY;
@@ -600,75 +632,176 @@ async function fetchJupiter(ca) {
 //   On any failure (missing key, 4xx/5xx, timeout, CF block, parse error) →
 //   { action: 'UNAVAILABLE', verified: false, ... } and bot continues scan.
 
-async function fetchDeFadeVerification(ca, oracleSignals = {}) {
-  const unavailable = (reason) => ({
-    action: 'UNAVAILABLE', reason, verified: false,
-    score: null, risk: null, factors: null,
+function deFadeModeAllows(opts = {}) {
+  if (opts.skipDeFade) return false;
+  if (config.DEFADE_MODE === 'off') return false;
+  if (config.DEFADE_MODE === 'all') return true;
+  if (config.DEFADE_MODE === 'audit_only') return !!(opts.auditMode || opts.deepMode);
+  if (config.DEFADE_MODE === 'buy_only_timed') return !!opts.buyCandidate;
+  return !!opts.buyCandidate;
+}
+
+function getDeFadeRuntime() {
+  resetDefadeDailyIfNeeded();
+  const ttlMs = Number.isFinite(config.DEFADE_CACHE_TTL_MS) ? config.DEFADE_CACHE_TTL_MS : 300000;
+  const now = Date.now();
+  const cooldownMs = Number.isFinite(config.DEFADE_MIN_INTERVAL_MS) ? config.DEFADE_MIN_INTERVAL_MS : 6000;
+  const cooldownRemainingMs = Math.max(0, cooldownMs - (now - defadeLastCallAt));
+  return {
+    mode: config.DEFADE_MODE,
+    cacheSize: defadeCache.size,
+    cacheTtlMs: ttlMs,
+    dailyCalls: defadeDailyCounter.calls,
+    dailyMaxCalls: config.DEFADE_DAILY_MAX_CALLS,
+    minIntervalMs: cooldownMs,
+    cooldownRemainingMs,
+    autoDisabled: !!defadeAutoDisabledReason,
+    autoDisabledReason: defadeAutoDisabledReason,
+  };
+}
+
+// ── DeFade verification module (v38.0) ────────────────────────────────────────
+async function fetchDeFadeVerification(ca, oracleSignals = {}, opts = {}) {
+  const unavailable = (action, reason, extra = {}) => ({
+    action,
+    reason,
+    verified: false,
+    score: null,
+    risk: null,
+    factors: null,
+    cache: extra.cache || 'miss',
+    endpoint: 'analyze',
+    httpStatus: extra.httpStatus ?? null,
+    rugBand: null,
   });
-  if (!process.env.DEFADE_API_KEY) { markApi('DeFade', { skipped: true, meta: { reason: 'missing_key' } }); return unavailable('DEFADE_API_KEY not configured'); }
+  if (!ca) return unavailable('UNAVAILABLE', 'Missing contract address.');
+  if (!deFadeModeAllows(opts)) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'mode_disabled', mode: config.DEFADE_MODE, context: getFetchContext(opts) } });
+    return unavailable('SKIPPED', `DeFade skipped by mode (${config.DEFADE_MODE}).`, { cache: 'miss' });
+  }
+  if (!process.env.DEFADE_API_KEY) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'missing_key' } });
+    return unavailable('UNAVAILABLE', 'DEFADE_API_KEY not configured.');
+  }
+  if (config.DEFADE_DISABLE_ON_AUTH_FAIL && defadeAutoDisabledReason) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'auth_auto_disabled' } });
+    return unavailable('AUTH_FAIL', `DeFade auto-disabled after auth failure: ${defadeAutoDisabledReason}`);
+  }
+
+  resetDefadeDailyIfNeeded();
+  const ttlMs = Number.isFinite(config.DEFADE_CACHE_TTL_MS) ? config.DEFADE_CACHE_TTL_MS : 300000;
+  const cached = defadeCache.get(ca);
+  if (!opts.noCache && cached && Date.now() - cached.at < ttlMs) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'cache_hit', ageMs: Date.now() - cached.at } });
+    return { ...cached.value, cache: 'hit' };
+  }
+
+  if (defadeDailyCounter.calls >= config.DEFADE_DAILY_MAX_CALLS) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'daily_budget_maxed', max: config.DEFADE_DAILY_MAX_CALLS } });
+    return unavailable('SKIPPED', 'DeFade daily budget reached.', { cache: 'miss' });
+  }
+  const minIntervalMs = Number.isFinite(config.DEFADE_MIN_INTERVAL_MS) ? config.DEFADE_MIN_INTERVAL_MS : 6000;
+  if (!opts.ignoreCooldown && defadeLastCallAt && Date.now() - defadeLastCallAt < minIntervalMs) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'cooldown', minIntervalMs } });
+    return unavailable('SKIPPED', `DeFade cooldown active (${minIntervalMs}ms).`, { cache: 'miss' });
+  }
 
   const base = process.env.DEFADE_BASE_URL || 'https://api.defade.org';
-  let data;
+  const endpoint = `${base}/v1/analyze/${ca}`;
+  let res;
+  let data = null;
+  defadeDailyCounter.calls += 1;
+  defadeLastCallAt = Date.now();
   try {
-    const res = await fetch(`${base}/v1/analyze/${ca}`, {
+    res = await fetch(endpoint, {
       headers: {
         'x-api-key': process.env.DEFADE_API_KEY,
         'Accept': 'application/json',
-        'User-Agent': 'OracleBot/8.2',
+        'User-Agent': 'OracleBot/38.0',
       },
       timeout: 6000,
     });
-    if (!res.ok) {
-      console.log(`[DeFade] HTTP ${res.status} — verification UNAVAILABLE`);
-      markApi('DeFade', { ok: false, error: `HTTP ${res.status}` });
-      return unavailable(`DeFade HTTP ${res.status}`);
-    }
-    data = await res.json();
+    if (res.ok) data = await res.json();
   } catch (e) {
-    console.error('[DeFade] error:', e.message);
     markApi('DeFade', { ok: false, error: e.message });
-    return unavailable(`DeFade error: ${e.message}`);
+    return unavailable('UNAVAILABLE', `DeFade error: ${e.message}`, { cache: 'miss' });
   }
 
-  // Defensive parsing — DeFade shape may vary across endpoints
-  const score = data?.score ?? data?.rugScore ?? data?.data?.score ?? null;
-  const risk  = data?.risk  ?? data?.riskLevel ?? data?.data?.risk ?? null;
+  if (!res.ok) {
+    if (res.status === 404) {
+      markApi('DeFade', { ok: false, error: 'HTTP 404', meta: { status: 404 } });
+      return unavailable('NOT_INDEXED', 'DeFade has not indexed this fresh CA yet', { httpStatus: 404 });
+    }
+    if (res.status === 401) {
+      defadeAutoDisabledReason = 'HTTP 401';
+      markApi('DeFade', { ok: false, error: 'HTTP 401', meta: { status: 401 } });
+      return unavailable('AUTH_FAIL', 'DeFade auth failed. Check DEFADE_API_KEY and x-api-key header.', { httpStatus: 401 });
+    }
+    if (res.status === 403) {
+      markApi('DeFade', { ok: false, error: 'HTTP 403', meta: { status: 403 } });
+      return unavailable('PLAN_RESTRICTED', 'Endpoint not available on current DeFade plan.', { httpStatus: 403 });
+    }
+    markApi('DeFade', { ok: false, error: `HTTP ${res.status}`, meta: { status: res.status } });
+    return unavailable('UNAVAILABLE', `DeFade HTTP ${res.status}`, { httpStatus: res.status });
+  }
+
+  const scoreRaw = data?.score ?? data?.rugScore ?? data?.data?.score ?? null;
+  const score = scoreRaw != null && Number.isFinite(Number(scoreRaw)) ? Number(scoreRaw) : null;
+  const risk = data?.risk ?? data?.riskLevel ?? data?.data?.risk ?? null;
   const factors = data?.factors ?? data?.data?.factors ?? data ?? {};
+  const liquidity = Number(factors?.liquidityUsd ?? factors?.liquidity ?? NaN);
 
-  const top10Pct       = Number(factors?.top10HolderPct ?? factors?.top10 ?? NaN);
-  const bundlesCount   = Number(factors?.bundlesDetected ?? factors?.bundles ?? NaN);
-  const dfLiquidityUsd = Number(factors?.liquidityUsd ?? factors?.liquidity ?? NaN);
-
-  // Apply verification rules — HARD_SKIP overrides all others.
-  let action = 'PASS', reason = 'All checks within tolerance';
-
-  if (score != null && Number(score) >= 80) {
-    action = 'HARD_SKIP'; reason = `Rug score ${score}/100 ≥ 80`;
-  } else if (isFinite(bundlesCount) && bundlesCount >= 3) {
-    action = 'HARD_SKIP'; reason = `Bundle manipulation confirmed (${bundlesCount} bundles)`;
-  } else if (isFinite(top10Pct) && top10Pct >= 35) {
-    // Threshold aligned with scanner's minimum cap (35% for sub-$100K, 25% for $100K+).
-    // The old 15% threshold hard-killed every early-stage token the scanner had already
-    // approved — early launches routinely show 20-30% top10 concentration.
-    action = 'HARD_SKIP'; reason = `Holder concentration top10 ${top10Pct}% ≥ 35%`;
-  } else if (
-    isFinite(dfLiquidityUsd) && oracleSignals.lp > 0 &&
-    Math.abs(dfLiquidityUsd - oracleSignals.lp) / oracleSignals.lp > 0.5
-  ) {
-    // DeFade liquidity disagrees with DexScreener/Birdeye by >50% → suspicious
-    action = 'FLAG';
-    reason = `Liquidity mismatch — DeFade $${dfLiquidityUsd.toFixed(0)} vs Oracle $${oracleSignals.lp.toFixed(0)}`;
-  } else if (score != null && Number(score) >= 50) {
-    action = 'FLAG'; reason = `Elevated rug score ${score}/100`;
+  let rugBand = null;
+  if (score != null) {
+    if (score <= 25) rugBand = 'SAFE';
+    else if (score <= 50) rugBand = 'MODERATE';
+    else if (score <= 75) rugBand = 'HIGH_RISK';
+    else rugBand = 'HARD_SKIP';
   }
 
-  console.log(`[DeFade] action=${action} score=${score} risk=${risk} reason="${reason}"`);
-  markApi('DeFade', { ok: true, meta: { action, score, risk } });
-  return {
-    action, reason, verified: true,
-    score: score != null ? Number(score) : null,
-    risk: risk ?? null,
+  let action = 'PASS';
+  let reason = 'DeFade verification passed on free endpoint analyze.';
+  if (score != null && score > 75) {
+    action = 'HARD_SKIP';
+    reason = `Rug score ${score}/100 indicates hard skip risk.`;
+  } else if (score != null && score > 50) {
+    action = 'FLAG';
+    reason = `Elevated rug score ${score}/100 (${rugBand}).`;
+  } else if (Number.isFinite(liquidity) && oracleSignals.lp > 0 && Math.abs(liquidity - oracleSignals.lp) / oracleSignals.lp > 0.5) {
+    action = 'FLAG';
+    reason = `Liquidity mismatch — DeFade $${liquidity.toFixed(0)} vs Oracle $${oracleSignals.lp.toFixed(0)}.`;
+  }
+
+  const payload = {
+    action,
+    reason,
+    verified: true,
+    score,
+    risk,
     factors,
+    endpoint: 'analyze',
+    httpStatus: 200,
+    cache: 'miss',
+    rugBand,
+  };
+  defadeCache.set(ca, { at: Date.now(), value: payload });
+  markApi('DeFade', { ok: true, meta: { action, score, rugBand } });
+  return payload;
+}
+
+async function runDeFadeTest(ca) {
+  const result = await fetchDeFadeVerification(ca, {}, {
+    manualMode: true,
+    buyCandidate: true,
+    noCache: false,
+  });
+  return {
+    endpoint: result.endpoint || 'analyze',
+    httpStatus: result.httpStatus ?? null,
+    cache: result.cache || 'miss',
+    rugScore: result.score ?? null,
+    action: result.action,
+    reason: result.reason,
   };
 }
 
@@ -750,6 +883,15 @@ async function fetchCodexHolders(ca) {
 // burning paid API credits on it. Used by Hunt mode; manual /scan omits opts.
 async function fetchAll(ca, opts = {}) {
   console.log(`[fetchAll] starting fetch for CA: ${ca}`);
+  const context = getFetchContext(opts);
+  const allowBirdeye = birdeyeAllowed(opts);
+  const allowCodex = !(opts.skipCodex || config.CODEX_MODE === 'off');
+  if (opts.skipGMGN || config.GMGN_MODE === 'audit_only') {
+    markApi('GMGN', { skipped: true, meta: { reason: opts.skipGMGN ? 'skip_flag' : 'audit_only_mode', context } });
+  }
+  if (opts.skipDeFade) {
+    markApi('DeFade', { skipped: true, meta: { reason: 'skip_flag', context } });
+  }
 
   // Phase 1a: cheap market data only (DexScreener + PumpPortal are free)
   const [pump, dex] = await Promise.all([
@@ -783,10 +925,31 @@ async function fetchAll(ca, opts = {}) {
   // Phase 1b: paid enrichment — only reached when vol/liq clears the floor.
   // fetchBirdeyeOverview is always fetched here (not deferred into the holder
   // closure) so wash signals are available regardless of which holder source wins.
+  const birdeyePromise = allowBirdeye
+    ? fetchBirdeye(ca)
+    : (markApi('Birdeye', {
+        skipped: true,
+        meta: {
+          reason: opts.huntMode ? 'hunt_hard_block' : 'mode_disabled',
+          mode: config.BIRDEYE_MODE,
+          context,
+        },
+      }), Promise.resolve(null));
+  const beOverviewPromise = allowBirdeye
+    ? fetchBirdeyeOverview(ca)
+    : (markApi('Birdeye', {
+        skipped: true,
+        meta: {
+          endpoint: 'overview',
+          reason: opts.huntMode ? 'hunt_hard_block' : 'mode_disabled',
+          mode: config.BIRDEYE_MODE,
+          context,
+        },
+      }), Promise.resolve(null));
   const [birdeye, stToken, beOverview] = await Promise.all([
-    fetchBirdeye(ca),
+    birdeyePromise,
     fetchSolanaTrackerToken(ca),
-    fetchBirdeyeOverview(ca),
+    beOverviewPromise,
   ]);
   const beOverviewResult = beOverview; // always available for wash computation
 
@@ -847,7 +1010,12 @@ async function fetchAll(ca, opts = {}) {
       //      → augmented with Birdeye/PumpPortal full count when possible
       //   4. Birdeye-only        — count only, no concentration
       //   5. PumpPortal-only     — count only, no concentration
-      let h = await fetchCodexHolders(ca);
+      let h = null;
+      if (allowCodex) {
+        h = await fetchCodexHolders(ca);
+      } else {
+        markApi('Codex', { skipped: true, meta: { reason: 'mode_disabled', mode: config.CODEX_MODE, context } });
+      }
       if (h) { console.log(`[fetchAll] holders: Codex — count=${h.holderCount} top10=${h.top10Pct?.toFixed(1)}%`); return h; }
 
       // SolanaTracker holders: full count + concentration in one call — use if available
@@ -1018,10 +1186,25 @@ async function fetchForensic(ca) {
   };
 }
 
-// Lightweight MC-only fetch used by the audit background loop.
-// Uses Birdeye token_overview (already called in fetchBirdeye) — single request,
-// no heavy multi-API fetchAll. Returns { mc } or null on error/missing key.
-async function fetchMcOnly(ca) {
+// Lightweight MC-only fetch used by audit loops and audit commands.
+// Priority: DexScreener -> Jupiter -> Birdeye (only when explicitly allowed).
+async function fetchMcOnly(ca, opts = {}) {
+  const dex = await fetchDexScreener(ca).catch(() => null);
+  const dexMc = dex?.marketCap ?? null;
+  if (dexMc != null && Number.isFinite(Number(dexMc)) && Number(dexMc) > 0) {
+    return { mc: Number(dexMc), source: 'dexscreener' };
+  }
+  const jup = await fetchJupiter(ca).catch(() => null);
+  const jupMc = jup?.marketCap ?? null;
+  if (jupMc != null && Number.isFinite(Number(jupMc)) && Number(jupMc) > 0) {
+    return { mc: Number(jupMc), source: 'jupiter' };
+  }
+
+  const allowBirdeyeFallback = !!opts.allowBirdeye && birdeyeAllowed({ auditMode: true, deepMode: !!opts.deepMode });
+  if (!allowBirdeyeFallback) {
+    markApi('Birdeye', { skipped: true, meta: { reason: 'audit_fallback_disabled', context: opts.deepMode ? 'auditdeep' : 'audit' } });
+    return null;
+  }
   const key = process.env.BIRDEYE_API_KEY;
   if (!key) return null;
   try {
@@ -1031,10 +1214,21 @@ async function fetchMcOnly(ca) {
       { headers, timeout: 8000 },
     );
     if (!res.ok) return null;
-    const j  = await res.json();
+    const j = await res.json();
     const mc = j?.data?.mc ?? j?.data?.marketCap ?? null;
-    return mc != null ? { mc: Number(mc) } : null;
-  } catch { return null; }
+    return mc != null ? { mc: Number(mc), source: 'birdeye' } : null;
+  } catch {
+    return null;
+  }
 }
 
-module.exports = { fetchAll, fetchForensic, fetchDeFadeVerification, fetchSocialData, fetchMcOnly };
+module.exports = {
+  birdeyeAllowed,
+  fetchAll,
+  fetchForensic,
+  fetchDeFadeVerification,
+  fetchSocialData,
+  fetchMcOnly,
+  getDeFadeRuntime,
+  runDeFadeTest,
+};
