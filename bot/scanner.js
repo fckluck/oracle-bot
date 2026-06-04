@@ -127,12 +127,20 @@ function buildOracleScore(result, data = {}) {
     bundleRisk: 0,
     liquidity: 0,
     age: 0,
+    narrative: 0,
   };
 
   const adj = Number(signals.adjustedVolLiq || 0);
   const wash = signals.washPct;
   const top10 = signals.top10Pct;
   const maxInSlot = signals.bundleCount || 0;
+  const narrativeStrength = Number(signals.narrativeStrength || 0);
+  const narrativeBonus = narrativeStrength <= 0 ? 0
+    : narrativeStrength === 1 ? 2
+    : narrativeStrength === 2 ? 5
+    : narrativeStrength === 3 ? 10
+    : narrativeStrength === 4 ? 15
+    : 20;
 
   components.volumeQuality = adj >= 12 ? 14 : adj >= 8 ? 12 : adj >= 5 ? 9 : adj >= 3 ? 6 : 2;
   components.devTrust = (signals.successRatePct ?? 0) >= 10 ? 12 : (signals.successRatePct ?? 0) >= 5 ? 9 : 5;
@@ -143,18 +151,24 @@ function buildOracleScore(result, data = {}) {
   components.bundleRisk = maxInSlot <= 5 ? 10 : maxInSlot <= 10 ? 7 : maxInSlot <= 20 ? 4 : 2;
   components.liquidity = (signals.lp || signals.marketCap || 0) >= config.LP_MIN_USD ? 10 : 4;
   components.age = signals.ageMinutes != null && signals.ageMinutes <= 15 ? 10 : 6;
+  components.narrative = narrativeBonus;
 
   if (signals.sybilFunded) hardBlocks.push('confirmed_sybil');
   if (wash != null && wash > 50) hardBlocks.push('wash_over_50');
   if (signals.marketCap == null || !Number.isFinite(Number(signals.marketCap)) || Number(signals.marketCap) <= 0) hardBlocks.push('malformed_or_missing_market_cap');
-  if (signals.holderHealth?.healthPct != null && signals.holderHealth.healthPct > 350) hardBlocks.push('severe_holder_spoofing');
+  if (signals.holderHealth?.healthPct != null && signals.holderHealth.healthPct > 350 && (signals.sybilFunded || (wash ?? 0) > 30 || maxInSlot > 10)) {
+    hardBlocks.push('severe_holder_spoofing');
+  }
   if ((signals.lp || signals.marketCap || 0) <= 0) hardBlocks.push('liquidity_malformed');
 
   if (maxInSlot >= 6) softWarnings.push('slot_cluster_suspicious');
   if (maxInSlot > 10) softWarnings.push('bundle_risk');
   if (top10 != null && top10 > 20) softWarnings.push('top10_elevated');
   if (wash != null && wash > 30) softWarnings.push('wash_elevated');
+  if (signals.earlyExpansionZone) softWarnings.push('early_expansion_zone');
+  if (narrativeStrength >= 3) softWarnings.push('narrative_catalyst');
 
+  const baseTotal = clampScore(Object.values(components).reduce((a, b) => a + b, 0) - components.narrative);
   let total = clampScore(Object.values(components).reduce((a, b) => a + b, 0));
   let cls = 'WATCH';
   if (hardBlocks.length) cls = 'NO_GO';
@@ -162,7 +176,11 @@ function buildOracleScore(result, data = {}) {
   else if (config.DIRTY_RUNNER_WATCH_ENABLED && total >= 58) cls = 'DIRTY_RUNNER_WATCH';
   else if (total < 45) cls = 'NO_GO';
 
-  return { total, class: cls, components, hardBlocks, softWarnings };
+  if (cls === 'ORACLE_BUY' && baseTotal < 72) {
+    cls = baseTotal >= 58 && config.DIRTY_RUNNER_WATCH_ENABLED ? 'DIRTY_RUNNER_WATCH' : 'WATCH';
+  }
+
+  return { total, baseTotal, class: cls, components, hardBlocks, softWarnings };
 }
 
 function evaluateRequiredStack(result, data) {
@@ -280,6 +298,10 @@ function scan(data) {
   // Social data is declared here so it's available to both the kill-shot hierarchy
   // (Social Necessity gate) and the Social Breakout upgrade block below.
   const social = data.social ?? null;
+  const narrativeType = social?.narrativeType || 'NONE';
+  const narrativeStrength = Number(social?.narrativeStrength || 0);
+  const narrativeReason = social?.narrativeReason || 'No narrative catalyst detected.';
+  const earlyExpansionZone = mc != null && mc >= 10_000 && mc <= 30_000;
 
   // ── Kill-Shot Headline Hierarchy (v8.4) ───────────────────────────────────
   // Priority: Bundle > Momentum > Concentration > Wash > Liquidity > Deployer
@@ -348,10 +370,15 @@ function scan(data) {
     noGoReason   = `RUGGER PROFILE — ${devLaunches} launches, 0 migrations (zero-survival dev)`;
     headlineType = 'DEPLOYER';
   }
-  // 8. Concentration hard cap (v12.0: MC-aware threshold — 35% under $100K, 25% above)
+  // 8. Concentration hard cap (adjusted): elevated concentration is weighted risk.
+  // Only severe concentration + supporting danger hard-blocks this lane.
   else if (top10Pct !== null && top10Pct > top10HardMax) {
-    noGoReason   = `CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% > ${top10HardMax}%`;
-    headlineType = 'CONCENTRATION';
+    const severeConcentration = top10Pct > 55 ||
+      (top10Pct > 50 && ((washPct ?? 0) > 30 || bundleCount > 10 || (holderHealthData?.healthPct ?? 0) > 300));
+    if (severeConcentration) {
+      noGoReason   = `SEVERE CONCENTRATION FAIL — Top10 ${top10Pct.toFixed(1)}% with supporting danger signals`;
+      headlineType = 'CONCENTRATION';
+    }
   }
   // 9. Botted/missing holders at sub-$100K MC.
   //    v12.0 exception: if MC < $40K AND adjusted vol/liq ≥ 8x AND data is merely
@@ -607,6 +634,9 @@ function scan(data) {
       successRatePct,
       holderHealth: holderHealthData,
       momentumStatus,
+      earlyExpansionZone,
+      narrativeType,
+      narrativeStrength,
     },
     social,
   };
@@ -621,6 +651,9 @@ function scan(data) {
     verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
     pressureLabel, momentumStatus, ctoBehavior,
+    narrativeType,
+    narrativeStrength,
+    narrativeReason,
     devProfile,
     oracleScore,
     socialUpgrade, socialBreakout, socialCto, effectiveCto,
@@ -640,6 +673,10 @@ function scan(data) {
       top3Pct:        holders?.top3Pct    ?? null,
       top50Pct:       holders?.top50Pct   ?? null,
       curvePct, ctoDesc, timeWindow, bundle,
+      earlyExpansionZone,
+      narrativeType,
+      narrativeStrength,
+      narrativeReason,
       birdeye: birdeye || null,
       bundleCount, isMeteora, deFadeScore, isDeFadeClean, sybilFunded,
       holderHealth:   holderHealthData,

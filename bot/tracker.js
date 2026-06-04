@@ -12,6 +12,7 @@ const { fetchForensic } = require('./fetcher');
 
 const MAX_POSITIONS  = 10;
 const POLL_INTERVAL  = 60 * 1000; // 60s
+const HARD_DANGER_TTL_MS = 10 * 60 * 1000;
 
 // v10.2.7: persist on Railway volume if available. Order:
 //   1. POSITIONS_FILE env override (explicit)
@@ -23,6 +24,7 @@ function resolvePersistFile() {
   return path.join(__dirname, 'positions.json');
 }
 const PERSIST_FILE = resolvePersistFile();
+const DATA_DIR = process.env.DATA_DIR || '/data';
 console.log(`[tracker] persist file: ${PERSIST_FILE}`);
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -55,11 +57,24 @@ function saveToDisk() {
 function loadFromDisk() {
   try {
     if (!fs.existsSync(PERSIST_FILE)) return;
-    const raw = JSON.parse(fs.readFileSync(PERSIST_FILE, 'utf8'));
+    const text = fs.readFileSync(PERSIST_FILE, 'utf8');
+    let raw = null;
+    try {
+      raw = JSON.parse(text);
+    } catch (e) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const corruptPath = PERSIST_FILE.replace(/\.json$/i, '') + `.corrupt.${ts}.json`;
+      fs.renameSync(PERSIST_FILE, corruptPath);
+      console.error(`[tracker] positions JSON parse failed (${e.message}). Preserved corrupt file: ${corruptPath}`);
+      return;
+    }
     if (!Array.isArray(raw)) return;
     for (const p of raw) {
       p.alertedFlags    = new Set(p.alertedFlags || []);
       p.holderSnapshots = p.holderSnapshots || [];
+      p.top50Snapshots  = p.top50Snapshots || [];
+      p.priceSnapshots  = p.priceSnapshots || [];
+      p.hardDangerFlags = p.hardDangerFlags || [];
       positions.set(p.ca, p);
     }
     if (positions.size > 0) {
@@ -331,6 +346,9 @@ function detectShakeout(pos, lp, holderCount, top50Pct) {
     if (lp < pos.entryLp * 0.90) return null;
   }
 
+  // Criterion 3: top50 stable or improving (no cluster concentration rise).
+  if (pos.entryTop50Pct != null && top50Pct != null && top50Pct > pos.entryTop50Pct * 1.05) return null;
+
   // Jeet-exit confirmation: top 50 wallets are still holding firm
   const jeetExit = (top50Pct != null && pos.entryTop50Pct != null)
     ? top50Pct <= pos.entryTop50Pct * 1.05
@@ -356,6 +374,19 @@ async function checkPosition(pos, bot) {
 
     // Update ATH
     if (mc && mc > pos.peakMc) pos.peakMc = mc;
+
+    // Baseline retry on normal Guardian polls for pending entries.
+    if (pos.entryMc == null || pos.entryMc <= 0) pos.entryMc = mc ?? pos.entryMc ?? 0;
+    if (pos.entryLp == null && lp != null) pos.entryLp = lp;
+    if (pos.entryHolderCount == null && holderCount != null) {
+      pos.entryHolderCount = holderCount;
+      pos.holderSnapshots = [{ ts: now, count: holderCount }];
+    }
+    if (pos.entryTop10Pct == null && top10Pct != null) pos.entryTop10Pct = top10Pct;
+    if (pos.entryTop50Pct == null && top50Pct != null) {
+      pos.entryTop50Pct = top50Pct;
+      pos.top50Snapshots = [{ ts: now, pct: top50Pct }];
+    }
 
     // Update rolling holder snapshots (10m window — stagnation check)
     if (holderCount != null) {
@@ -383,6 +414,23 @@ async function checkPosition(pos, bot) {
 
     const slPct  = pos.timeWindow === 'DEAD_ZONE' ? 25 : 50;
     const alerts = [];
+    const hardNow = [];
+    pos.hardDangerFlags = pos.hardDangerFlags || [];
+
+    const addHardDanger = (key, reason, action = 'EXIT') => {
+      const existing = pos.hardDangerFlags.find(f => f.key === key);
+      if (existing) {
+        existing.ts = now;
+        existing.reason = reason;
+        existing.action = action;
+      } else {
+        pos.hardDangerFlags.push({ key, reason, action, ts: now });
+      }
+      hardNow.push({ key, reason, action, ts: now });
+    };
+
+    const activeHardDanger = () => (pos.hardDangerFlags || [])
+      .filter(f => now - (f.ts || 0) <= HARD_DANGER_TTL_MS);
 
     // ── 0. CANDLE CRUSH (highest priority — sub-minute rug detection) ───────
     // If MC dropped >25% within the last 90s, broadcast IMMEDIATELY before any
@@ -390,7 +438,8 @@ async function checkPosition(pos, bot) {
     if (mc != null && mc > 0 && (pos.priceSnapshots?.length ?? 0) >= 2 && !pos.alertedFlags.has('CANDLE_CRUSH')) {
       const maxMc = Math.max(...pos.priceSnapshots.map(s => s.mc));
       const dropPct = ((maxMc - mc) / maxMc) * 100;
-      if (dropPct > 25) {
+      if (dropPct > 30) {
+        addHardDanger('CANDLE_CRUSH', `candle crush ${dropPct.toFixed(1)}% in <90s`, 'EXIT');
         alerts.push(
           `🚨 *ORACLE EMERGENCY: CANDLE CRUSH*\n` +
           `Price dropped *${dropPct.toFixed(1)}%* in <90s ` +
@@ -414,6 +463,7 @@ async function checkPosition(pos, bot) {
     ) {
       const drop = pos.entryTop50Pct - top50Pct;
       if (drop >= 3) {
+        addHardDanger('CLUSTER_EXIT', `top50 supply dropped ${drop.toFixed(1)}%`, 'EXIT');
         alerts.push(
           `🚨 *CLUSTER EXIT DETECTED*\n` +
           `Top 50 supply dropped *${drop.toFixed(1)}%* ` +
@@ -428,6 +478,7 @@ async function checkPosition(pos, bot) {
     if (pos.devWallet && !pos.alertedFlags.has('FEE_LOADER')) {
       const fl = await checkDevFeeLoader(pos.devWallet);
       if (fl.detected) {
+        addHardDanger('FEE_LOADER', `dev wallet loaded ${fl.uniqueDestinations} sub-wallets`, 'EXIT');
         alerts.push(
           `🚨 *PRE-DUMP PREP*\n` +
           `Dev wallet loaded *${fl.uniqueDestinations}* sub-wallets with 0.01–0.1 SOL in the last 5 minutes\n→ *EXIT 100% NOW*`
@@ -463,6 +514,7 @@ async function checkPosition(pos, bot) {
 
     // ── D. Momentum decay ───────────────────────────────────────────────────
     if (adjustedVolLiq !== null && adjustedVolLiq < 2.0 && !pos.alertedFlags.has('VOL_DECAY')) {
+      if ((sig.change1h ?? 0) < 0) addHardDanger('VOL_DECAY', `adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x while price is falling`, 'TRIM');
       alerts.push(
         `⚠️ *MOMENTUM DECAY*\nAdjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x — below 2x exit floor\n→ *TRIM 75% NOW*`
       );
@@ -471,13 +523,25 @@ async function checkPosition(pos, bot) {
 
     // ── LP floor ────────────────────────────────────────────────────────────
     if (lp > 0 && lp < 5000 && !pos.alertedFlags.has('LP_FLOOR')) {
+      addHardDanger('LP_FLOOR', `LP floor breached at ${fmtUsd(lp)}`, 'EXIT');
       alerts.push(`🚨 *LP FLOOR HIT* — ${fmtUsd(lp)} (below $5K)\n→ *HARD EXIT 100%*`);
       pos.alertedFlags.add('LP_FLOOR');
+    }
+
+    if (pos.entryLp != null && lp != null && pos.entryLp > 0 && lp < pos.entryLp * 0.80) {
+      addHardDanger('LP_DRAIN', `LP dropped ${(((pos.entryLp - lp) / pos.entryLp) * 100).toFixed(1)}% from entry`, 'EXIT');
+    }
+    if (pos.entryHolderCount != null && holderCount != null && holderCount < pos.entryHolderCount * 0.90) {
+      addHardDanger('HOLDER_DROP', `holders dropped ${(((pos.entryHolderCount - holderCount) / pos.entryHolderCount) * 100).toFixed(1)}% from entry`, 'EXIT');
+    }
+    if (pos.entryTop50Pct != null && top50Pct != null && top50Pct > pos.entryTop50Pct + 3) {
+      addHardDanger('TOP50_RISE', `top50 concentration rose ${((top50Pct - pos.entryTop50Pct)).toFixed(1)}%`, 'EXIT');
     }
 
     // ── ATH stop-loss retrace + Shakeout Diagnostic ─────────────────────────
     if (pos.peakMc > 0 && mc > 0) {
       const retracePct = ((pos.peakMc - mc) / pos.peakMc) * 100;
+      const hardActive = activeHardDanger();
 
       // Early advisory: ≥20% flush before SL fires — warn if on-chain health is still green.
       // Fires once (SHAKEOUT_20) so it doesn't spam every 60s poll.
@@ -487,7 +551,7 @@ async function checkPosition(pos, bot) {
         !pos.alertedFlags.has('SHAKEOUT_20')
       ) {
         const shakeout = detectShakeout(pos, lp, holderCount, top50Pct);
-        if (shakeout) {
+        if (shakeout && hardActive.length === 0) {
           const jeetLine = shakeout.jeetExit
             ? `\n⚠️ *JEET EXIT:* Top 50 holding firm — weak hands are flushing.`
             : '';
@@ -497,6 +561,15 @@ async function checkPosition(pos, bot) {
             `→ *HOLD THE LINE. Reversal expected.*`
           );
           pos.alertedFlags.add('SHAKEOUT_20');
+        } else if (shakeout && hardActive.length > 0 && !pos.alertedFlags.has('SHAKEOUT_CONFLICT')) {
+          const reasons = hardActive.map(f => `• ${f.reason}`).join('\n');
+          const action = hardActive.some(f => f.action === 'EXIT') ? 'EXIT' : 'TRIM';
+          alerts.push(
+            `⚠️ *CONFLICT: EXIT SIGNAL HAS PRIORITY*\n` +
+            `Shakeout invalidated by:\n${reasons}\n` +
+            `Action: *${action}* based on highest severity.`
+          );
+          pos.alertedFlags.add('SHAKEOUT_CONFLICT');
         }
       }
 
@@ -504,7 +577,7 @@ async function checkPosition(pos, bot) {
       // If price keeps falling through the grace, SL fires on the next trigger.
       if (retracePct >= slPct && !pos.alertedFlags.has('ATH_SL')) {
         const shakeout = detectShakeout(pos, lp, holderCount, top50Pct);
-        if (shakeout && !pos.alertedFlags.has('SHAKEOUT_SL_PAUSE')) {
+        if (shakeout && !pos.alertedFlags.has('SHAKEOUT_SL_PAUSE') && hardActive.length === 0) {
           const jeetLine = shakeout.jeetExit
             ? `\n⚠️ *JEET EXIT:* Top 50 holding firm. Manufactured flush.`
             : '';
@@ -514,6 +587,14 @@ async function checkPosition(pos, bot) {
             `→ *HOLD POSITION.* One SL grace given. If price continues lower, SL fires next poll.`
           );
           pos.alertedFlags.add('SHAKEOUT_SL_PAUSE');
+        } else if (shakeout && hardActive.length > 0 && !pos.alertedFlags.has('SHAKEOUT_CONFLICT_SL')) {
+          const reasons = hardActive.map(f => `• ${f.reason}`).join('\n');
+          alerts.push(
+            `⚠️ *CONFLICT: EXIT SIGNAL HAS PRIORITY*\n` +
+            `Shakeout invalidated by:\n${reasons}\n` +
+            `Action: *EXIT / TRIM* based on highest severity.`
+          );
+          pos.alertedFlags.add('SHAKEOUT_CONFLICT_SL');
         } else {
           // No shakeout detected (rug), or grace already used — fire the stop loss.
           alerts.push(
@@ -528,6 +609,7 @@ async function checkPosition(pos, bot) {
 
     if (alerts.length === 0) {
       console.log(`[tracker] ${pos.ca.slice(0,8)}... OK — MC=${fmtUsd(mc)} VolLiq=${adjustedVolLiq?.toFixed(2)}x LP=${fmtUsd(lp)} holders=${holderCount} top50=${top50Pct?.toFixed(1)}%`);
+      saveToDisk();
       return;
     }
 
@@ -567,6 +649,7 @@ async function checkPosition(pos, bot) {
         ]],
       },
     });
+    saveToDisk();
 
   } catch (e) {
     console.error(`[tracker] error checking ${pos.ca.slice(0,8)}:`, e.message);
@@ -675,4 +758,23 @@ function startTracker(bot) {
   console.log('[tracker] Oracle Guardian v10.2 (Spine-Aligned) — 60s forensic + 90s candle-crush + 5m heartbeat, positions persisted');
 }
 
-module.exports = { track, untrack, list, startTracker, maybeEstablishBaseline, syncBaseline };
+function getMemoryStats() {
+  return {
+    dataDir: DATA_DIR,
+    positionsFile: PERSIST_FILE,
+    trackedPositionsCount: positions.size,
+    usingFallbackFile: !PERSIST_FILE.startsWith('/data/'),
+  };
+}
+
+module.exports = {
+  DATA_DIR,
+  PERSIST_FILE,
+  track,
+  untrack,
+  list,
+  startTracker,
+  maybeEstablishBaseline,
+  syncBaseline,
+  getMemoryStats,
+};

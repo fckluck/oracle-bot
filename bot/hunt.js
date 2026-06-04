@@ -73,7 +73,7 @@ function getAllowedHuntVerdicts() {
       .map(v => v.trim().toUpperCase())
       .filter(Boolean);
   }
-  return ['ORACLE_BUY', 'DIRTY_RUNNER_WATCH'];
+  return ['ORACLE_BUY', 'MISSED_WINNER_MATCH', 'DIRTY_RUNNER_WATCH'];
 }
 
 function shouldBroadcastHuntResult(result) {
@@ -307,11 +307,31 @@ async function runScan(job, broadcaster) {
       entryTier:      result.entryTier,
       mc:             result.signals?.marketCap,
       adjustedVolLiq: result.signals?.adjustedVolLiq,
+      rawVolLiq:      result.signals?.rawVolLiq,
+      lp:             result.signals?.lp,
       top10Pct:       result.signals?.top10Pct,
+      top50Pct:       result.signals?.top50Pct,
+      holderCount:    result.signals?.holderCount,
+      holderHealthPct: result.signals?.holderHealth?.healthPct ?? null,
+      bundleCount:    result.signals?.bundleCount,
+      sybilFunded:    result.signals?.sybilFunded,
       washPct:        result.signals?.washPct,
       isEliteDev:     result.signals?.isEliteDev,
       successRatePct: result.signals?.successRatePct,
       devLaunches:    result.signals?.totalLaunches,
+      peakMultiplier: result.signals?.peakMultiplier,
+      ageMinutes:     result.signals?.ageMinutes,
+      timeWindow:     result.timeWindow,
+      socialMentions15m: result.social?.mentions15m,
+      uniqueAccounts: result.social?.uniqueAccounts,
+      narrativeType: result.signals?.narrativeType || result.narrativeType,
+      narrativeStrength: result.signals?.narrativeStrength || result.narrativeStrength,
+      narrativeReason: result.signals?.narrativeReason || result.narrativeReason,
+      noGoReason: result.noGoReason,
+      watchReason: result.watchReason,
+      headlineType: result.headlineType,
+      oracleScoreTotal: result.oracleScore?.total,
+      oracleScoreClass: result.oracleScore?.class,
       source:         'hunt',
     });
 
@@ -326,9 +346,16 @@ async function runScan(job, broadcaster) {
     if (!finalGate.ok) {
       if (result.patternMatch?.matched &&
           result.patternMatch?.confidence >= (config.DIRTY_RUNNER_MIN_CONFIDENCE || 0.7) &&
+          !result.patternMatch?.catastrophic?.length &&
           !(result.oracleScore?.hardBlocks || []).length) {
-        result.oracleScore.class = 'DIRTY_RUNNER_WATCH';
-        result.verdict = 'DIRTY_RUNNER_WATCH';
+        result.oracleScore.class = 'MISSED_WINNER_MATCH';
+        result.verdict = 'MISSED_WINNER_MATCH';
+        result.missedWinnerMatch = {
+          memoryMatched: true,
+          confidence: result.patternMatch.confidence,
+          strong: !!result.patternMatch.strong,
+          reasons: result.patternMatch.reasons || [result.patternMatch.reason].filter(Boolean),
+        };
       } else {
         markSuppressed(ca, result, finalGate.reason);
         return;
@@ -363,7 +390,8 @@ async function runScan(job, broadcaster) {
       rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
     };
 
-    const message = formatVerdict(result, ca);
+    const huntCardMode = String(config.HUNT_CARD_MODE || config.SCAN_CARD_MODE || 'full').toLowerCase() === 'short' ? 'short' : 'full';
+    const message = formatVerdict(result, ca, { context: 'hunt', mode: huntCardMode });
     const mc = result.signals?.marketCap || 0;
     const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>
