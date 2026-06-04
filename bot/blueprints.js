@@ -134,7 +134,7 @@ function confidenceFor(matchCount, riskCount) {
     : matchCount === 2 ? 0.70
     : matchCount === 1 ? 0.62
     : 0.45;
-  const penalized = base - Math.min(0.14, riskCount * 0.025);
+  const penalized = base - Math.min(0.12, riskCount * 0.015);
   return Math.max(0.45, Math.min(0.92, Number(penalized.toFixed(2))));
 }
 
