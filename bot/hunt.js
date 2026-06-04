@@ -28,6 +28,7 @@ const { recordScan, getPatternMemory, matchLearnedPattern } = require('./audit')
 const { actionTimeLine } = require('./time');
 const { getApiStats, markApi } = require('./telemetry');
 const config               = require('./config');
+const { resolveTraderClass } = require('./trader-ui');
 
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
 const DEX_PROFILES_URL = 'https://api.dexscreener.com/token-profiles/latest/v1';
@@ -419,11 +420,12 @@ async function runScan(job, broadcaster) {
     const message = formatVerdict(result, ca, { context: 'hunt', mode: huntCardMode });
     const mc = result.signals?.marketCap || 0;
     const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const traderClass = resolveTraderClass(result.oracleScore?.class || result.verdict, result.oracleScore?.total).label;
     const header = `🎯 <b>HUNT MODE — ${eventType.toUpperCase()}</b>
 ` +
                    `${actionTimeLine('Detected At', result.scannedAt)}
 ` +
-                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b> | Class: <b>${result.oracleScore?.class || 'WATCH'}</b>
+                   `Detected: <code>${symbol}</code> | Adj Vol/Liq: <b>${adjustedVolLiq.toFixed(1)}x</b> | Class: <b>${traderClass}</b>
 ` +
                    `Source: <code>${source}</code>
 

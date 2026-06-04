@@ -1,6 +1,15 @@
 const config = require('./config');
 const { actionTimeLine } = require('./time');
 const { dataUsedHtml } = require('./telemetry');
+const {
+  resolveTraderClass,
+  confidenceFromResult,
+  shortRisk,
+  whyRunText,
+  whyFailText,
+  oracleReadText,
+  setupTagsFromResult,
+} = require('./trader-ui');
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
@@ -85,34 +94,57 @@ function recommendedSizing(result) {
 
 function formatShortCard(result, ca) {
   const signals = result?.signals || {};
-  const blueprint = result?.blueprintMatch || null;
-  const cls = String(result?.oracleScore?.class || result?.verdict || 'WATCH');
-  const score = result?.oracleScore?.total != null ? String(result.oracleScore.total) + '/100' : 'N/A';
-  const sizing = recommendedSizing(result);
-  const risk = result?.noGoReason || result?.watchReason || result?.headlineType || 'risk mixed';
-  const whyShown = blueprint?.matched
-    ? blueprint.reason
-    : (result?.missedWinnerMatch?.reasons?.length ? result.missedWinnerMatch.reasons.join(', ') : (result?.patternMatch?.reason || 'scanner and risk filters'));
-  const tpPlan = cls === 'MISSED_WINNER_MATCH'
-    ? 'TP1 2x | TP2 5x | TP3 10x'
-    : cls === 'DIRTY_RUNNER_WATCH'
-      ? 'TP1 2x | TP2 4-5x | derisk fast | track Guardian'
-      : 'Use standard TP ladder';
+  const rawClass = String(result?.oracleScore?.class || result?.verdict || 'WATCH');
+  const scoreRaw = result?.oracleScore?.total;
+  const score = scoreRaw != null && Number.isFinite(Number(scoreRaw))
+    ? `${Math.round(Number(scoreRaw))}/100`
+    : 'N/A';
+  const traderClass = resolveTraderClass(rawClass, scoreRaw);
+  const confidence = `${confidenceFromResult(result).toFixed(1)}/10`;
+  const setupTags = setupTagsFromResult(result);
+  const ageMinutes = signals.ageMinutes != null ? `${Math.round(Number(signals.ageMinutes))}m` : 'N/A';
+  const mainRisk = shortRisk(result);
+  const runLine = whyRunText(result);
+  const failLine = whyFailText(result);
+  const oracleRead = oracleReadText(traderClass.key);
   const lines = [];
   lines.push(actionTimeLine(result?.context === 'hunt' ? 'Hunt Time' : 'Scan Time', result?.scannedAt || Date.now()));
-  lines.push('🧾 ' + b('ORACLE EXEC CARD (SHORT)'));
-  lines.push(b('Token:') + ' ' + esc(result?.ticker || result?.symbol || ca.slice(0, 8)));
-  lines.push(b('Class:') + ' ' + b(cls) + ' | ' + b('Score:') + ' ' + b(score));
-  if (blueprint?.matched || blueprint?.action === 'BLOCK') {
-    const compactMatches = (blueprint.matches || []).slice(0, 3).join(', ') || 'NONE';
-    lines.push(b('Blueprint:') + ' ' + esc(`${blueprint.action} | ${compactMatches}`));
+  lines.push('');
+  lines.push('🎯 ' + b('ORACLE SIGNAL'));
+  lines.push('');
+  lines.push(b('Class:') + ' ' + b(traderClass.label));
+  lines.push(b('Score:') + ' ' + b(score));
+  lines.push(b('Move Potential:') + ' ' + b(traderClass.movePotential));
+  lines.push(b('Confidence:') + ' ' + b(confidence));
+  lines.push('');
+  lines.push(b('Setup:'));
+  if (setupTags.length) {
+    for (const tag of setupTags) lines.push(esc(tag));
+  } else {
+    lines.push('🔵 Developing / wait for confirmation');
   }
-  lines.push(b('Suggested size:') + ' ' + b(sizing.size) + ' — ' + esc(sizing.label));
-  lines.push(b('MC:') + ' ' + fmtUsd(signals.marketCap) + ' | ' + b('LP:') + ' ' + fmtUsd(signals.lp) + ' | ' + b('Adj Vol/Liq:') + ' ' + fmt(signals.adjustedVolLiq, 2) + 'x');
-  lines.push(b('Top10:') + ' ' + fmtPct(signals.top10Pct) + ' | ' + b('Bundle:') + ' ' + (signals.bundleCount ?? 0) + '/slot | ' + b('Wash:') + ' ' + fmtPct(signals.washPct, 0));
-  lines.push(b('Main risk:') + ' ' + esc(risk));
-  lines.push(b('Why shown:') + ' ' + esc(whyShown));
-  lines.push(b('TP plan:') + ' ' + esc(tpPlan));
+  lines.push('');
+  lines.push(b('Core:'));
+  lines.push(`MC: ${fmtUsd(signals.marketCap)}`);
+  lines.push(`LP: ${fmtUsd(signals.lp)}`);
+  lines.push(`Vol/Liq: ${fmt(signals.adjustedVolLiq, 2)}x`);
+  lines.push(`Wash: ${fmtPct(signals.washPct, 0)}`);
+  lines.push(`Top10: ${fmtPct(signals.top10Pct, 1)}`);
+  lines.push(`Bundle: ${signals.bundleCount ?? 0}/slot`);
+  lines.push(`Age: ${ageMinutes}`);
+  lines.push('');
+  lines.push(b('Main Risk:'));
+  lines.push(esc(mainRisk));
+  lines.push('');
+  lines.push(b('Why It Could Run:'));
+  lines.push(esc(runLine));
+  lines.push('');
+  lines.push(b('Why It Could Fail:'));
+  lines.push(esc(failLine));
+  lines.push('');
+  lines.push(b('Oracle Read:'));
+  lines.push(esc(oracleRead));
+  lines.push('');
   lines.push('CA: ' + code(ca));
   return lines.join('\n');
 }
