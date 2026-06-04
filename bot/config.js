@@ -68,8 +68,8 @@ const config = {
   // Optional comma-separated override, e.g. "BUY,RISKY_RUNNER".
   HUNT_ALERT_VERDICTS: process.env.HUNT_ALERT_VERDICTS || '',
 
-  // Card verbosity: scan stays full by default; Hunt is short unless explicitly overridden.
-  SCAN_CARD_MODE: process.env.SCAN_CARD_MODE || 'full',
+  // Card verbosity: short trader card by default; full forensic via DETAILS button.
+  SCAN_CARD_MODE: process.env.SCAN_CARD_MODE || 'short',
   HUNT_CARD_MODE: process.env.HUNT_CARD_MODE || 'short',
 
   // Winner-family promotion sizing (tradeable scout, never full-size override).

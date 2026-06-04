@@ -5,6 +5,7 @@
 const fs   = require('fs');
 const path = require('path');
 const config = require('./config');
+const { resolveTraderClass } = require('./trader-ui');
 
 const DATA_DIR      = process.env.DATA_DIR || '/data';
 const AUDIT_FILE    = path.join(DATA_DIR, 'audit.json');
@@ -136,6 +137,15 @@ function normalizeFingerprint(fp = {}) {
     blueprintConfidence: fp.blueprintConfidence ?? null,
     blueprintMatches: normalizeStringArray(fp.blueprintMatches),
     blueprintReason: fp.blueprintReason ?? null,
+    source: fp.source ?? null,
+    learnedAt: fp.learnedAt ?? null,
+    reason: fp.reason ?? null,
+    originalClass: fp.originalClass ?? null,
+    originalScore: fp.originalScore ?? null,
+    originalScanMc: fp.originalScanMc ?? null,
+    currentMc: fp.currentMc ?? null,
+    currentPeakMc: fp.currentPeakMc ?? null,
+    multipleFromScan: fp.multipleFromScan ?? fp.multiple ?? null,
     outcome: fp.outcome ?? 'UNKNOWN',
     failureReason: fp.failureReason ?? null,
     resolvedAt: fp.resolvedAt ?? Date.now(),
@@ -477,13 +487,15 @@ function getAuditReport() {
   const resolvedLines = recent.length
     ? recent.map(e => {
       const mult = e.scanMc > 0 && e.peakMc > 0 ? `${(e.peakMc / e.scanMc).toFixed(1)}x` : '?x';
-      return `${e.outcome} ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Peak: ${fmtUsdCompact(e.peakMc)} (${mult}) | ${e.oracleScoreClass || e.verdict}`;
+      const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
+      return `${e.outcome} ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Peak: ${fmtUsdCompact(e.peakMc)} (${mult}) | ${classLabel}`;
     })
     : ['No resolved entries yet.'];
 
   const pendingLines = pendingSnapshot.length
     ? pendingSnapshot.map(e => {
-      return `PENDING ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Current/Peak: ${fmtUsdCompact(e.current)}/${fmtUsdCompact(e.peak)} (${e.multiple > 0 ? e.multiple.toFixed(1) : '0.0'}x) | age: ${formatAge(Date.now() - (e.scanTime || Date.now()))} | ${e.oracleScoreClass || e.verdict}`;
+      const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
+      return `PENDING ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Current/Peak: ${fmtUsdCompact(e.current)}/${fmtUsdCompact(e.peak)} (${e.multiple > 0 ? e.multiple.toFixed(1) : '0.0'}x) | age: ${formatAge(Date.now() - (e.scanTime || Date.now()))} | ${classLabel}`;
     })
     : ['No pending entries.'];
 
@@ -620,7 +632,8 @@ function getAuditPendingReport() {
     const current = e.currentMc ?? e.peakMc ?? e.scanMc ?? 0;
     const peak = e.peakMc ?? current;
     const mult = e.scanMc > 0 && peak > 0 ? (peak / e.scanMc).toFixed(2) : 'N/A';
-    return `${idx + 1}. ${e.ticker || e.ca.slice(0, 8)} | Scan ${fmtUsdCompact(e.scanMc)} | Current/Peak ${fmtUsdCompact(current)}/${fmtUsdCompact(peak)} | ${mult}x | age ${formatAge(now - (e.scanTime || now))} | ${e.oracleScoreClass || e.verdict}`;
+    const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
+    return `${idx + 1}. ${e.ticker || e.ca.slice(0, 8)} | Scan ${fmtUsdCompact(e.scanMc)} | Current/Peak ${fmtUsdCompact(current)}/${fmtUsdCompact(peak)} | ${mult}x | age ${formatAge(now - (e.scanTime || now))} | ${classLabel}`;
   });
   const suffix = pending.length > shown.length ? `\n\nShowing first ${shown.length} of ${pending.length} pending entries.` : '';
   return lines.join('\n') + suffix;
@@ -760,6 +773,100 @@ function getMemoryStats() {
   };
 }
 
+function findOriginalScanEntry(ca) {
+  loadAudit();
+  const entries = [...auditHistory, ...auditQueue]
+    .filter(e => e.ca === ca)
+    .sort((a, b) => (a.scanTime || 0) - (b.scanTime || 0));
+  const fpEntries = [...winnerFingerprints, ...failedFingerprints]
+    .filter(fp => fp.ca === ca)
+    .sort((a, b) => (a.scanTime || 0) - (b.scanTime || 0));
+  const sourceEntries = entries.length ? entries : fpEntries;
+  if (!sourceEntries.length) return null;
+  const original = sourceEntries[0];
+  const highestPeak = sourceEntries.reduce((max, e) => {
+    const peak = e.peakMc ?? e.currentPeakMc ?? e.currentMc ?? e.scanMc ?? e.originalScanMc ?? 0;
+    return Math.max(max, peak);
+  }, 0);
+  return {
+    ...original,
+    highestPeakMc: highestPeak || (original.scanMc ?? original.originalScanMc ?? 0),
+  };
+}
+
+function saveForcedLearnRecord(record = {}) {
+  loadAudit();
+  const scanMc = Number(record.originalScanMc) > 0 ? Number(record.originalScanMc) : Number(record.currentMc || 0);
+  const peakMc = Number(record.currentPeakMc) > 0 ? Number(record.currentPeakMc) : Number(record.currentMc || 0);
+  const multiple = scanMc > 0 && peakMc > 0 ? peakMc / scanMc : 1;
+  const fingerprint = normalizeFingerprint({
+    ca: record.ca,
+    ticker: record.symbol || record.ticker || '???',
+    symbol: record.symbol || record.ticker || '???',
+    scanMc,
+    peakMc,
+    multiple,
+    verdict: record.originalClass || 'MANUAL_LEARN',
+    oracleScoreTotal: record.originalScore ?? null,
+    oracleScoreClass: record.originalClass || null,
+    adjustedVolLiq: record.adjustedVolLiq ?? null,
+    lp: record.lp ?? null,
+    top10Pct: record.top10Pct ?? null,
+    top50Pct: record.top50Pct ?? null,
+    holderHealthPct: record.holderHealthPct ?? null,
+    bundleCount: record.bundleCount ?? null,
+    washPct: record.washPct ?? null,
+    ageMinutes: record.ageMinutes ?? null,
+    narrativeType: record.narrativeType ?? 'NONE',
+    narrativeStrength: record.narrativeStrength ?? 0,
+    source: record.source ?? 'manual_learn_button',
+    learnedAt: record.learnedAt ?? Date.now(),
+    reason: record.reason ?? 'user_forced_learn',
+    originalClass: record.originalClass ?? null,
+    originalScore: record.originalScore ?? null,
+    originalScanMc: scanMc,
+    currentMc: record.currentMc ?? null,
+    currentPeakMc: peakMc,
+    multipleFromScan: multiple,
+    outcome: 'WINNER',
+    resolvedAt: Date.now(),
+    scanTime: record.learnedAt ?? Date.now(),
+  });
+  winnerFingerprints.push(fingerprint);
+  winnerFingerprints = winnerFingerprints.slice(-400);
+  saveAudit();
+  return fingerprint;
+}
+
+function getLogReport(limit = 20) {
+  loadAudit();
+  const lines = [...auditHistory, ...auditQueue]
+    .sort((a, b) => (b.scanTime || 0) - (a.scanTime || 0))
+    .slice(0, Math.max(1, limit))
+    .map((e, idx) => {
+      const peak = e.peakMc ?? e.currentMc ?? e.scanMc ?? 0;
+      const mult = e.scanMc > 0 && peak > 0 ? `${(peak / e.scanMc).toFixed(2)}x` : 'N/A';
+      const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
+      return `${idx + 1}. ${e.ticker || e.ca.slice(0, 8)} | ${classLabel} | Scan ${fmtUsdCompact(e.scanMc)} -> Peak ${fmtUsdCompact(peak)} (${mult}) | age ${formatAge(Date.now() - (e.scanTime || Date.now()))}`;
+    });
+  return lines.length ? lines.join('\n') : 'No log entries yet.';
+}
+
+function getLogForCa(ca, limit = 10) {
+  loadAudit();
+  const matches = [...auditHistory, ...auditQueue]
+    .filter(e => e.ca === ca)
+    .sort((a, b) => (b.scanTime || 0) - (a.scanTime || 0))
+    .slice(0, Math.max(1, limit));
+  if (!matches.length) return `No log entries found for ${ca.slice(0, 8)}...`;
+  return matches.map((e, idx) => {
+    const peak = e.peakMc ?? e.currentMc ?? e.scanMc ?? 0;
+    const mult = e.scanMc > 0 && peak > 0 ? `${(peak / e.scanMc).toFixed(2)}x` : 'N/A';
+    const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
+    return `${idx + 1}. ${new Date(e.scanTime || Date.now()).toISOString()} | ${classLabel} | Scan ${fmtUsdCompact(e.scanMc)} -> Peak ${fmtUsdCompact(peak)} (${mult})`;
+  }).join('\n');
+}
+
 module.exports = {
   DATA_DIR,
   AUDIT_FILE,
@@ -777,4 +884,8 @@ module.exports = {
   processPendingOnce,
   matchLearnedPattern,
   getMemoryStats,
+  findOriginalScanEntry,
+  saveForcedLearnRecord,
+  getLogReport,
+  getLogForCa,
 };

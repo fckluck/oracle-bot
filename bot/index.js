@@ -18,7 +18,12 @@ const {
   processPendingOnce,
   matchLearnedPattern,
   getMemoryStats: getAuditMemoryStats,
+  findOriginalScanEntry,
+  saveForcedLearnRecord,
+  getLogReport,
+  getLogForCa,
 } = require('./audit');
+const { resolveTraderClass } = require('./trader-ui');
 
 function ensureDataDir() {
   const dataDir = process.env.DATA_DIR || '/data';
@@ -111,14 +116,16 @@ function isSolanaCA(text) {
 
 function buildKeyboard(ca, currentMc, verdict) {
   const mc = Math.floor(currentMc || 0);
-  const rows = [[
-    { text: '➕ TRACK', callback_data: `track:${ca}:${mc}` },
-    { text: '📈 CHART', url: `https://dexscreener.com/solana/${ca}` },
-    { text: '🐦 X SEARCH', url: `https://x.com/search?q=${ca}&src=typed_query` },
-  ]];
-  if (verdict === 'WATCH_VOL') {
-    rows.push([{ text: '🔔 ALERT ON ENTRY GRADE', callback_data: `alert:${ca}:${mc}` }]);
-  }
+  const rows = [
+    [
+      { text: '👀 TRACK', callback_data: `track:${ca}:${mc}` },
+      { text: '🔔 ALERT', callback_data: `alert:${ca}:${mc}` },
+    ],
+    [
+      { text: '📌 LEARN', callback_data: `learn:${ca}` },
+      { text: '🧠 DETAILS', callback_data: `details:${ca}` },
+    ],
+  ];
   return { inline_keyboard: rows };
 }
 
@@ -172,6 +179,142 @@ async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
   return { ok: true, shortCa, message: msg, baseline };
 }
 
+async function executeOracleScan(ca, {
+  source = 'scan',
+  includeVerification = true,
+  includeReasoning = true,
+  recordAuditEntry = false,
+} = {}) {
+  const [data, social] = await Promise.all([
+    fetchAll(ca, {
+      manualMode: true,
+      skipCodex: config.CODEX_MODE === 'off',
+      skipGMGN: true,
+    }),
+    fetchSocialData(ca),
+  ]);
+
+  if (!data.codex && !data.pump) {
+    return { ok: false, reason: 'NO_DATA' };
+  }
+
+  data.social = social;
+  const result = scan(data);
+  result.scannedAt = Date.now();
+  result.social = social;
+
+  const memoryMatch = matchLearnedPattern(result);
+  result.patternMatch = memoryMatch;
+  const currentClass = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
+  const classEligible = ['NO_GO', 'WATCH', 'WATCH_VOL', 'WATCH_WASH', 'DIRTY_RUNNER_WATCH', 'RISKY_RUNNER', 'SKIP'].includes(currentClass);
+  const catastrophic = ['confirmed_sybil', 'wash_over_50', 'malformed_or_missing_market_cap', 'liquidity_malformed'];
+  const hasCatastrophic = (result?.oracleScore?.hardBlocks || []).some(b => catastrophic.includes(b));
+  if (classEligible && memoryMatch?.matched && !hasCatastrophic) {
+    result.verdict = 'MISSED_WINNER_MATCH';
+    result.entryTier = null;
+    if (result.oracleScore) result.oracleScore.class = 'MISSED_WINNER_MATCH';
+    result.missedWinnerMatch = {
+      memoryMatched: true,
+      confidence: memoryMatch.confidence,
+      strong: !!memoryMatch.strong,
+      reasons: memoryMatch.reasons || [memoryMatch.reason].filter(Boolean),
+    };
+    result.watchReason = `WINNER-FAMILY MATCH — ${(memoryMatch.reasons || [memoryMatch.reason]).filter(Boolean).join(', ')}`;
+    result.noGoReason = null;
+  }
+
+  if (includeVerification && result.oracleScore?.class === 'ORACLE_BUY') {
+    const deFade = await fetchDeFadeVerification(ca, { lp: result.signals?.lp }, { manualMode: true, buyCandidate: true });
+    result.deFadeVerification = deFade;
+    if (deFade?.action === 'HARD_SKIP') {
+      result.verdict = 'NO_GO';
+      result.entryTier = null;
+      result.noGoReason = `DeFade verification: ${deFade.reason}`;
+      if (!Array.isArray(result.oracleScore.hardBlocks)) result.oracleScore.hardBlocks = [];
+      result.oracleScore.hardBlocks.push('defade_hard_skip');
+      result.oracleScore.class = 'NO_GO';
+    }
+  } else {
+    markApi('DeFade', { skipped: true, meta: { reason: includeVerification ? 'not_oracle_buy' : 'verification_skipped', class: result.oracleScore?.class || result.verdict } });
+    result.deFadeVerification = {
+      action: 'SKIPPED',
+      reason: includeVerification
+        ? `Skipped because class was ${result.oracleScore?.class || result.verdict}; DeFade only runs on ORACLE_BUY candidates.`
+        : 'Skipped in lightweight scan mode.',
+      verified: false,
+    };
+  }
+  if (result.oracleScore?.class === 'DIRTY_RUNNER_WATCH') {
+    result.verdict = 'DIRTY_RUNNER_WATCH';
+    result.entryTier = null;
+  }
+
+  result.requiredStack = evaluateRequiredStack(result, data);
+
+  if (includeReasoning) {
+    const soul = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() });
+    result.soulVerdict = soul;
+    result.soulReasoning = soul?.reasoning ?? null;
+  } else {
+    markApi('Grok', { skipped: true, meta: { reason: 'reasoning_skipped_manual_button' } });
+    result.soulVerdict = { available: false, verdict: null, reasoning: null };
+    result.soulReasoning = null;
+  }
+
+  result.dataUsed = {
+    dex: { status: data.codex ? 'ok' : 'failed' },
+    pump: { status: data.pump ? 'ok' : 'failed' },
+    birdeye: data.birdeye ? { status: 'ok' } : { status: 'skipped', reason: 'mode_or_context' },
+    solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
+    socialData: { status: social?.available ? 'ok' : 'failed' },
+    helius: { status: data.holders?.source === 'helius' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' ? null : 'not_primary_holder_source' },
+    codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
+    deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason },
+    grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || null },
+    gmgn: { status: 'skipped', reason: 'audit_only_or_not_wired' },
+    rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
+  };
+
+  if (recordAuditEntry) {
+    recordScan({
+      ca,
+      symbol: data.codex?.symbol || data.pump?.symbol,
+      verdict: result.oracleScore?.class || result.verdict,
+      entryTier: result.entryTier,
+      mc: result.signals?.marketCap,
+      adjustedVolLiq: result.signals?.adjustedVolLiq,
+      rawVolLiq: result.signals?.rawVolLiq,
+      lp: result.signals?.lp,
+      top10Pct: result.signals?.top10Pct,
+      top50Pct: result.signals?.top50Pct,
+      holderCount: result.signals?.holderCount,
+      holderHealthPct: result.signals?.holderHealth?.healthPct ?? null,
+      bundleCount: result.signals?.bundleCount,
+      sybilFunded: result.signals?.sybilFunded,
+      washPct: result.signals?.washPct,
+      isEliteDev: result.signals?.isEliteDev,
+      successRatePct: result.signals?.successRatePct,
+      devLaunches: result.signals?.totalLaunches,
+      peakMultiplier: result.signals?.peakMultiplier,
+      ageMinutes: result.signals?.ageMinutes,
+      timeWindow: result.timeWindow,
+      socialMentions15m: result.social?.mentions15m,
+      uniqueAccounts: result.social?.uniqueAccounts,
+      narrativeType: result.signals?.narrativeType || result.narrativeType,
+      narrativeStrength: result.signals?.narrativeStrength || result.narrativeStrength,
+      narrativeReason: result.signals?.narrativeReason || result.narrativeReason,
+      noGoReason: result.noGoReason,
+      watchReason: result.watchReason,
+      headlineType: result.headlineType,
+      oracleScoreTotal: result.oracleScore?.total,
+      oracleScoreClass: result.oracleScore?.class,
+      source,
+    });
+  }
+
+  return { ok: true, data, social, result };
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
@@ -190,7 +333,7 @@ const HELP_MENU =
   `• /memorybackup — Snapshot /data/audit.json and /data/positions.json\n` +
   `• /defadetest [CA] — DeFade endpoint/cache/action test\n\n` +
   `<b>── HUNT MODE (Automated) ──</b>\n` +
-  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts for ORACLE_BUY / MISSED_WINNER_MATCH / DIRTY_RUNNER_WATCH\n` +
+  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Trader-grade MONSTER/RUNNER/SCOUT alerts\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
@@ -205,7 +348,9 @@ const HELP_MENU =
   `• /untrack [CA] — Stop monitoring a specific token\n\n` +
   `<b>── RESEARCH ──</b>\n` +
   `• /scanfull [CA] or /details [CA] — Force full forensic card\n` +
-  `• /watchlist — Tokens being watched for Entry Grade activation\n` +
+  `• /watchlist — Tokens with active dip/re-entry alerts\n` +
+  `• /log — Recent audit log with clean class labels\n` +
+  `• /logca [CA] — Recent audit entries for one CA\n` +
   `• <i>[Paste any CA]</i> — Full 10-gate forensic Oracle Scorecard\n\n` +
   `<i>Type /hunt to begin. 🔒🛡️🚀</i>`;
 
@@ -278,7 +423,7 @@ bot.command('memorybackup', async ctx => {
 bot.command('hunt', ctx => {
   const added = hunt.addHunter(ctx.chat.id);
   return ctx.replyWithHTML(added
-    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts are narrowed to ORACLE_BUY / MISSED_WINNER_MATCH / DIRTY_RUNNER_WATCH only.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
+    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts now use clean MONSTER / RUNNER / SCOUT / ALERT / PASS classes.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
     : `${actionTimeLine('Hunt Time')}\n\n🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
 });
 
@@ -411,9 +556,10 @@ bot.command('huntlast', ctx => {
     const ageStr = age < 60 ? `${age}s ago` : `${Math.floor(age/60)}m ago`;
     const deliv  = c.delivered > 0 ? `✅ delivered` : c.attempted === 0 ? `⚪ no hunters` : `❌ FAILED`;
     const errStr = c.error ? `\n   ⚠️ <i>${c.error.slice(0, 80)}</i>` : '';
+    const classLabel = resolveTraderClass(c.verdict, null).label;
     return (
       `${i+1}. <b>$${c.symbol}</b> — <code>${c.ca.slice(0,8)}...</code>\n` +
-      `   ${c.verdict} | ${c.adjustedVolLiq.toFixed(1)}x Vol/Liq | MC $${c.mc >= 1000 ? (c.mc/1000).toFixed(1)+'K' : c.mc.toFixed(0)}\n` +
+      `   ${classLabel} | ${c.adjustedVolLiq.toFixed(1)}x Vol/Liq | MC $${c.mc >= 1000 ? (c.mc/1000).toFixed(1)+'K' : c.mc.toFixed(0)}\n` +
       `   ${ageStr} — ${deliv}${errStr}\n` +
       `   <a href="https://dexscreener.com/solana/${c.ca}">Chart</a>`
     );
@@ -498,18 +644,18 @@ bot.command('untrack', ctx => {
 bot.command('watchlist', ctx => {
   const all = watchlist.list();
   const mine = all.filter(e => e.chatId === ctx.chat.id);
-  if (!mine.length) return ctx.reply('No tokens on your watchlist. Use /track [CA] or +track [CA] to add any token.');
+  if (!mine.length) return ctx.reply('No tokens on your dip-alert watchlist. Use 🔔 ALERT from a signal card.');
   const now = Date.now();
   const lines = mine.map((e, i) => {
     const ageMin = Math.floor((now - e.addedAt) / 60000);
-    const expiresIn = Math.max(0, Math.floor((e.addedAt + 6 * 60 * 60 * 1000 - now) / 60000));
+    const expiresIn = Math.max(0, Math.floor((e.addedAt + 12 * 60 * 60 * 1000 - now) / 60000));
     return `${i + 1}. <code>${e.ca.slice(0, 8)}...</code> $${e.symbol} — added ${ageMin}m ago, expires in ${expiresIn}m`;
   });
   return ctx.replyWithHTML(
-    `<b>Your Watchlist (${mine.length})</b>\n` +
-    `<i>Waiting for Vol/Liq ≥ 5x + Holder Health ≥ 50%</i>\n\n` +
+    `<b>Your Dip Alert Watchlist (${mine.length})</b>\n` +
+    `<i>Waiting for high-quality retrace/retest confirmation</i>\n\n` +
     lines.join('\n') +
-    `\n\n<i>Alerts auto-expire after 6 hours.</i>`
+    `\n\n<i>Alerts auto-expire after 12 hours.</i>`
   );
 });
 
@@ -584,6 +730,23 @@ bot.command('auditpending', async ctx => {
   await ctx.replyWithHTML(`${actionTimeLine('Audit Pending Time')}
 
 ${getAuditPendingReport()}`);
+});
+
+bot.command('log', async ctx => {
+  await ctx.replyWithHTML(
+    `${actionTimeLine('Log Time')}\n\n<b>Oracle Log (latest)</b>\n\n${getLogReport(20)}`
+  );
+});
+
+bot.command('logca', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const ca = parts[1];
+  if (!ca || !isSolanaCA(ca)) {
+    return ctx.replyWithHTML('Usage: <code>/logca &lt;CA&gt;</code>');
+  }
+  await ctx.replyWithHTML(
+    `${actionTimeLine('Log CA Time')}\n\n<b>Oracle Log for ${ca.slice(0, 8)}...</b>\n\n${getLogForCa(ca, 10)}`
+  );
 });
 
 bot.command('defadetest', async ctx => {
@@ -689,18 +852,13 @@ bot.on('text', async ctx => {
   const scanning = await ctx.replyWithHTML(`🔍 Scanning <code>${ca}</code>...`);
 
   try {
-    // Social fetch runs in parallel with the main data fetch to avoid adding latency.
-    // fetchAll is the expensive chain; social is a single fast endpoint.
-    const [data, social] = await Promise.all([
-      fetchAll(ca, {
-        manualMode: true,
-        skipCodex: config.CODEX_MODE === 'off',
-        skipGMGN: true,
-      }),
-      fetchSocialData(ca),
-    ]);
-
-    if (!data.codex && !data.pump) {
+    const scanExec = await executeOracleScan(ca, {
+      source: 'scan',
+      includeVerification: true,
+      includeReasoning: true,
+      recordAuditEntry: true,
+    });
+    if (!scanExec.ok) {
       await ctx.telegram.editMessageText(
         ctx.chat.id, scanning.message_id, undefined,
         `No data found for <code>${ca}</code>. Check the address and try again.`,
@@ -708,121 +866,11 @@ bot.on('text', async ctx => {
       );
       return;
     }
-
-    // Attach social data to the fetchAll result so scanner can read it
-    data.social = social;
-
-    const result  = scan(data);
-    result.scannedAt = Date.now();
-
-    // Attach social data to result so verdict formatter can render social signals
-    result.social = social;
-
-    // Memory-backed winner-family check before final output (never overrides catastrophic blocks).
-    const memoryMatch = matchLearnedPattern(result);
-    result.patternMatch = memoryMatch;
-    const currentClass = String(result.oracleScore?.class || result.verdict || '').toUpperCase();
-    const classEligible = ['NO_GO', 'WATCH', 'WATCH_VOL', 'WATCH_WASH', 'DIRTY_RUNNER_WATCH', 'RISKY_RUNNER', 'SKIP'].includes(currentClass);
-    const catastrophic = ['confirmed_sybil', 'wash_over_50', 'malformed_or_missing_market_cap', 'liquidity_malformed'];
-    const hasCatastrophic = (result.oracleScore?.hardBlocks || []).some(b => catastrophic.includes(b));
-    if (classEligible && memoryMatch?.matched && !hasCatastrophic) {
-      result.verdict = 'MISSED_WINNER_MATCH';
-      result.entryTier = null;
-      if (result.oracleScore) result.oracleScore.class = 'MISSED_WINNER_MATCH';
-      result.missedWinnerMatch = {
-        memoryMatched: true,
-        confidence: memoryMatch.confidence,
-        strong: !!memoryMatch.strong,
-        reasons: memoryMatch.reasons || [memoryMatch.reason].filter(Boolean),
-      };
-      result.watchReason = `WINNER-FAMILY MATCH — ${(memoryMatch.reasons || [memoryMatch.reason]).filter(Boolean).join(', ')}`;
-      result.noGoReason = null;
-    }
-
-    // DeFade runs before Soul so Grok sees the final scanner/verification verdict.
-    // DeFade only fires on BUY candidates (free-plan quota guard).
-    const deFade = result.oracleScore?.class === 'ORACLE_BUY'
-      ? await fetchDeFadeVerification(ca, { lp: result.signals?.lp }, { manualMode: true, buyCandidate: true })
-      : (markApi('DeFade', { skipped: true, meta: { reason: 'not_oracle_buy', class: result.oracleScore?.class || result.verdict } }), {
-          action: 'SKIPPED',
-          reason: `Skipped because class was ${result.oracleScore?.class || result.verdict}; DeFade only runs on ORACLE_BUY candidates.`,
-          verified: false,
-        });
-    result.deFadeVerification = deFade;
-    if (deFade?.action === 'HARD_SKIP') {
-      result.verdict    = 'NO_GO';
-      result.entryTier  = null;
-      result.noGoReason = `DeFade verification: ${deFade.reason}`;
-      if (!Array.isArray(result.oracleScore.hardBlocks)) result.oracleScore.hardBlocks = [];
-      result.oracleScore.hardBlocks.push('defade_hard_skip');
-      result.oracleScore.class = 'NO_GO';
-    }
-    if (result.oracleScore?.class === 'DIRTY_RUNNER_WATCH') {
-      result.verdict = 'DIRTY_RUNNER_WATCH';
-      result.entryTier = null;
-    }
-
-    result.requiredStack = evaluateRequiredStack(result, data);
-
-    const soul = await getSoulVerdict(result, { ...data, patternMemory: getPatternMemory() });
-    result.soulVerdict = soul;
-    result.soulReasoning = soul?.reasoning ?? null;
-
-    result.dataUsed = {
-      dex: { status: data.codex ? 'ok' : 'failed' },
-      pump: { status: data.pump ? 'ok' : 'failed' },
-      birdeye: data.birdeye ? { status: 'ok' } : { status: 'skipped', reason: 'mode_or_context' },
-      solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
-      socialData: { status: social?.available ? 'ok' : 'failed' },
-      helius: { status: data.holders?.source === 'helius' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' ? null : 'not_primary_holder_source' },
-      codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
-      deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason },
-      grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || null },
-      gmgn: { status: 'skipped', reason: 'audit_only_or_not_wired' },
-      rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
-    };
-
-    const mc      = result.signals.marketCap || 0;
-
-    // Audit every completed /scan so /audit can surface missed winners + false positives.
-    recordScan({
-      ca,
-      symbol:         data.codex?.symbol || data.pump?.symbol,
-      verdict:        result.oracleScore?.class || result.verdict,
-      entryTier:      result.entryTier,
-      mc:             result.signals?.marketCap,
-      adjustedVolLiq: result.signals?.adjustedVolLiq,
-      rawVolLiq:      result.signals?.rawVolLiq,
-      lp:             result.signals?.lp,
-      top10Pct:       result.signals?.top10Pct,
-      top50Pct:       result.signals?.top50Pct,
-      holderCount:    result.signals?.holderCount,
-      holderHealthPct: result.signals?.holderHealth?.healthPct ?? null,
-      bundleCount:    result.signals?.bundleCount,
-      sybilFunded:    result.signals?.sybilFunded,
-      washPct:        result.signals?.washPct,
-      isEliteDev:     result.signals?.isEliteDev,
-      successRatePct: result.signals?.successRatePct,
-      devLaunches:    result.signals?.totalLaunches,
-      peakMultiplier: result.signals?.peakMultiplier,
-      ageMinutes:     result.signals?.ageMinutes,
-      timeWindow:     result.timeWindow,
-      socialMentions15m: result.social?.mentions15m,
-      uniqueAccounts: result.social?.uniqueAccounts,
-      narrativeType: result.signals?.narrativeType || result.narrativeType,
-      narrativeStrength: result.signals?.narrativeStrength || result.narrativeStrength,
-      narrativeReason: result.signals?.narrativeReason || result.narrativeReason,
-      noGoReason: result.noGoReason,
-      watchReason: result.watchReason,
-      headlineType: result.headlineType,
-      oracleScoreTotal: result.oracleScore?.total,
-      oracleScoreClass: result.oracleScore?.class,
-      source:         'scan',
-    });
-
+    const { result } = scanExec;
+    const mc = result.signals.marketCap || 0;
     const forceFull = forceFullNextScanChats.has(ctx.chat.id);
     if (forceFull) forceFullNextScanChats.delete(ctx.chat.id);
-    const cardMode = forceFull ? 'full' : (String(config.SCAN_CARD_MODE || 'full').toLowerCase() === 'short' ? 'short' : 'full');
+    const cardMode = forceFull ? 'full' : 'short';
     const message = formatVerdict(result, ca, { context: 'scan', mode: cardMode });
 
     await ctx.telegram.editMessageText(
@@ -853,22 +901,140 @@ bot.on('callback_query', async ctx => {
     const ca     = parts[1];
     const mc     = parseFloat(parts[2]) || 0;
     const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
-    if (watchlist.has(ca)) {
+    if (watchlist.has(ca, ctx.chat.id)) {
       await ctx.answerCbQuery(`🔔 Already watching ${shortCa}`);
       return;
     }
-    // Pull symbol from a quick re-read of the callback message text (best-effort)
-    const symbol = ctx.callbackQuery?.message?.text?.match(/\$([A-Z]{2,10})\b/)?.[1] || '???';
-    const added = watchlist.add(ca, ctx.chat.id, symbol, mc);
+    let sig = null;
+    try { sig = await fetchForensic(ca); } catch (_) {}
+    const symbol = ctx.callbackQuery?.message?.text?.match(/Token:\s*([A-Za-z0-9_$-]+)/i)?.[1] || '???';
+    const baselineMc = sig?.marketCap ?? mc;
+    const added = watchlist.add(ca, ctx.chat.id, symbol, {
+      baselineMc,
+      athMc: baselineMc,
+      baselineLp: sig?.lp ?? null,
+      baselineHolders: sig?.holderCount ?? null,
+      baselineTop10: sig?.top10Pct ?? null,
+      baselineTop50: sig?.top50Pct ?? null,
+      baselineVolLiq: sig?.adjustedVolLiq ?? null,
+    });
     if (added) {
-      await ctx.answerCbQuery(`🔔 Alert set for ${shortCa}`);
+      await ctx.answerCbQuery(`🔔 Dip alert set for ${shortCa}`);
       await bot.telegram.sendMessage(
         ctx.chat.id,
-        `🔔 *ENTRY GRADE ALERT SET*\n\`${shortCa}\`\n\nI'll notify you the moment Vol/Liq ≥ 5x AND Holder Health ≥ 50% are both met.\n_Auto-expires in 6 hours._`,
+        `🔔 *DIP ALERT ARMED*\n` +
+        `CA: \`${shortCa}\`\n` +
+        `Baseline MC: $${fmtUsd(baselineMc)}\n\n` +
+        `I will notify only when a high-quality retrace/retest forms:\n` +
+        `• retrace from ATH\n` +
+        `• LP/holder stability\n` +
+        `• concentration stability\n` +
+        `• no drain danger\n` +
+        `• volume still alive\n\n` +
+        `_Auto-expires in 12 hours._`,
         { parse_mode: 'Markdown' }
       );
     } else {
       await ctx.answerCbQuery(`Already watching ${shortCa}`);
+    }
+    return;
+  }
+
+  if (data.startsWith('learn:')) {
+    const ca = data.split(':')[1];
+    const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
+    await ctx.answerCbQuery('📌 Saving learned memory...');
+    try {
+      const scanExec = await executeOracleScan(ca, {
+        source: 'learn_button',
+        includeVerification: false,
+        includeReasoning: false,
+        recordAuditEntry: false,
+      });
+      if (!scanExec.ok) {
+        await ctx.telegram.sendMessage(ctx.chat.id, `⚠️ Could not load live data for ${shortCa}.`);
+        return;
+      }
+      const original = findOriginalScanEntry(ca);
+      const signals = scanExec.result?.signals || {};
+      const currentMc = Number(signals.marketCap || 0);
+      const originalScanMc = original?.scanMc > 0 ? Number(original.scanMc) : currentMc;
+      const currentPeakMc = Math.max(currentMc, Number(original?.highestPeakMc || 0), Number(original?.peakMc || 0));
+      const multipleFromScan = originalScanMc > 0 && currentPeakMc > 0 ? currentPeakMc / originalScanMc : 1;
+      const originalClass = original?.oracleScoreClass || original?.verdict || scanExec.result?.oracleScore?.class || 'MANUAL';
+      const originalScore = original?.oracleScoreTotal ?? scanExec.result?.oracleScore?.total ?? null;
+      const saved = saveForcedLearnRecord({
+        ca,
+        symbol: scanExec.data?.codex?.symbol || scanExec.data?.pump?.symbol || '???',
+        originalScanMc,
+        currentMc,
+        currentPeakMc,
+        multipleFromScan,
+        originalClass,
+        originalScore,
+        adjustedVolLiq: signals.adjustedVolLiq ?? null,
+        washPct: signals.washPct ?? null,
+        top10Pct: signals.top10Pct ?? null,
+        bundleCount: signals.bundleCount ?? null,
+        holderHealthPct: signals.holderHealth?.healthPct ?? null,
+        lp: signals.lp ?? null,
+        ageMinutes: signals.ageMinutes ?? null,
+        narrativeType: signals.narrativeType || scanExec.result?.narrativeType || 'NONE',
+        narrativeStrength: signals.narrativeStrength ?? scanExec.result?.narrativeStrength ?? 0,
+        source: 'learn_button',
+        learnedAt: Date.now(),
+        reason: 'user_forced_learn',
+      });
+      const originalRead = resolveTraderClass(originalClass, originalScore).label;
+      const noOriginalNote = original ? '' : '\nNo original scan found; saved as manual memory.';
+      await ctx.telegram.sendMessage(
+        ctx.chat.id,
+        `📌 <b>LEARNED</b>\n\n` +
+        `Original Scan: <b>$${fmtUsd(saved.originalScanMc || originalScanMc)}</b>\n` +
+        `Current Peak: <b>$${fmtUsd(saved.currentPeakMc || currentPeakMc)}</b>\n` +
+        `Move: <b>${Number(saved.multiple || multipleFromScan).toFixed(1)}x</b>\n` +
+        `Original Read: <b>${originalRead}</b>\n\n` +
+        `Saved to Oracle memory.${noOriginalNote}`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      console.error('[learn callback] error:', err);
+      await ctx.telegram.sendMessage(ctx.chat.id, `⚠️ LEARN failed for ${shortCa}: ${err.message}`);
+    }
+    return;
+  }
+
+  if (data.startsWith('details:')) {
+    const ca = data.split(':')[1];
+    const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
+    await ctx.answerCbQuery('🧠 Building full details...');
+    try {
+      const scanExec = await executeOracleScan(ca, {
+        source: 'details_button',
+        includeVerification: true,
+        includeReasoning: true,
+        recordAuditEntry: false,
+      });
+      if (!scanExec.ok) {
+        await ctx.telegram.sendMessage(ctx.chat.id, `⚠️ No data found for ${shortCa}.`);
+        return;
+      }
+      const details = formatVerdict(scanExec.result, ca, { context: 'scan', mode: 'full' });
+      await ctx.telegram.sendMessage(
+        ctx.chat.id,
+        details,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '📈 CHART', url: `https://dexscreener.com/solana/${ca}` },
+            ]],
+          },
+        }
+      );
+    } catch (err) {
+      console.error('[details callback] error:', err);
+      await ctx.telegram.sendMessage(ctx.chat.id, `⚠️ DETAILS failed for ${shortCa}: ${err.message}`);
     }
     return;
   }

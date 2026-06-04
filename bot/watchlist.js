@@ -1,38 +1,39 @@
-// Oracle Watchlist — "Alert on Entry Grade" (v9.3)
-// Monitors WATCH_VOL tokens every 60s. Fires a priority alert the moment
-// Adjusted Vol/Liq >= 5.0 AND Holder Health >= 50% are simultaneously met.
-// Persists pending alerts to watchlist.json — survives restarts.
+// Oracle Dip Alert Watchlist
+// Tracks high-quality dip/re-entry setups from 🔔 ALERT button presses.
 
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 const { fetchForensic } = require('./fetcher');
-const { recordScan }    = require('./audit');
-const { formatEt, formatUtc } = require('./time');
 
-// Prefer /data (Railway persistent volume) over local file — same pattern as hunters.json.
-// Falls back to the local bot/ directory when /data is not writable (dev/Replit).
 function resolveWatchlistFile() {
   if (process.env.WATCHLIST_FILE) return process.env.WATCHLIST_FILE;
   try { fs.accessSync('/data', fs.constants.W_OK); return '/data/watchlist.json'; } catch (_) {}
   return path.join(__dirname, 'watchlist.json');
 }
-const PERSIST_FILE = resolveWatchlistFile();
-console.log(`[watchlist] persist file: ${PERSIST_FILE}`);
-const POLL_INTERVAL = 60 * 1000;
-const MAX_AGE_MS    = 6 * 60 * 60 * 1000; // auto-expire after 6 hours
-const VOL_LIQ_MIN   = 5.0;
-const HEALTH_MIN    = 50; // holderHealth.healthPct
 
-// Map: ca -> { ca, chatId, symbol, mc, addedAt }
+const PERSIST_FILE = resolveWatchlistFile();
+const POLL_INTERVAL = 60 * 1000;
+const MAX_AGE_MS = 12 * 60 * 60 * 1000;
 const pending = new Map();
 
-// ── Persistence ───────────────────────────────────────────────────────────────
+function keyFor(ca, chatId) {
+  return `${chatId}:${ca}`;
+}
+
+function fmtUsd(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v) || v <= 0) return 'N/A';
+  if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return `${v.toFixed(2)}`;
+}
 
 function saveToDisk() {
   try {
-    const arr = [...pending.values()];
-    fs.writeFileSync(PERSIST_FILE, JSON.stringify(arr, null, 2));
-  } catch (e) { console.error('[watchlist] save error:', e.message); }
+    fs.writeFileSync(PERSIST_FILE, JSON.stringify([...pending.values()], null, 2));
+  } catch (e) {
+    console.error('[watchlist] save error:', e.message);
+  }
 }
 
 function loadFromDisk() {
@@ -43,142 +44,134 @@ function loadFromDisk() {
     const now = Date.now();
     for (const entry of raw) {
       if (!entry.ca || !entry.chatId) continue;
-      if (now - (entry.addedAt || 0) > MAX_AGE_MS) continue; // expired
-      pending.set(entry.ca, entry);
+      if (now - (entry.addedAt || 0) > MAX_AGE_MS) continue;
+      pending.set(keyFor(entry.ca, entry.chatId), entry);
     }
-    console.log(`[watchlist] loaded ${pending.size} pending alert(s) from disk`);
-  } catch (e) { console.error('[watchlist] load error:', e.message); }
+    console.log(`[watchlist] loaded ${pending.size} dip alert(s) from disk`);
+  } catch (e) {
+    console.error('[watchlist] load error:', e.message);
+  }
 }
 
-// ── Holder health (mirrors scanner.js logic — 400 holders per $100K MC) ──────
-
-function holderHealthPct(holderCount, marketCap) {
-  if (!holderCount || !marketCap || marketCap <= 0) return null;
-  const target = (marketCap / 100000) * 400;
-  if (target <= 0) return null;
-  return Math.round((holderCount / target) * 100);
-}
-
-// ── Public API ────────────────────────────────────────────────────────────────
-
-function add(ca, chatId, symbol, mc) {
-  if (pending.has(ca)) return false;
-  pending.set(ca, { ca, chatId, symbol: symbol || '???', mc: mc || 0, addedAt: Date.now() });
+function add(ca, chatId, symbol, baseline = {}) {
+  const key = keyFor(ca, chatId);
+  if (pending.has(key)) return false;
+  const now = Date.now();
+  pending.set(key, {
+    ca,
+    chatId,
+    symbol: symbol || '???',
+    baselineMc: Number(baseline.baselineMc || 0),
+    athMc: Number(baseline.athMc || baseline.baselineMc || 0),
+    baselineLp: baseline.baselineLp ?? null,
+    baselineHolders: baseline.baselineHolders ?? null,
+    baselineTop10: baseline.baselineTop10 ?? null,
+    baselineTop50: baseline.baselineTop50 ?? null,
+    baselineVolLiq: baseline.baselineVolLiq ?? null,
+    addedAt: now,
+    lastCheckedAt: 0,
+  });
   saveToDisk();
-  console.log(`[watchlist] added ${ca.slice(0,8)}... symbol=${symbol} chatId=${chatId}`);
   return true;
 }
 
-function remove(ca) {
-  const removed = pending.delete(ca);
+function remove(ca, chatId) {
+  if (chatId != null) {
+    const removed = pending.delete(keyFor(ca, chatId));
+    if (removed) saveToDisk();
+    return removed;
+  }
+  let removed = false;
+  for (const [k, entry] of pending.entries()) {
+    if (entry.ca !== ca) continue;
+    pending.delete(k);
+    removed = true;
+  }
   if (removed) saveToDisk();
   return removed;
 }
 
-function list() { return [...pending.values()]; }
+function has(ca, chatId) {
+  if (chatId != null) return pending.has(keyFor(ca, chatId));
+  for (const entry of pending.values()) if (entry.ca === ca) return true;
+  return false;
+}
 
-function has(ca) { return pending.has(ca); }
-
-// ── Monitoring loop ───────────────────────────────────────────────────────────
+function list() {
+  return [...pending.values()];
+}
 
 async function checkEntry(entry, bot) {
+  const key = keyFor(entry.ca, entry.chatId);
   try {
     const sig = await fetchForensic(entry.ca);
     if (!sig) return;
+    const now = Date.now();
+    const currentMc = Number(sig.marketCap || 0);
+    if (currentMc > entry.athMc) entry.athMc = currentMc;
+    const ath = Math.max(entry.athMc || 0, entry.baselineMc || 0, currentMc || 0);
+    const retracePct = ath > 0 && currentMc > 0 ? ((ath - currentMc) / ath) * 100 : 0;
+    const lpStable = entry.baselineLp == null || sig.lp == null || sig.lp >= Number(entry.baselineLp) * 0.88;
+    const holdersStable = entry.baselineHolders == null || sig.holderCount == null || sig.holderCount >= Number(entry.baselineHolders) * 0.92;
+    const top10Stable = entry.baselineTop10 == null || sig.top10Pct == null || sig.top10Pct <= Number(entry.baselineTop10) + 3;
+    const top50Stable = entry.baselineTop50 == null || sig.top50Pct == null || sig.top50Pct <= Number(entry.baselineTop50) + 3;
+    const volumeAlive = (sig.adjustedVolLiq ?? 0) >= 2.5 ||
+      (entry.baselineVolLiq != null && (sig.adjustedVolLiq ?? 0) >= Number(entry.baselineVolLiq) * 0.45);
+    const noLpDrain = entry.baselineLp == null || sig.lp == null || sig.lp >= Number(entry.baselineLp) * 0.8;
+    const qualified = retracePct >= 20 && retracePct <= 55 && lpStable && holdersStable && top10Stable && top50Stable && noLpDrain && volumeAlive;
 
-    const volLiq      = sig.adjustedVolLiq ?? 0;
-    const healthPct   = holderHealthPct(sig.holderCount, sig.marketCap);
-    const mc          = sig.marketCap || 0;
-    const px          = sig.priceUsd  || 0;
-    const shortCa     = `${entry.ca.slice(0,6)}...${entry.ca.slice(-4)}`;
+    entry.lastCheckedAt = now;
+    if (!qualified) {
+      saveToDisk();
+      return;
+    }
 
-    const volOk    = volLiq  >= VOL_LIQ_MIN;
-    const healthOk = healthPct != null ? healthPct >= HEALTH_MIN : false;
+    const lpStatus = lpStable ? 'stable' : 'unstable';
+    const holderStatus = holdersStable ? 'stable' : 'falling';
+    const risk = noLpDrain && volumeAlive ? 'moderate' : 'elevated';
 
-    console.log(`[watchlist] ${entry.ca.slice(0,8)}... volLiq=${volLiq.toFixed(2)}x health=${healthPct ?? 'N/A'}% volOk=${volOk} healthOk=${healthOk}`);
-
-    if (!volOk || !healthOk) return;
-
-    // Conditions met — fire priority alert and remove from pending
-    pending.delete(entry.ca);
+    pending.delete(key);
     saveToDisk();
 
-    const fmtUsd = (n) => n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : n >= 1000 ? `$${(n/1000).toFixed(1)}K` : `$${n.toFixed(0)}`;
-    const fmtPx  = (n) => n < 0.001 ? n.toExponential(3) : n < 1 ? n.toFixed(5) : n.toFixed(4);
-
-    const metLines = [];
-    if (volOk)    metLines.push(`Vol/Liq hit *${volLiq.toFixed(2)}x* (≥5x threshold met)`);
-    if (healthOk) metLines.push(`Holder Health *${healthPct}%* (≥50% threshold met)`);
-
-    const msg =
-      `🕒 *Action Time:* ${formatEt()} | ${formatUtc()}\n\n` +
-      `🚀 *ORACLE UPDATE: ${entry.symbol} IS NOW ENTRY GRADE*\n` +
-      `CA: \`${shortCa}\`\n\n` +
-      `── *CONDITIONS MET* ──\n` +
-      metLines.map(l => `• ${l}`).join('\n') + '\n\n' +
-      `── *CURRENT LEVELS* ──\n` +
-      `• *MC:* ${fmtUsd(mc)}\n` +
-      `• *Price:* $${fmtPx(px)}\n` +
-      `• *Vol/Liq:* ${volLiq.toFixed(2)}x\n\n` +
-      `→ *Execute Entry Grade Position (1.0x)*`;
-
-    await bot.telegram.sendMessage(entry.chatId, msg, {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [[
-          { text: '📈 VIEW CHART',   url: `https://dexscreener.com/solana/${entry.ca}` },
-          { text: '➕ TRACK',        callback_data: `track:${entry.ca}:${Math.floor(mc)}` },
-          { text: '🐦 X SEARCH',    url: `https://x.com/search?q=${entry.ca}&src=typed_query` },
-        ]],
-      },
-    });
-
-    // Audit watchlist fires — these are WATCH_VOL tokens that hit entry grade;
-    // /audit will track whether they ultimately ran or rugged.
-    recordScan({
-      ca:             entry.ca,
-      symbol:         entry.symbol,
-      verdict:        'WATCHLIST_FIRED',
-      entryTier:      'BASELINE_ENTRY',
-      mc,
-      adjustedVolLiq: volLiq,
-      top10Pct:       null,
-      washPct:        null,
-      isEliteDev:     false,
-      successRatePct: null,
-      devLaunches:    null,
-      source:         'watchlist',
-    });
-
-    console.log(`[watchlist] FIRED alert for ${entry.ca.slice(0,8)}... — conditions met`);
+    await bot.telegram.sendMessage(
+      entry.chatId,
+      `🔔 *DIP ALERT*\n\n` +
+      `High-quality retest forming.\n` +
+      `MC: $${fmtUsd(currentMc)}\n` +
+      `Retrace: ${retracePct.toFixed(1)}%\n` +
+      `LP: ${lpStatus}\n` +
+      `Holders: ${holderStatus}\n` +
+      `Risk: ${risk}\n` +
+      `CA: \`${entry.ca}\``,
+      { parse_mode: 'Markdown' }
+    );
   } catch (e) {
-    console.error(`[watchlist] check error for ${entry.ca.slice(0,8)}:`, e.message);
+    console.error(`[watchlist] dip check error for ${entry.ca.slice(0, 8)}:`, e.message);
   }
 }
 
 function start(bot) {
   loadFromDisk();
-
-  // Expire stale entries on start
   const now = Date.now();
-  for (const [ca, entry] of pending) {
-    if (now - entry.addedAt > MAX_AGE_MS) { pending.delete(ca); }
+  for (const [k, entry] of pending.entries()) {
+    if (now - (entry.addedAt || 0) > MAX_AGE_MS) pending.delete(k);
   }
   saveToDisk();
 
   setInterval(async () => {
-    if (pending.size === 0) return;
-    console.log(`[watchlist] polling ${pending.size} pending alert(s)`);
+    if (!pending.size) return;
     const snapshot = [...pending.values()];
     for (const entry of snapshot) {
-      // Re-check expiry on each cycle
-      if (Date.now() - entry.addedAt > MAX_AGE_MS) { pending.delete(entry.ca); saveToDisk(); continue; }
+      if (Date.now() - (entry.addedAt || 0) > MAX_AGE_MS) {
+        pending.delete(keyFor(entry.ca, entry.chatId));
+        continue;
+      }
       await checkEntry(entry, bot);
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1500));
     }
   }, POLL_INTERVAL);
 
-  console.log(`[watchlist] Entry Grade alerting started — ${pending.size} pending, polling every 60s`);
+  console.log(`[watchlist] dip alert monitoring started — ${pending.size} active`);
 }
 
 module.exports = { start, add, remove, list, has };
