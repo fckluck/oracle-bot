@@ -1,19 +1,23 @@
 'use strict';
-// Oracle Audit Engine v38.5
-// Memory-safe persistence + pending ATH snapshots + fingerprint storage.
+// Oracle Audit Engine v38.6 - Blueprint Refresh
+// Keeps strict safety intact while refreshing winner memory with freshest
+// blueprint families and promotion timing tracking.
 
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 
-const DATA_DIR      = process.env.DATA_DIR || '/data';
-const AUDIT_FILE    = path.join(DATA_DIR, 'audit.json');
-const MAX_ENTRIES   = 50;
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const AUDIT_FILE = path.join(DATA_DIR, 'audit.json');
+const MAX_ENTRIES = 50;
 const HISTORY_LIMIT = 200;
-const BATCH_SIZE    = 5;
-const CYCLE_MS      = 30_000;
-const RESOLVE_MS    = 6 * 60 * 60 * 1000;
-const MISSED_REJECT_VERDICTS = new Set([
+const BATCH_SIZE = 5;
+const CYCLE_MS = 30_000;
+const RESOLVE_MS = 6 * 60 * 60 * 1000;
+const FRESH_24H_MS = 24 * 60 * 60 * 1000;
+const FRESH_72H_MS = 72 * 60 * 60 * 1000;
+
+const MISSED_VERDICTS = new Set([
   'SKIP',
   'NO_GO',
   'AVOID',
@@ -21,175 +25,220 @@ const MISSED_REJECT_VERDICTS = new Set([
   'WATCH_WASH',
   'RISKY_RUNNER',
   'DIRTY_RUNNER_WATCH',
-  'MISSED_WINNER_MATCH',
-  'WATCH',
 ]);
+
+const ACTIVE_WINNER_BLUEPRINT_REGISTRY = {
+  refreshedAt: new Date().toISOString(),
+  tokens: [
+    'NEAN',
+    'grug',
+    'DATBIHGAH',
+    'Friday 25x runner',
+    'IPO',
+    'BAMBIS',
+    'GGS',
+    'POLYOM',
+    'CAT',
+    'GOLDBANK',
+    'Hillary',
+    'ewok',
+    'SPSC',
+    'NEOW',
+    'SigeonPex',
+  ],
+  families: {
+    EARLY_EXPANSION_ZONE: {
+      mcRangeUsd: '$5K-$30K',
+      volLiqRange: '3x-12x',
+      characteristics: ['low wash', 'fresh migration/profile'],
+      examples: ['grug', 'IPO', 'BAMBIS', 'GGS', 'POLYOM', 'CAT', 'GOLDBANK', 'Hillary', 'ewok', 'SPSC'],
+    },
+    BUNDLE_BLOCKED_EXPANSION: {
+      bundleRange: '6-10/slot',
+      volLiqRange: '8x-13x',
+      top10Range: '30-40%',
+      characteristics: ['low wash', 'healthy LP'],
+      examples: ['DATBIHGAH', 'Friday 25x runner', 'ALPHA'],
+    },
+    CONTROLLED_CONCENTRATION_WINNER: {
+      top10Range: '30-45%',
+      characteristics: ['holder health may look inflated', 'organic volume present'],
+      examples: ['GRAIL', 'NEAN', 'SigeonPex', 'SOREN', 'ballish'],
+    },
+    NARRATIVE_CATALYST_RUNNER: {
+      characteristics: ['celebrity/Elon/X/politics/news/AI/viral connection'],
+      examples: ['duja', 'Hillary', 'ewok'],
+    },
+    PROMOTION_TIMING_TRACKER: {
+      fields: [
+        'firstSeenAt',
+        'firstSeenMC',
+        'firstSeenClass',
+        'firstSeenVolLiq',
+        'promotionAt',
+        'promotionMC',
+        'promotionClass',
+        'promotionDelayMinutes',
+      ],
+    },
+  },
+};
 
 let auditQueue = [];
 let auditHistory = [];
-let winnerFingerprints = [];
-let failedFingerprints = [];
 let updateTimer = null;
+
+function asNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeVerdict(v) {
+  return String(v || '').trim().toUpperCase();
+}
+
+function isOracleBuyClass(v) {
+  return normalizeVerdict(v) === 'ORACLE_BUY';
+}
 
 function normalizeRecord(rec) {
   const outcome = rec.outcome ?? 'UNRESOLVED';
-  const holderHealthPct = rec.holderHealthPct ?? rec.holderHealth?.healthPct ?? null;
+  const scanTime = asNumber(rec.scanTime ?? rec.scannedAt) ?? Date.now();
+  const verdict = rec.verdict ?? rec.oracleClass ?? 'UNKNOWN';
 
-  return {
+  const normalized = {
     ca: rec.ca,
     ticker: rec.ticker ?? rec.symbol ?? '???',
     symbol: rec.symbol ?? rec.ticker ?? '???',
-    verdict: rec.verdict,
-    oracleScoreTotal: rec.oracleScoreTotal ?? rec.oracleScore?.total ?? null,
-    oracleScoreClass: rec.oracleScoreClass ?? rec.oracleScore?.class ?? null,
+    verdict,
     entryTier: rec.entryTier ?? null,
-    scanMc: rec.scanMc ?? rec.mc ?? null,
-    peakMc: rec.peakMc ?? rec.scanMc ?? rec.mc ?? null,
-    currentMc: rec.currentMc ?? null,
-    scannedAt: rec.scannedAt ?? rec.scanTime ?? Date.now(),
-    scanTime: rec.scanTime ?? rec.scannedAt ?? Date.now(),
-    lastChecked: rec.lastChecked ?? 0,
-    adjustedVolLiq: rec.adjustedVolLiq ?? null,
-    rawVolLiq: rec.rawVolLiq ?? null,
-    lp: rec.lp ?? null,
-    top10Pct: rec.top10Pct ?? null,
-    top50Pct: rec.top50Pct ?? null,
-    holderCount: rec.holderCount ?? null,
-    holderHealthPct,
-    bundleCount: rec.bundleCount ?? null,
-    sybilFunded: !!rec.sybilFunded,
-    washPct: rec.washPct ?? null,
-    isEliteDev: rec.isEliteDev ?? false,
-    successRatePct: rec.successRatePct ?? null,
-    devLaunches: rec.devLaunches ?? null,
-    peakMultiplier: rec.peakMultiplier ?? null,
-    ageMinutes: rec.ageMinutes ?? null,
-    timeWindow: rec.timeWindow ?? null,
-    socialMentions15m: rec.socialMentions15m ?? null,
-    uniqueAccounts: rec.uniqueAccounts ?? null,
-    narrativeType: rec.narrativeType ?? 'NONE',
-    narrativeStrength: rec.narrativeStrength ?? 0,
-    narrativeReason: rec.narrativeReason ?? null,
-    noGoReason: rec.noGoReason ?? null,
-    watchReason: rec.watchReason ?? null,
-    headlineType: rec.headlineType ?? null,
+    scanMc: asNumber(rec.scanMc ?? rec.mc),
+    peakMc: asNumber(rec.peakMc ?? rec.scanMc ?? rec.mc),
+    currentMc: asNumber(rec.currentMc),
+    scannedAt: asNumber(rec.scannedAt) ?? scanTime,
+    scanTime,
+    lastChecked: asNumber(rec.lastChecked) ?? 0,
+    adjustedVolLiq: asNumber(rec.adjustedVolLiq),
+    top10Pct: asNumber(rec.top10Pct),
+    washPct: asNumber(rec.washPct),
+    bundleCount: asNumber(rec.bundleCount),
+    lp: asNumber(rec.lp),
+    isEliteDev: !!rec.isEliteDev,
+    successRatePct: asNumber(rec.successRatePct),
+    devLaunches: asNumber(rec.devLaunches),
     source: rec.source ?? null,
-
+    firstSeenAt: asNumber(rec.firstSeenAt) ?? scanTime,
+    firstSeenMC: asNumber(rec.firstSeenMC ?? rec.scanMc ?? rec.mc),
+    firstSeenClass: rec.firstSeenClass ?? verdict,
+    firstSeenVolLiq: asNumber(rec.firstSeenVolLiq ?? rec.adjustedVolLiq),
+    promotionAt: asNumber(rec.promotionAt),
+    promotionMC: asNumber(rec.promotionMC),
+    promotionClass: rec.promotionClass ?? null,
+    promotionDelayMinutes: asNumber(rec.promotionDelayMinutes),
+    blueprintFamilies: Array.isArray(rec.blueprintFamilies) ? rec.blueprintFamilies : [],
     resolved: rec.resolved ?? outcome !== 'UNRESOLVED',
     outcome,
   };
+
+  if (!(normalized.peakMc > 0) && normalized.scanMc > 0) normalized.peakMc = normalized.scanMc;
+  normalized.blueprintFamilies = inferBlueprintFamilies(normalized);
+  return normalized;
 }
 
-function normalizeFingerprint(fp = {}) {
-  return {
-    ca: fp.ca ?? null,
-    ticker: fp.ticker ?? fp.symbol ?? '???',
-    symbol: fp.symbol ?? fp.ticker ?? '???',
-    scanMc: fp.scanMc ?? null,
-    peakMc: fp.peakMc ?? null,
-    multiple: fp.multiple ?? null,
-    verdict: fp.verdict ?? null,
-    oracleScoreTotal: fp.oracleScoreTotal ?? null,
-    oracleScoreClass: fp.oracleScoreClass ?? null,
-    adjustedVolLiq: fp.adjustedVolLiq ?? null,
-    rawVolLiq: fp.rawVolLiq ?? null,
-    lp: fp.lp ?? null,
-    top10Pct: fp.top10Pct ?? null,
-    top50Pct: fp.top50Pct ?? null,
-    holderCount: fp.holderCount ?? null,
-    holderHealthPct: fp.holderHealthPct ?? null,
-    bundleCount: fp.bundleCount ?? null,
-    sybilFunded: !!fp.sybilFunded,
-    washPct: fp.washPct ?? null,
-    successRatePct: fp.successRatePct ?? null,
-    devLaunches: fp.devLaunches ?? null,
-    peakMultiplier: fp.peakMultiplier ?? null,
-    ageMinutes: fp.ageMinutes ?? null,
-    timeWindow: fp.timeWindow ?? null,
-    socialMentions15m: fp.socialMentions15m ?? null,
-    uniqueAccounts: fp.uniqueAccounts ?? null,
-    narrativeType: fp.narrativeType ?? 'NONE',
-    narrativeStrength: fp.narrativeStrength ?? 0,
-    narrativeReason: fp.narrativeReason ?? null,
-    noGoReason: fp.noGoReason ?? null,
-    watchReason: fp.watchReason ?? null,
-    headlineType: fp.headlineType ?? null,
-    outcome: fp.outcome ?? 'UNKNOWN',
-    failureReason: fp.failureReason ?? null,
-    resolvedAt: fp.resolvedAt ?? Date.now(),
-    scanTime: fp.scanTime ?? null,
-  };
-}
+function inferBlueprintFamilies(rec) {
+  const families = new Set();
+  const mc = asNumber(rec.scanMc ?? rec.firstSeenMC) ?? 0;
+  const vol = asNumber(rec.adjustedVolLiq ?? rec.firstSeenVolLiq) ?? 0;
+  const wash = asNumber(rec.washPct);
+  const top10 = asNumber(rec.top10Pct);
+  const bundle = asNumber(rec.bundleCount);
+  const hasLowWash = wash == null || wash < 20;
 
-function archiveCorruptFile(filePath, reason) {
-  try {
-    if (!fs.existsSync(filePath)) return null;
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const corruptPath = filePath.replace(/\.json$/i, '') + `.corrupt.${ts}.json`;
-    fs.renameSync(filePath, corruptPath);
-    console.warn(`[audit] ${reason}; preserved corrupt file at ${corruptPath}`);
-    return corruptPath;
-  } catch (e) {
-    console.warn(`[audit] failed to preserve corrupt file ${filePath}: ${e.message}`);
-    return null;
+  if (mc >= 5_000 && mc <= 30_000 && vol >= 3 && vol <= 12 && hasLowWash) {
+    families.add('EARLY_EXPANSION_ZONE');
   }
+  if (bundle != null && bundle >= 6 && bundle <= 10 && vol >= 8 && vol <= 13 && top10 != null && top10 >= 30 && top10 <= 40 && hasLowWash) {
+    families.add('BUNDLE_BLOCKED_EXPANSION');
+  }
+  if (top10 != null && top10 >= 30 && top10 <= 45 && vol >= 3) {
+    families.add('CONTROLLED_CONCENTRATION_WINNER');
+  }
+
+  const text = `${rec.ticker || ''} ${rec.symbol || ''}`.toLowerCase();
+  if (/(elon|x|viral|tweet|hillary|trump|news|ai|duja|ewok)/.test(text)) {
+    families.add('NARRATIVE_CATALYST_RUNNER');
+  }
+
+  families.add('PROMOTION_TIMING_TRACKER');
+  return [...families];
+}
+
+function updatePromotionTracker(entry, incoming, now = Date.now()) {
+  if (!entry.firstSeenAt) entry.firstSeenAt = now;
+  if (entry.firstSeenMC == null && incoming.scanMc != null) entry.firstSeenMC = incoming.scanMc;
+  if (!entry.firstSeenClass) entry.firstSeenClass = incoming.verdict || entry.verdict || 'UNKNOWN';
+  if (entry.firstSeenVolLiq == null && incoming.adjustedVolLiq != null) entry.firstSeenVolLiq = incoming.adjustedVolLiq;
+
+  const wasOracleBuyInitially = isOracleBuyClass(entry.firstSeenClass);
+  const nowOracleBuy = isOracleBuyClass(incoming.verdict);
+  if (nowOracleBuy && !entry.promotionAt) {
+    entry.promotionAt = now;
+    entry.promotionMC = incoming.scanMc ?? entry.scanMc ?? null;
+    entry.promotionClass = incoming.verdict;
+    const baseTs = entry.firstSeenAt || now;
+    entry.promotionDelayMinutes = Math.max(0, Math.round((entry.promotionAt - baseTs) / 60000));
+    if (wasOracleBuyInitially) entry.promotionDelayMinutes = 0;
+  }
+}
+
+function applyRecordUpdate(entry, incoming) {
+  const now = Date.now();
+  if (incoming.ticker) entry.ticker = incoming.ticker;
+  if (incoming.symbol) entry.symbol = incoming.symbol;
+  if (incoming.verdict) entry.verdict = incoming.verdict;
+  if (incoming.entryTier != null) entry.entryTier = incoming.entryTier;
+  if (incoming.scanMc != null) entry.scanMc = incoming.scanMc;
+  if (incoming.adjustedVolLiq != null) entry.adjustedVolLiq = incoming.adjustedVolLiq;
+  if (incoming.top10Pct != null) entry.top10Pct = incoming.top10Pct;
+  if (incoming.bundleCount != null) entry.bundleCount = incoming.bundleCount;
+  if (incoming.lp != null) entry.lp = incoming.lp;
+  if (incoming.washPct != null) entry.washPct = incoming.washPct;
+  if (incoming.successRatePct != null) entry.successRatePct = incoming.successRatePct;
+  if (incoming.devLaunches != null) entry.devLaunches = incoming.devLaunches;
+  if (incoming.source != null) entry.source = incoming.source;
+  if (incoming.currentMc != null) entry.currentMc = incoming.currentMc;
+  if (incoming.scanMc != null && (entry.peakMc == null || incoming.scanMc > entry.peakMc)) entry.peakMc = incoming.scanMc;
+  if (incoming.currentMc != null && (entry.peakMc == null || incoming.currentMc > entry.peakMc)) entry.peakMc = incoming.currentMc;
+  updatePromotionTracker(entry, incoming, now);
+  entry.blueprintFamilies = inferBlueprintFamilies(entry);
 }
 
 function loadAudit() {
   try {
     if (!fs.existsSync(AUDIT_FILE)) return;
-    const text = fs.readFileSync(AUDIT_FILE, 'utf8');
-    let raw = null;
-    try {
-      raw = JSON.parse(text);
-    } catch (e) {
-      archiveCorruptFile(AUDIT_FILE, `JSON parse failed (${e.message})`);
-      auditHistory = [];
-      auditQueue = [];
-      winnerFingerprints = [];
-      failedFingerprints = [];
-      return;
-    }
-
+    const raw = JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf8'));
     if (Array.isArray(raw)) {
       const records = raw.map(normalizeRecord);
       auditHistory = records.filter(r => r.outcome !== 'UNRESOLVED').slice(-HISTORY_LIMIT);
       auditQueue = records.filter(r => r.outcome === 'UNRESOLVED').slice(-MAX_ENTRIES);
-      winnerFingerprints = [];
-      failedFingerprints = [];
       return;
     }
-
     auditHistory = Array.isArray(raw.history) ? raw.history.map(normalizeRecord).slice(-HISTORY_LIMIT) : [];
     auditQueue = Array.isArray(raw.queue) ? raw.queue.map(normalizeRecord).slice(-MAX_ENTRIES) : [];
-    winnerFingerprints = Array.isArray(raw.winnerFingerprints)
-      ? raw.winnerFingerprints.map(normalizeFingerprint)
-      : [];
-    failedFingerprints = Array.isArray(raw.failedFingerprints)
-      ? raw.failedFingerprints.map(normalizeFingerprint)
-      : [];
   } catch (e) {
     console.warn('[audit] Failed to load audit file:', e.message);
     auditHistory = [];
     auditQueue = [];
-    winnerFingerprints = [];
-    failedFingerprints = [];
   }
 }
 
 function saveAudit() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const hasAnyData = auditHistory.length || auditQueue.length || winnerFingerprints.length || failedFingerprints.length;
-    if (!hasAnyData && fs.existsSync(AUDIT_FILE)) {
-      // Memory-safety: never wipe existing audit memory with an empty payload.
-      return;
-    }
     const payload = {
       history: auditHistory.slice(-HISTORY_LIMIT),
       queue: auditQueue.slice(-MAX_ENTRIES),
-      winnerFingerprints,
-      failedFingerprints,
+      activeWinnerBlueprintRegistry: ACTIVE_WINNER_BLUEPRINT_REGISTRY,
       updatedAt: new Date().toISOString(),
     };
     const tmp = AUDIT_FILE + '.tmp';
@@ -202,92 +251,76 @@ function saveAudit() {
 
 function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
   if (!ca || !verdict) return;
-
   loadAudit();
 
-  const now = Date.now();
-  const dupeWindowMs = 5 * 60 * 1000;
-  if (auditQueue.some(e => e.ca === ca && now - e.scanTime < dupeWindowMs)) return;
-
-  if (auditQueue.length >= MAX_ENTRIES) auditQueue.shift();
-  auditQueue.push(normalizeRecord({
+  const incoming = {
     ca,
     ticker,
     symbol: ticker,
     verdict,
     entryTier,
-    scanMc: scanMc ?? null,
-    peakMc: scanMc ?? null,
+    scanMc: asNumber(scanMc),
+    adjustedVolLiq: asNumber(extra.adjustedVolLiq),
+    top10Pct: asNumber(extra.top10Pct),
+    washPct: asNumber(extra.washPct),
+    bundleCount: asNumber(extra.bundleCount),
+    lp: asNumber(extra.lp),
+    isEliteDev: !!extra.isEliteDev,
+    successRatePct: asNumber(extra.successRatePct),
+    devLaunches: asNumber(extra.devLaunches),
+    source: extra.source ?? null,
+  };
+
+  const existing = [...auditQueue].reverse().find(e => e.ca === ca && !e.resolved);
+  if (existing) {
+    applyRecordUpdate(existing, incoming);
+    saveAudit();
+    return;
+  }
+
+  const now = Date.now();
+  if (auditQueue.length >= MAX_ENTRIES) auditQueue.shift();
+  const entry = normalizeRecord({
+    ca,
+    ticker,
+    symbol: ticker,
+    verdict,
+    entryTier,
+    scanMc: incoming.scanMc,
+    peakMc: incoming.scanMc,
     scannedAt: now,
     scanTime: now,
     lastChecked: 0,
-    adjustedVolLiq: extra.adjustedVolLiq,
-    rawVolLiq: extra.rawVolLiq,
-    lp: extra.lp,
-    top10Pct: extra.top10Pct,
-    top50Pct: extra.top50Pct,
-    holderCount: extra.holderCount,
-    holderHealthPct: extra.holderHealthPct,
-    bundleCount: extra.bundleCount,
-    sybilFunded: extra.sybilFunded,
-    washPct: extra.washPct,
-    isEliteDev: extra.isEliteDev,
-    successRatePct: extra.successRatePct,
-    devLaunches: extra.devLaunches,
-    peakMultiplier: extra.peakMultiplier,
-    ageMinutes: extra.ageMinutes,
-    timeWindow: extra.timeWindow,
-    socialMentions15m: extra.socialMentions15m,
-    uniqueAccounts: extra.uniqueAccounts,
-    narrativeType: extra.narrativeType,
-    narrativeStrength: extra.narrativeStrength,
-    narrativeReason: extra.narrativeReason,
-    noGoReason: extra.noGoReason,
-    watchReason: extra.watchReason,
-    headlineType: extra.headlineType,
-    oracleScoreTotal: extra.oracleScoreTotal,
-    oracleScoreClass: extra.oracleScoreClass,
-    source: extra.source,
+    adjustedVolLiq: incoming.adjustedVolLiq,
+    top10Pct: incoming.top10Pct,
+    washPct: incoming.washPct,
+    bundleCount: incoming.bundleCount,
+    lp: incoming.lp,
+    isEliteDev: incoming.isEliteDev,
+    successRatePct: incoming.successRatePct,
+    devLaunches: incoming.devLaunches,
+    source: incoming.source,
     resolved: false,
     outcome: 'UNRESOLVED',
-  }));
+  });
+  applyRecordUpdate(entry, incoming);
+  auditQueue.push(entry);
   saveAudit();
 }
 
 function recordScan({
   ca, symbol, verdict, entryTier, mc, adjustedVolLiq, top10Pct, washPct,
-  rawVolLiq, lp, top50Pct, holderCount, holderHealthPct, bundleCount, sybilFunded,
-  isEliteDev, successRatePct, devLaunches, peakMultiplier, ageMinutes, timeWindow,
-  socialMentions15m, uniqueAccounts, narrativeType, narrativeStrength, narrativeReason,
-  noGoReason, watchReason, headlineType, oracleScoreTotal, oracleScoreClass, source,
+  bundleCount, lp, isEliteDev, successRatePct, devLaunches, source,
 }) {
   addToAudit(ca, symbol, verdict, entryTier, mc, {
     adjustedVolLiq,
-    rawVolLiq,
-    lp,
     top10Pct,
-    top50Pct,
-    holderCount,
-    holderHealthPct,
-    bundleCount,
-    sybilFunded,
     washPct,
+    bundleCount,
+    lp,
     isEliteDev,
     successRatePct,
     devLaunches,
-    peakMultiplier,
-    ageMinutes,
-    timeWindow,
-    socialMentions15m,
-    uniqueAccounts,
-    narrativeType,
-    narrativeStrength,
-    narrativeReason,
-    noGoReason,
-    watchReason,
-    headlineType,
-    oracleScoreTotal,
-    oracleScoreClass,
     source,
   });
 }
@@ -306,62 +339,6 @@ function classify(entry) {
   return 'FLAT_OR_RUG';
 }
 
-function inferFailureReason(entry) {
-  return entry.noGoReason || entry.watchReason || entry.headlineType || 'unclassified_failure';
-}
-
-function buildFingerprint(entry, outcome) {
-  const multiple = entry.scanMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.scanMc : null;
-  return normalizeFingerprint({
-    ca: entry.ca,
-    ticker: entry.ticker,
-    symbol: entry.symbol,
-    scanMc: entry.scanMc,
-    peakMc: entry.peakMc,
-    multiple,
-    verdict: entry.oracleScoreClass || entry.verdict,
-    oracleScoreTotal: entry.oracleScoreTotal,
-    oracleScoreClass: entry.oracleScoreClass,
-    adjustedVolLiq: entry.adjustedVolLiq,
-    rawVolLiq: entry.rawVolLiq,
-    lp: entry.lp,
-    top10Pct: entry.top10Pct,
-    top50Pct: entry.top50Pct,
-    holderCount: entry.holderCount,
-    holderHealthPct: entry.holderHealthPct,
-    bundleCount: entry.bundleCount,
-    sybilFunded: entry.sybilFunded,
-    washPct: entry.washPct,
-    successRatePct: entry.successRatePct,
-    devLaunches: entry.devLaunches,
-    peakMultiplier: entry.peakMultiplier,
-    ageMinutes: entry.ageMinutes,
-    timeWindow: entry.timeWindow,
-    socialMentions15m: entry.socialMentions15m,
-    uniqueAccounts: entry.uniqueAccounts,
-    narrativeType: entry.narrativeType,
-    narrativeStrength: entry.narrativeStrength,
-    narrativeReason: entry.narrativeReason,
-    noGoReason: entry.noGoReason,
-    watchReason: entry.watchReason,
-    headlineType: entry.headlineType,
-    outcome,
-    failureReason: outcome === 'WINNER' ? null : inferFailureReason(entry),
-    resolvedAt: Date.now(),
-    scanTime: entry.scanTime,
-  });
-}
-
-function pushFingerprint(entry) {
-  const outcome = entry.outcome || classify(entry);
-  const fp = buildFingerprint(entry, outcome);
-  if (outcome === 'WINNER') {
-    winnerFingerprints.push(fp);
-  } else {
-    failedFingerprints.push(fp);
-  }
-}
-
 async function processBatch(bot, fetchMcFn) {
   const pending = auditQueue
     .filter(e => !e.resolved)
@@ -374,13 +351,15 @@ async function processBatch(bot, fetchMcFn) {
       const currentMc = await resolveMc(fetchMcFn, entry.ca);
       entry.lastChecked = Date.now();
       if (currentMc == null) continue;
+      entry.currentMc = currentMc;
       if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
 
       if (Date.now() - entry.scanTime >= RESOLVE_MS) {
         entry.resolved = true;
         entry.outcome = classify(entry);
+        entry.blueprintFamilies = inferBlueprintFamilies(entry);
         const multiplier = entry.scanMc > 0 ? entry.peakMc / entry.scanMc : null;
-        const wasMissedOrDowngraded = MISSED_REJECT_VERDICTS.has(entry.verdict);
+        const wasMissedOrDowngraded = MISSED_VERDICTS.has(normalizeVerdict(entry.verdict));
 
         if (wasMissedOrDowngraded && multiplier != null && multiplier >= 3 && bot && process.env.OWNER_TELEGRAM_ID) {
           const label = entry.ticker ?? entry.ca.slice(0, 8);
@@ -390,9 +369,7 @@ async function processBatch(bot, fetchMcFn) {
             + `Pattern memory updated.`;
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
         }
-        const resolvedEntry = { ...entry };
-        auditHistory.push(resolvedEntry);
-        pushFingerprint(resolvedEntry);
+        auditHistory.push({ ...entry });
       }
     } catch (e) {
       console.warn(`[audit] update failed for ${entry.ca?.slice(0, 8) ?? 'unknown'}:`, e.message);
@@ -414,7 +391,7 @@ function startAuditLoop(bot, fetchMcFn) {
   updateTimer = setInterval(() => {
     processBatch(bot, fetchMcFn).catch(e => console.warn('[audit] batch error:', e.message));
   }, CYCLE_MS);
-  console.log(`[audit] v37 loop started - ${BATCH_SIZE} CA(s) every ${CYCLE_MS / 1000}s, queue cap ${MAX_ENTRIES}`);
+  console.log(`[audit] v38.6 loop started - ${BATCH_SIZE} CA(s) every ${CYCLE_MS / 1000}s, queue cap ${MAX_ENTRIES}`);
 }
 
 function stopAuditLoop() {
@@ -425,31 +402,15 @@ function stopAuditLoop() {
 function getAuditReport() {
   loadAudit();
   const recent = [...auditHistory].slice(-10).reverse();
-  const pendingSnapshot = auditQueue
-    .filter(e => !e.resolved)
-    .map(e => {
-      const current = e.currentMc ?? e.peakMc ?? e.scanMc ?? 0;
-      const peak = Math.max(e.peakMc ?? 0, current);
-      const multiple = e.scanMc > 0 && peak > 0 ? peak / e.scanMc : 0;
-      return { ...e, current, peak, multiple };
-    })
-    .sort((a, b) => b.multiple - a.multiple)
-    .slice(0, 10);
-
-  const resolvedLines = recent.length
-    ? recent.map(e => {
-      const mult = e.scanMc > 0 && e.peakMc > 0 ? `${(e.peakMc / e.scanMc).toFixed(1)}x` : '?x';
-      return `${e.outcome} ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Peak: ${fmtUsdCompact(e.peakMc)} (${mult}) | ${e.oracleScoreClass || e.verdict}`;
-    })
-    : ['No resolved entries yet.'];
-
-  const pendingLines = pendingSnapshot.length
-    ? pendingSnapshot.map(e => {
-      return `PENDING ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Current/Peak: ${fmtUsdCompact(e.current)}/${fmtUsdCompact(e.peak)} (${e.multiple > 0 ? e.multiple.toFixed(1) : '0.0'}x) | age: ${formatAge(Date.now() - (e.scanTime || Date.now()))} | ${e.oracleScoreClass || e.verdict}`;
-    })
-    : ['No pending entries.'];
-
-  return `AUDIT - Last 10 Resolved\n\n${resolvedLines.join('\n')}\n\nPENDING SNAPSHOT (Top 10 by current multiple)\n\n${pendingLines.join('\n')}\n\nPending means not old enough to finalize yet. Peaks are updated live.`;
+  if (recent.length === 0) {
+    return `AUDIT - No resolved entries yet.\n${auditQueue.length} pending in queue.`;
+  }
+  const lines = recent.map(e => {
+    const mult = e.scanMc > 0 && e.peakMc > 0 ? `${(e.peakMc / e.scanMc).toFixed(1)}x` : '?x';
+    const timing = e.promotionDelayMinutes != null ? ` | promotion ${e.promotionDelayMinutes}m` : '';
+    return `${e.outcome} ${e.ticker ?? e.ca.slice(0, 8)} | Scan: $${(e.scanMc / 1000).toFixed(1)}K -> Peak: $${(e.peakMc / 1000).toFixed(1)}K (${mult}) | ${e.verdict}${timing}`;
+  });
+  return `AUDIT - Last 10 Resolved\n\n${lines.join('\n')}\n\n${auditQueue.length} pending in queue`;
 }
 
 function getAll() {
@@ -462,60 +423,53 @@ function getUnresolved() {
   return auditQueue.filter(e => !e.resolved);
 }
 
+function summarizeNamedComparables(records, names) {
+  const byName = {};
+  for (const n of names) {
+    const needle = String(n).toLowerCase().replace(/\s+/g, '');
+    const found = records.find(r => {
+      const txt = `${r.ticker || ''}${r.symbol || ''}`.toLowerCase().replace(/\s+/g, '');
+      return txt.includes(needle);
+    });
+    byName[n] = found || null;
+  }
+  return byName;
+}
+
 function getPatternMemory() {
   loadAudit();
-
-  const winners = auditHistory
+  const now = Date.now();
+  const winnersAll = auditHistory
     .filter(r => r.outcome === 'WINNER' || r.outcome === 'RUNNER')
-    .sort((a, b) => b.scanTime - a.scanTime)
-    .slice(0, 8);
+    .sort((a, b) => b.scanTime - a.scanTime);
 
+  const winners = winnersAll.slice(0, 8);
   const rugs = auditHistory
     .filter(r => r.outcome === 'FLAT_OR_RUG')
     .sort((a, b) => b.scanTime - a.scanTime)
     .slice(0, 8);
 
-  const missedWinners = winners
-    .filter(r => MISSED_REJECT_VERDICTS.has(r.verdict))
-    .slice(0, 5);
+  const freshWinners24 = winnersAll.filter(r => (now - r.scanTime) <= FRESH_24H_MS).slice(0, 12);
+  const freshWinners72 = winnersAll.filter(r => (now - r.scanTime) <= FRESH_72H_MS).slice(0, 20);
+  const staleWinners = winnersAll.filter(r => (now - r.scanTime) > FRESH_72H_MS).slice(0, 8);
 
-  const missedWinners3x = [...winnerFingerprints]
-    .filter(fp => fp.multiple != null && fp.multiple >= 3 && MISSED_REJECT_VERDICTS.has(fp.verdict))
-    .sort((a, b) => (b.resolvedAt || 0) - (a.resolvedAt || 0))
-    .slice(0, 8);
+  const missedWinners = winnersAll
+    .filter(r => MISSED_VERDICTS.has(normalizeVerdict(r.verdict)))
+    .slice(0, 12);
 
-  const monsterWinners10x = [...winnerFingerprints]
-    .filter(fp => fp.multiple != null && fp.multiple >= 10)
-    .sort((a, b) => (b.multiple || 0) - (a.multiple || 0))
-    .slice(0, 8);
+  const namedComparables = summarizeNamedComparables(winnersAll, ACTIVE_WINNER_BLUEPRINT_REGISTRY.tokens);
 
-  const recentFailedAlerts = [...failedFingerprints]
-    .sort((a, b) => (b.resolvedAt || 0) - (a.resolvedAt || 0))
-    .slice(0, 10);
-
-  const failedWarnings = recentFailedAlerts
-    .filter(fp => fp.outcome === 'FLAT_OR_RUG')
-    .slice(0, 6);
-
-  if (
-    winners.length === 0 &&
-    rugs.length === 0 &&
-    missedWinners.length === 0 &&
-    missedWinners3x.length === 0 &&
-    monsterWinners10x.length === 0 &&
-    recentFailedAlerts.length === 0
-  ) return null;
+  if (!winners.length && !rugs.length && !missedWinners.length) return null;
 
   return {
     winners,
     rugs,
     missedWinners,
-    missedWinners3x,
-    monsterWinners10x,
-    recentFailedAlerts,
-    winnerFingerprints: [...winnerFingerprints].slice(-50),
-    failedFingerprints: [...failedFingerprints].slice(-50),
-    failedWarnings,
+    freshWinners24,
+    freshWinners72,
+    staleWinners,
+    namedComparables,
+    activeBlueprints: ACTIVE_WINNER_BLUEPRINT_REGISTRY,
   };
 }
 
@@ -525,11 +479,10 @@ function updatePeaks(mcMap) {
     const mc = mcMap?.[entry.ca];
     if (mc != null && (entry.peakMc == null || mc > entry.peakMc)) entry.peakMc = mc;
     entry.lastChecked = Date.now();
+    entry.blueprintFamilies = inferBlueprintFamilies(entry);
   }
   saveAudit();
 }
-
-
 
 async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false, deepMode = false } = {}) {
   loadAudit();
@@ -549,10 +502,9 @@ async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false,
     if (Date.now() - entry.scanTime >= RESOLVE_MS) {
       entry.resolved = true;
       entry.outcome = classify(entry);
+      entry.blueprintFamilies = inferBlueprintFamilies(entry);
       resolved++;
-      const resolvedEntry = { ...entry };
-      auditHistory.push(resolvedEntry);
-      pushFingerprint(resolvedEntry);
+      auditHistory.push({ ...entry });
     }
   }
   auditQueue = auditQueue.filter(e => !e.resolved).slice(-MAX_ENTRIES);
@@ -566,23 +518,22 @@ function getAuditPendingReport() {
   const now = Date.now();
   const pending = auditQueue.filter(e => !e.resolved);
   if (!pending.length) return 'No unresolved audit entries.';
-  const shown = pending.length <= 25 ? pending : pending.slice(0, 25);
-  const lines = shown.map((e, idx) => {
-    const current = e.currentMc ?? e.peakMc ?? e.scanMc ?? 0;
+  return pending.slice(0, 30).map((e, idx) => {
+    const current = e.currentMc ?? e.scanMc ?? 0;
     const peak = e.peakMc ?? current;
-    const mult = e.scanMc > 0 && peak > 0 ? (peak / e.scanMc).toFixed(2) : 'N/A';
-    return `${idx + 1}. ${e.ticker || e.ca.slice(0, 8)} | Scan ${fmtUsdCompact(e.scanMc)} | Current/Peak ${fmtUsdCompact(current)}/${fmtUsdCompact(peak)} | ${mult}x | age ${formatAge(now - (e.scanTime || now))} | ${e.oracleScoreClass || e.verdict}`;
-  });
-  const suffix = pending.length > shown.length ? `\n\nShowing first ${shown.length} of ${pending.length} pending entries.` : '';
-  return lines.join('\n') + suffix;
+    const mult = e.scanMc > 0 && current > 0 ? (current / e.scanMc).toFixed(2) : 'N/A';
+    const ageMin = Math.floor((now - e.scanTime) / 60000);
+    const resolveIn = Math.max(0, Math.floor((RESOLVE_MS - (now - e.scanTime)) / 60000));
+    const promo = e.promotionDelayMinutes != null ? ` | promo:${e.promotionDelayMinutes}m` : '';
+    return `${idx + 1}. ${e.ticker} | ${e.verdict} | scan:$${Math.round((e.scanMc || 0) / 1000)}K | current:$${Math.round((current || 0) / 1000)}K | peak:$${Math.round((peak || 0) / 1000)}K | multiple:${mult}x | age:${ageMin}m | resolve:${resolveIn}m${promo}`;
+  }).join('\n');
 }
 
 function matchLearnedPattern(result) {
   const memory = getPatternMemory();
-  if (!memory?.winnerFingerprints?.length && !memory?.missedWinners3x?.length) {
-    return { matched: false, strong: false, action: null, type: null, confidence: 0, reason: 'No winner-fingerprint history yet.' };
+  if (!memory?.missedWinners?.length && !memory?.freshWinners72?.length) {
+    return { matched: false, action: null, type: null, confidence: 0, reason: 'No fresh learned runner patterns yet.' };
   }
-
   const s = result?.signals || {};
   const candidate = {
     mc: Number(s.marketCap || 0),
@@ -590,129 +541,30 @@ function matchLearnedPattern(result) {
     wash: Number(s.washPct || 0),
     vol: Number(s.adjustedVolLiq || 0),
     bundle: Number(s.bundleCount || 0),
-    sybil: !!s.sybilFunded,
-    lp: Number(s.lp || 0),
   };
+  const earlyExpansion = candidate.mc >= 5_000 && candidate.mc <= 30_000 && candidate.vol >= 3 && candidate.vol <= 12 && (candidate.wash <= 20 || candidate.wash === 0);
+  const bundleExpansion = candidate.bundle >= 6 && candidate.bundle <= 10 && candidate.vol >= 8 && candidate.vol <= 13 && candidate.top10 >= 30 && candidate.top10 <= 40 && candidate.wash < 15;
+  const controlledConc = candidate.top10 >= 30 && candidate.top10 <= 45 && candidate.vol >= 3;
 
-  const catastrophic = [];
-  if (candidate.sybil) catastrophic.push('confirmed_sybil');
-  if (candidate.wash > 50) catastrophic.push('wash_over_50');
-  if (!(candidate.mc > 0)) catastrophic.push('malformed_or_missing_market_cap');
-  if (!(candidate.lp > 0 || candidate.mc > 0)) catastrophic.push('liquidity_malformed');
-
-  if (catastrophic.length) {
-    return {
-      matched: false,
-      strong: false,
-      action: null,
-      type: null,
-      confidence: 0,
-      reason: `Blocked by catastrophic risk: ${catastrophic.join(', ')}`,
-      catastrophic,
-    };
-  }
-
-  const reasons = [];
-  let score = 0;
-
-  const controlledConcentration = candidate.mc > 0 &&
-    candidate.mc <= 150_000 &&
-    candidate.top10 >= 30 &&
-    candidate.top10 <= 50 &&
-    candidate.vol >= 5 &&
-    (candidate.wash <= 25 || candidate.wash === 0);
-  if (controlledConcentration) {
-    score += 2;
-    reasons.push('controlled-concentration winner family');
-  }
-
-  const bundleExpansion = candidate.bundle >= 6 &&
-    candidate.bundle <= 10 &&
-    candidate.vol >= 8 &&
-    candidate.wash < 15 &&
-    candidate.top10 <= 45 &&
-    !candidate.sybil;
-  if (bundleExpansion) {
-    score += 2;
-    reasons.push('bundle-blocked expansion winner family');
-  }
-
-  const earlyExpansion = candidate.mc >= 10_000 &&
-    candidate.mc <= 30_000 &&
-    candidate.vol >= 4 &&
-    candidate.wash < 25 &&
-    !candidate.sybil;
-  if (earlyExpansion) {
-    score += 1.5;
-    reasons.push('early expansion zone');
-  }
-
-  const narrativeStrength = Number(s.narrativeStrength || 0);
-  if (narrativeStrength >= 3) {
-    score += 1.25;
-    reasons.push(`narrative catalyst ${s.narrativeType || 'NONE'} (${narrativeStrength}/5)`);
-  }
-
-  const fpMatches = (memory.winnerFingerprints || []).filter(fp => {
-    if (!(fp.scanMc > 0) || !(fp.multiple >= 3)) return false;
-    const mcNear = candidate.mc > 0 ? Math.abs(candidate.mc - fp.scanMc) / Math.max(candidate.mc, fp.scanMc) <= 0.7 : false;
-    const top10Near = fp.top10Pct == null || candidate.top10 === 0 ? false : Math.abs(candidate.top10 - fp.top10Pct) <= 12;
-    const volNear = fp.adjustedVolLiq == null || candidate.vol === 0 ? false : Math.abs(candidate.vol - fp.adjustedVolLiq) <= 6;
-    return mcNear && (top10Near || volNear);
-  });
-  if (fpMatches.length) {
-    score += Math.min(2, fpMatches.length * 0.5);
-    reasons.push(`historical fingerprint similarity (${fpMatches.length})`);
-  }
-
-  const confidence = Math.max(0, Math.min(0.95, 0.35 + score * 0.12));
-  const matched = score >= 2.5;
-  const strong = score >= 4;
+  const confidence = earlyExpansion || bundleExpansion || controlledConc ? 0.76 : 0.56;
+  let type = null;
+  if (bundleExpansion) type = 'BUNDLE_BLOCKED_EXPANSION';
+  else if (earlyExpansion) type = 'EARLY_EXPANSION_ZONE';
+  else if (controlledConc) type = 'CONTROLLED_CONCENTRATION_WINNER';
 
   return {
-    matched,
-    strong,
-    action: matched ? 'MISSED_WINNER_MATCH' : null,
-    type: matched ? 'WINNER_FAMILY_SIMILARITY' : null,
+    matched: confidence >= (config.DIRTY_RUNNER_MIN_CONFIDENCE || 0.7),
+    action: 'DIRTY_RUNNER_WATCH',
+    type: type || 'CONCENTRATION_RUNNER',
     confidence,
-    reason: reasons.length ? reasons.join('; ') : 'No winner-family match.',
-    reasons,
-    catastrophic,
-  };
-}
-
-function formatAge(ms) {
-  if (!Number.isFinite(ms) || ms < 0) return '0m';
-  const totalMin = Math.floor(ms / 60000);
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  if (h <= 0) return `${m}m`;
-  return `${h}h ${m}m`;
-}
-
-function fmtUsdCompact(n) {
-  const v = Number(n || 0);
-  if (!Number.isFinite(v) || v <= 0) return '$0';
-  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
-  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
-  return `$${v.toFixed(0)}`;
-}
-
-function getMemoryStats() {
-  loadAudit();
-  return {
-    dataDir: DATA_DIR,
-    auditFile: AUDIT_FILE,
-    queueCount: auditQueue.length,
-    historyCount: auditHistory.length,
-    winnerFingerprintCount: winnerFingerprints.length,
-    failedFingerprintCount: failedFingerprints.length,
+    reason: type
+      ? `Matches fresh ${type} winner-family blueprint from recent audit memory.`
+      : 'Matches prior missed 3x+ concentration runners: sub-$100K, organic vol, elevated top10, low wash.',
   };
 }
 
 module.exports = {
-  DATA_DIR,
-  AUDIT_FILE,
+  ACTIVE_WINNER_BLUEPRINT_REGISTRY,
   addToAudit,
   recordScan,
   startAuditLoop,
@@ -726,5 +578,4 @@ module.exports = {
   getAuditPendingReport,
   processPendingOnce,
   matchLearnedPattern,
-  getMemoryStats,
 };
