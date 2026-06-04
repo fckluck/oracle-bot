@@ -36,6 +36,52 @@ function fmtMult(n) {
   if (n >= 10)  return `${n.toFixed(1)}x`;
   return `${n.toFixed(2)}x`;
 }
+function recommendedSizing(result) {
+  const cls = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
+  const signals = result?.signals || {};
+  if (cls === 'ORACLE_BUY' || result?.verdict === 'BUY') {
+    return { size: (result?.positionSizeSol != null ? String(result.positionSizeSol) : String(config.SESSION_SIZE_SOL)) + ' SOL', label: 'ORACLE_BUY' };
+  }
+  if (cls === 'MISSED_WINNER_MATCH' || result?.verdict === 'MISSED_WINNER_MATCH') {
+    const strong = !!result?.missedWinnerMatch?.strong;
+    const sol = strong ? config.MISSED_WINNER_MATCH_STRONG_SIZE_SOL : config.MISSED_WINNER_MATCH_SIZE_SOL;
+    return { size: sol.toFixed(2) + ' SOL', label: 'TRADEABLE SCOUT — proven winner-family match' };
+  }
+  if (cls === 'DIRTY_RUNNER_WATCH' || result?.verdict === 'DIRTY_RUNNER_WATCH') {
+    const trackOnly = !!signals.sybilFunded || (signals.washPct ?? 0) > 35 || (signals.top10Pct ?? 0) > 50;
+    return {
+      size: trackOnly ? 'track-only' : config.DIRTY_RUNNER_MIN_SIZE_SOL.toFixed(2) + '-' + config.DIRTY_RUNNER_MAX_SIZE_SOL.toFixed(2) + ' SOL',
+      label: 'HIGH RISK WATCH — not clean enough for full confidence',
+    };
+  }
+  if (['NO_GO', 'AVOID', 'SKIP'].includes(cls) || ['NO_GO', 'AVOID', 'SKIP'].includes(String(result?.verdict || '').toUpperCase())) {
+    return { size: '0 SOL', label: 'No position' };
+  }
+  return { size: config.DIRTY_RUNNER_MIN_SIZE_SOL.toFixed(2) + ' SOL', label: 'watchlist / discretionary' };
+}
+
+function formatShortCard(result, ca) {
+  const signals = result?.signals || {};
+  const cls = String(result?.oracleScore?.class || result?.verdict || 'WATCH');
+  const score = result?.oracleScore?.total != null ? String(result.oracleScore.total) + '/100' : 'N/A';
+  const sizing = recommendedSizing(result);
+  const risk = result?.noGoReason || result?.watchReason || result?.headlineType || 'risk mixed';
+  const whyShown = result?.missedWinnerMatch?.reasons?.length ? result.missedWinnerMatch.reasons.join(', ') : (result?.patternMatch?.reason || 'scanner and risk filters');
+  const lines = [];
+  lines.push('🧾 ' + b('ORACLE EXEC CARD (SHORT)'));
+  lines.push(b('Token:') + ' ' + esc(result?.ticker || result?.symbol || ca.slice(0, 8)));
+  lines.push(b('Class:') + ' ' + b(cls) + ' | ' + b('Score:') + ' ' + b(score));
+  lines.push(b('Suggested size:') + ' ' + b(sizing.size) + ' — ' + esc(sizing.label));
+  lines.push(b('MC:') + ' ' + fmtUsd(signals.marketCap) + ' | ' + b('LP:') + ' ' + fmtUsd(signals.lp) + ' | ' + b('Adj Vol/Liq:') + ' ' + fmt(signals.adjustedVolLiq, 2) + 'x');
+  lines.push(b('Top10:') + ' ' + fmtPct(signals.top10Pct) + ' | ' + b('Bundle:') + ' ' + (signals.bundleCount ?? 0) + '/slot');
+  lines.push(b('Dev:') + ' ' + esc(result?.devProfile?.totalLaunches != null ? String(result.devProfile.totalLaunches) + ' launches | SR ' + ((signals.successRatePct ?? 0).toFixed(1)) + '%' : 'dev data partial'));
+  lines.push(b('Social/Narrative:') + ' ' + esc(result?.social?.available ? String(result.social.mentions15m) + ' mentions/15m' : 'social partial') + ' | ' + esc(signals.narrativeType || result?.narrativeType || 'NONE') + ' ' + String(signals.narrativeStrength ?? result?.narrativeStrength ?? 0) + '/5');
+  lines.push(b('Main risk:') + ' ' + esc(risk));
+  lines.push(b('Why shown:') + ' ' + esc(whyShown));
+  lines.push(b('TP plan:') + ' ' + esc(cls === 'MISSED_WINNER_MATCH' ? 'TP1 2x | TP2 5x | TP3 10x' : cls === 'DIRTY_RUNNER_WATCH' ? 'TP1 2x | TP2 4x | derisk fast' : 'Use standard TP ladder'));
+  lines.push('CA: ' + code(ca));
+  return lines.join('\n');
+}
 
 // ── Verdict header ────────────────────────────────────────────────────────────
 
@@ -136,7 +182,9 @@ function washQualityDisplay(washPct) {
 
 // ── Main formatter (v8.4 Anti-Wash Predator) ──────────────────────────────────
 
-function formatVerdict(result, ca) {
+function formatVerdict(result, ca, options = {}) {
+  const mode = String(options.mode || "full").toLowerCase();
+  if (mode === "short") return formatShortCard(result, ca);
   const {
     verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
@@ -497,14 +545,20 @@ function formatVerdict(result, ca) {
 
   // ── TPs (class-calibrated) ───────────────────────────────────────────────
 
-  if (oracleClass === 'ORACLE_BUY' || oracleClass === 'DIRTY_RUNNER_WATCH' || verdict === 'BUY' || verdict === 'DIRTY_RUNNER_WATCH') {
+  if (oracleClass === 'ORACLE_BUY' || oracleClass === 'DIRTY_RUNNER_WATCH' || oracleClass === 'MISSED_WINNER_MATCH' || verdict === 'BUY' || verdict === 'DIRTY_RUNNER_WATCH' || verdict === 'MISSED_WINNER_MATCH') {
     L.push(b('── TAKE PROFITS ──'));
-    if (oracleClass === 'DIRTY_RUNNER_WATCH' || verdict === 'DIRTY_RUNNER_WATCH') {
+    if (oracleClass === 'MISSED_WINNER_MATCH' || verdict === 'MISSED_WINNER_MATCH') {
       L.push('TP1: 2x');
       L.push('TP2: 5x');
       L.push('TP3: 10x');
       L.push('Trail: 35–50% ATH retrace');
-      L.push('Sizing: smaller scout');
+      L.push(`Sizing: ${recommendedSizing(result).size} scout`);
+    } else if (oracleClass === 'DIRTY_RUNNER_WATCH' || verdict === 'DIRTY_RUNNER_WATCH') {
+      L.push('TP1: 2x');
+      L.push('TP2: 5x');
+      L.push('TP3: 10x');
+      L.push('Trail: 35–50% ATH retrace');
+      L.push(`Sizing: ${recommendedSizing(result).size}`);
       if (signals.isSerialDeployer) {
         L.push('Serial deployer note: faster TP cadence, smaller scout, moonbag only after principal removed');
       }

@@ -9,7 +9,16 @@ const { actionTimeLine } = require('./time');
 const { apiStatusHtml, markApi } = require('./telemetry');
 const config    = require('./config');
 const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
-const { recordScan, startAuditLoop, getAuditReport, getPatternMemory, getAuditPendingReport, processPendingOnce } = require('./audit');
+const {
+  recordScan,
+  startAuditLoop,
+  getAuditReport,
+  getPatternMemory,
+  getAuditPendingReport,
+  processPendingOnce,
+  matchLearnedPattern,
+  getMemoryStats: getAuditMemoryStats,
+} = require('./audit');
 
 function ensureDataDir() {
   const dataDir = process.env.DATA_DIR || '/data';
@@ -32,6 +41,35 @@ ensureDataDir();
 const tracker   = require('./tracker');
 const hunt      = require('./hunt');
 const watchlist = require('./watchlist');
+
+function canWriteDir(dirPath) {
+  try {
+    fs.accessSync(dirPath, fs.constants.W_OK);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function logMemoryStartupState() {
+  const auditMemory = getAuditMemoryStats();
+  const trackerMemory = tracker.getMemoryStats ? tracker.getMemoryStats() : {
+    positionsFile: process.env.POSITIONS_FILE || '/data/positions.json',
+    trackedPositionsCount: tracker.list().length,
+    usingFallbackFile: false,
+  };
+  const dataDir = process.env.DATA_DIR || '/data';
+  const dataDirExists = fs.existsSync(dataDir);
+  const dataDirWritable = dataDirExists && canWriteDir(dataDir);
+
+  console.log('[startup] memory state');
+  console.log(`[startup] DATA_DIR: ${dataDir} | exists=${dataDirExists} | writable=${dataDirWritable}`);
+  console.log(`[startup] AUDIT_FILE: ${auditMemory.auditFile} | queue=${auditMemory.queueCount} | history=${auditMemory.historyCount}`);
+  console.log(`[startup] POSITIONS_FILE: ${trackerMemory.positionsFile} | tracked=${trackerMemory.trackedPositionsCount}`);
+  if (trackerMemory.usingFallbackFile) {
+    console.warn('[startup] Guardian positions file is using repo-local fallback (bot/positions.json).');
+  }
+}
 
 // ── Railway health check ───────────────────────────────────────────────────────
 // Railway treats every service as a web service and kills the process if it
@@ -57,6 +95,8 @@ if (!config.TELEGRAM_BOT_TOKEN) {
 }
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
+const forceFullNextScanChats = new Set();
+logMemoryStartupState();
 
 bot.catch((err, ctx) => {
   const updateType = ctx?.updateType || 'unknown';
@@ -82,6 +122,56 @@ function buildKeyboard(ca, currentMc, verdict) {
   return { inline_keyboard: rows };
 }
 
+function fmtUsd(n) {
+  if (n == null || !Number.isFinite(Number(n)) || Number(n) <= 0) return 'N/A';
+  const v = Number(n);
+  if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return `${v.toFixed(2)}`;
+}
+
+function summarizeBaseline(sig) {
+  if (!sig) return 'pending';
+  const fields = [sig.marketCap, sig.lp, sig.holderCount, sig.top10Pct, sig.top50Pct];
+  const haveCount = fields.filter(v => v != null).length;
+  if (haveCount === 0) return 'pending';
+  return haveCount === fields.length ? 'complete' : 'partial';
+}
+
+async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
+  const shortCa = `${ca.slice(0, 6)}...${ca.slice(-4)}`;
+  let sig = null;
+  try { sig = await fetchForensic(ca); } catch (_) {}
+
+  const baseline = summarizeBaseline(sig);
+  const entryMc = sig?.marketCap ?? preferredMc ?? 0;
+  const entryLp = sig?.lp ?? null;
+  const holders = sig?.holderCount ?? null;
+  const top10 = sig?.top10Pct ?? null;
+  const top50 = sig?.top50Pct ?? null;
+
+  const added = tracker.track(ca, chatId, entryMc, 'MANUAL', 'DISCOVERY', null, holders, top10, top50, entryLp);
+  if (!added) {
+    const reason = tracker.list().length >= 10 ? 'max 10 positions reached' : 'already tracking this token';
+    return { ok: false, reason, shortCa };
+  }
+
+  if (baseline !== 'complete') tracker.maybeEstablishBaseline(ca, bot);
+
+  const msg =
+    `✅ GUARDIAN TRACKING STARTED\n` +
+    `CA: ${shortCa}\n` +
+    `MC: ${fmtUsd(entryMc)}\n` +
+    `LP: ${fmtUsd(entryLp)}\n` +
+    `Holders: ${holders ?? 'N/A'}\n` +
+    `Top 10: ${top10 != null ? top10.toFixed(1) + '%' : 'N/A'}\n` +
+    `Top 50: ${top50 != null ? top50.toFixed(1) + '%' : 'N/A'}\n` +
+    `Baseline: ${baseline}\n` +
+    `Next poll: 60s`;
+
+  return { ok: true, shortCa, message: msg, baseline };
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 const HELP_MENU =
@@ -96,9 +186,11 @@ const HELP_MENU =
   `• /auditpending — Show unresolved audit entries\n` +
   `• /auditnow — Force one cheap pending-pass now\n` +
   `• /auditdeep — Deeper learning pass with larger caps\n` +
+  `• /memorycheck — Verify audit/guardian memory paths + counts\n` +
+  `• /memorybackup — Snapshot /data/audit.json and /data/positions.json\n` +
   `• /defadetest [CA] — DeFade endpoint/cache/action test\n\n` +
   `<b>── HUNT MODE (Automated) ──</b>\n` +
-  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts only for ORACLE_BUY / DIRTY_RUNNER_WATCH\n` +
+  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Alerts for ORACLE_BUY / MISSED_WINNER_MATCH / DIRTY_RUNNER_WATCH\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
@@ -106,10 +198,13 @@ const HELP_MENU =
   `• /huntmode [strict|watch|all] — Legacy toggle (v38 still enforces class gates)\n` +
   `• /window — Current trading mode (Discovery / Dead Zone / Research)\n\n` +
   `<b>── POSITION TRACKING (Guardian) ──</b>\n` +
+  `• /track [CA] — Track any Solana token CA (baseline can be pending)\n` +
+  `• +track [CA] — Shortcut alias for /track\n` +
   `• /tracking — List all tracked tokens + live state\n` +
   `• /sync [CA] — Force-sync Guardian baseline if entry was missed\n` +
   `• /untrack [CA] — Stop monitoring a specific token\n\n` +
   `<b>── RESEARCH ──</b>\n` +
+  `• /scanfull [CA] or /details [CA] — Force full forensic card\n` +
   `• /watchlist — Tokens being watched for Entry Grade activation\n` +
   `• <i>[Paste any CA]</i> — Full 10-gate forensic Oracle Scorecard\n\n` +
   `<i>Type /hunt to begin. 🔒🛡️🚀</i>`;
@@ -132,10 +227,58 @@ bot.command('apistatus', ctx => {
   return ctx.replyWithHTML(`${actionTimeLine('API Status Time')}\n\n${apiStatusHtml()}`);
 });
 
+bot.command('memorycheck', ctx => {
+  const auditMemory = getAuditMemoryStats();
+  const trackerMemory = tracker.getMemoryStats ? tracker.getMemoryStats() : {
+    positionsFile: process.env.POSITIONS_FILE || '/data/positions.json',
+    trackedPositionsCount: tracker.list().length,
+    usingFallbackFile: false,
+  };
+  const dataDir = process.env.DATA_DIR || '/data';
+  const exists = fs.existsSync(dataDir);
+  const writable = exists && canWriteDir(dataDir);
+  const warning = trackerMemory.usingFallbackFile
+    ? '\n⚠️ Guardian is using repo-local bot/positions.json fallback.'
+    : '';
+
+  return ctx.reply(
+    `${actionTimeLine('Memory Check Time')}\n\n` +
+    `✅ DATA_DIR: ${dataDir} (exists=${exists}, writable=${writable})\n` +
+    `✅ AUDIT_FILE: ${auditMemory.auditFile}\n` +
+    `✅ POSITIONS_FILE: ${trackerMemory.positionsFile}\n` +
+    `✅ audit queue count: ${auditMemory.queueCount}\n` +
+    `✅ audit history count: ${auditMemory.historyCount}\n` +
+    `✅ tracked positions count: ${trackerMemory.trackedPositionsCount}` +
+    warning
+  );
+});
+
+bot.command('memorybackup', async ctx => {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const backups = [
+    { from: '/data/audit.json', to: `/data/audit.backup.${ts}.json` },
+    { from: '/data/positions.json', to: `/data/positions.backup.${ts}.json` },
+  ];
+  const lines = [`${actionTimeLine('Memory Backup Time')}`, ''];
+  for (const item of backups) {
+    try {
+      if (!fs.existsSync(item.from)) {
+        lines.push(`⚠️ missing: ${item.from}`);
+        continue;
+      }
+      fs.copyFileSync(item.from, item.to);
+      lines.push(`✅ backup created: ${item.to}`);
+    } catch (e) {
+      lines.push(`⚠️ backup failed for ${item.from}: ${e.message}`);
+    }
+  }
+  await ctx.reply(lines.join('\n'));
+});
+
 bot.command('hunt', ctx => {
   const added = hunt.addHunter(ctx.chat.id);
   return ctx.replyWithHTML(added
-    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts are narrowed to ORACLE_BUY and DIRTY_RUNNER_WATCH only.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
+    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts are narrowed to ORACLE_BUY / MISSED_WINNER_MATCH / DIRTY_RUNNER_WATCH only.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
     : `${actionTimeLine('Hunt Time')}\n\n🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
 });
 
@@ -355,7 +498,7 @@ bot.command('untrack', ctx => {
 bot.command('watchlist', ctx => {
   const all = watchlist.list();
   const mine = all.filter(e => e.chatId === ctx.chat.id);
-  if (!mine.length) return ctx.reply('No tokens on your watchlist. Use the 🔔 ALERT button on any WATCH_VOL result to add one.');
+  if (!mine.length) return ctx.reply('No tokens on your watchlist. Use /track [CA] or +track [CA] to add any token.');
   const now = Date.now();
   const lines = mine.map((e, i) => {
     const ageMin = Math.floor((now - e.addedAt) / 60000);
@@ -368,6 +511,19 @@ bot.command('watchlist', ctx => {
     lines.join('\n') +
     `\n\n<i>Alerts auto-expire after 6 hours.</i>`
   );
+});
+
+bot.command('track', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const ca = parts[1];
+  if (!ca || !isSolanaCA(ca)) {
+    return ctx.reply('Usage: /track [CA]');
+  }
+  const tracked = await beginTrackingAnyCa({ ca, chatId: ctx.chat.id });
+  if (!tracked.ok) {
+    return ctx.reply(`⚠️ TRACK FAILED — ${tracked.reason}`);
+  }
+  return ctx.reply(tracked.message);
 });
 
 bot.command('audit', async ctx => {
@@ -493,7 +649,7 @@ bot.command('window', ctx => {
   );
   const window = etHour >= 2 && etHour < 12 ? 'DISCOVERY' : etHour >= 12 && etHour < 19 ? 'DEAD_ZONE' : 'RESEARCH';
   return ctx.replyWithHTML(
-    `<b>Scan Thresholds</b>\n\nLP min: $${config.LP_MIN_USD.toLocaleString()}\nAge max: ${config.AGE_MAX_MIN}min\n` +
+    `<b>Scan Thresholds</b>\n\nLP min: ${config.LP_MIN_USD.toLocaleString()}\nAge max: ${config.AGE_MAX_MIN}min\n` +
     `Vol/Liq: ${window === 'DEAD_ZONE' ? '8x' : '5x'} (${window})\nTop 10 max: ${config.TOP10_MAX_PCT}%\n` +
     `Curve max: ${config.CURVE_MAX_PCT}% (hard skip: ${config.CURVE_HARD_SKIP_PCT}%)\n` +
     `Top 10 hard NO-GO: ${config.TOP10_HARD_MAX_PCT}%\nSession: ${config.SESSION_SIZE_SOL} SOL\n\n` +
@@ -503,11 +659,28 @@ bot.command('window', ctx => {
   );
 });
 
+bot.command('scanfull', ctx => {
+  forceFullNextScanChats.add(ctx.chat.id);
+  return ctx.reply('Full-card mode armed for your next scan. Paste a CA (or use /details).');
+});
+
+bot.command('details', ctx => {
+  forceFullNextScanChats.add(ctx.chat.id);
+  return ctx.reply('Full-card mode armed for your next scan. Paste a CA (or use /scanfull).');
+});
+
 // ── CA scan handler ───────────────────────────────────────────────────────────
 
 bot.on('text', async ctx => {
   const text = ctx.message.text.trim();
   if (text.startsWith('/')) return;
+
+  const plusTrack = text.match(/^\+track\s+([1-9A-HJ-NP-Za-km-z]{32,50})$/i);
+  if (plusTrack) {
+    const tracked = await beginTrackingAnyCa({ ca: plusTrack[1], chatId: ctx.chat.id });
+    if (!tracked.ok) return ctx.reply(`⚠️ TRACK FAILED — ${tracked.reason}`);
+    return ctx.reply(tracked.message);
+  }
 
   const tokens = text.split(/\s+/);
   const ca = tokens.find(t => isSolanaCA(t));
@@ -544,6 +717,27 @@ bot.on('text', async ctx => {
 
     // Attach social data to result so verdict formatter can render social signals
     result.social = social;
+
+    // Memory-backed winner-family check before final output (never overrides catastrophic blocks).
+    const memoryMatch = matchLearnedPattern(result);
+    result.patternMatch = memoryMatch;
+    const currentClass = String(result.oracleScore?.class || result.verdict || '').toUpperCase();
+    const classEligible = ['NO_GO', 'WATCH', 'WATCH_VOL', 'WATCH_WASH', 'DIRTY_RUNNER_WATCH', 'RISKY_RUNNER', 'SKIP'].includes(currentClass);
+    const catastrophic = ['confirmed_sybil', 'wash_over_50', 'malformed_or_missing_market_cap', 'liquidity_malformed'];
+    const hasCatastrophic = (result.oracleScore?.hardBlocks || []).some(b => catastrophic.includes(b));
+    if (classEligible && memoryMatch?.matched && !hasCatastrophic) {
+      result.verdict = 'MISSED_WINNER_MATCH';
+      result.entryTier = null;
+      if (result.oracleScore) result.oracleScore.class = 'MISSED_WINNER_MATCH';
+      result.missedWinnerMatch = {
+        memoryMatched: true,
+        confidence: memoryMatch.confidence,
+        strong: !!memoryMatch.strong,
+        reasons: memoryMatch.reasons || [memoryMatch.reason].filter(Boolean),
+      };
+      result.watchReason = `WINNER-FAMILY MATCH — ${(memoryMatch.reasons || [memoryMatch.reason]).filter(Boolean).join(', ')}`;
+      result.noGoReason = null;
+    }
 
     // DeFade runs before Soul so Grok sees the final scanner/verification verdict.
     // DeFade only fires on BUY candidates (free-plan quota guard).
@@ -598,15 +792,38 @@ bot.on('text', async ctx => {
       entryTier:      result.entryTier,
       mc:             result.signals?.marketCap,
       adjustedVolLiq: result.signals?.adjustedVolLiq,
+      rawVolLiq:      result.signals?.rawVolLiq,
+      lp:             result.signals?.lp,
       top10Pct:       result.signals?.top10Pct,
+      top50Pct:       result.signals?.top50Pct,
+      holderCount:    result.signals?.holderCount,
+      holderHealthPct: result.signals?.holderHealth?.healthPct ?? null,
+      bundleCount:    result.signals?.bundleCount,
+      sybilFunded:    result.signals?.sybilFunded,
       washPct:        result.signals?.washPct,
       isEliteDev:     result.signals?.isEliteDev,
       successRatePct: result.signals?.successRatePct,
       devLaunches:    result.signals?.totalLaunches,
+      peakMultiplier: result.signals?.peakMultiplier,
+      ageMinutes:     result.signals?.ageMinutes,
+      timeWindow:     result.timeWindow,
+      socialMentions15m: result.social?.mentions15m,
+      uniqueAccounts: result.social?.uniqueAccounts,
+      narrativeType: result.signals?.narrativeType || result.narrativeType,
+      narrativeStrength: result.signals?.narrativeStrength || result.narrativeStrength,
+      narrativeReason: result.signals?.narrativeReason || result.narrativeReason,
+      noGoReason: result.noGoReason,
+      watchReason: result.watchReason,
+      headlineType: result.headlineType,
+      oracleScoreTotal: result.oracleScore?.total,
+      oracleScoreClass: result.oracleScore?.class,
       source:         'scan',
     });
 
-    const message = formatVerdict(result, ca);
+    const forceFull = forceFullNextScanChats.has(ctx.chat.id);
+    if (forceFull) forceFullNextScanChats.delete(ctx.chat.id);
+    const cardMode = forceFull ? 'full' : (String(config.SCAN_CARD_MODE || 'full').toLowerCase() === 'short' ? 'short' : 'full');
+    const message = formatVerdict(result, ca, { context: 'scan', mode: cardMode });
 
     await ctx.telegram.editMessageText(
       ctx.chat.id, scanning.message_id, undefined,
@@ -669,78 +886,13 @@ bot.on('callback_query', async ctx => {
     const ca    = parts[1];
     const mc    = parseFloat(parts[2]) || 0;
 
-    // Re-scan to get entryTier, timeWindow, devWallet, holderCount, top10Pct
-    let entryTier = null, timeWindow = 'DISCOVERY';
-    let devWallet = null, holderCount = null, top10Pct = null, top50Pct = null, entryLp = null;
-    try {
-      const scanData = await fetchAll(ca, { manualMode: true, skipCodex: config.CODEX_MODE === 'off', skipGMGN: true });
-      const result   = scan(scanData);
-      entryTier   = result.entryTier;
-      timeWindow  = result.timeWindow;
-      devWallet   = result.devProfile?.wallet   ?? null;
-      entryLp     = result.signals?.lp          ?? null;
-      holderCount = result.signals?.holderCount ?? null;
-      top10Pct    = result.signals?.top10Pct    ?? null;
-      top50Pct    = result.signals?.top50Pct    ?? null;
-    } catch (_) {}
-
-    const added = tracker.track(ca, ctx.chat.id, mc, entryTier, timeWindow, devWallet, holderCount, top10Pct, top50Pct, entryLp);
-    const shortCa = `${ca.slice(0,6)}...${ca.slice(-4)}`;
-
-    if (!added) {
-      const reason = tracker.list().length >= 10 ? 'max 10 positions reached' : 'already tracking this token';
-      await ctx.answerCbQuery(`⚠️ ${reason}`);
+    const tracked = await beginTrackingAnyCa({ ca, chatId: ctx.chat.id, preferredMc: mc });
+    if (!tracked.ok) {
+      await ctx.answerCbQuery(`⚠️ ${tracked.reason}`);
       return;
     }
-    await ctx.answerCbQuery(`✅ Tracking ${shortCa}`);
-
-    // v10.2.7: synchronous baseline with 3-attempt retry.
-    // Solana API lag is common in the first few seconds after a new launch.
-    // A single-shot fetch would untrack good tokens unnecessarily. Retry 3×
-    // at 2s intervals — baseline message arrives within ~6s worst case (the
-    // callback was already answered, so the user isn't blocked).
-    const MAX_BASELINE_ATTEMPTS = 3;
-    const BASELINE_RETRY_MS     = 2000;
-    let sig = null;
-    let lastErr = null;
-    for (let attempt = 1; attempt <= MAX_BASELINE_ATTEMPTS; attempt++) {
-      try {
-        sig = await fetchForensic(ca);
-        if (sig) { console.log(`[track] baseline attempt ${attempt} OK for ${shortCa}`); break; }
-        lastErr = new Error('forensic returned null (DexScreener/SolanaTracker unreachable)');
-        console.log(`[track] baseline attempt ${attempt} returned null — retry in ${BASELINE_RETRY_MS}ms`);
-      } catch (e) {
-        lastErr = e;
-        console.log(`[track] baseline attempt ${attempt} threw: ${e.message} — retry in ${BASELINE_RETRY_MS}ms`);
-      }
-      if (attempt < MAX_BASELINE_ATTEMPTS) await new Promise(r => setTimeout(r, BASELINE_RETRY_MS));
-    }
-
-    if (!sig) {
-      tracker.untrack(ca);
-      await ctx.telegram.sendMessage(ctx.chat.id,
-        `❌ *TRACK FAILED — forensic data unavailable*\n` +
-        `\`${shortCa}\` is NOT actively monitored.\n` +
-        `Tried ${MAX_BASELINE_ATTEMPTS}× — ${lastErr?.message ?? 'API unreachable'}.\n` +
-        `Re-click [ ➕ TRACK ] in a few minutes once the token settles.`,
-        { parse_mode: 'Markdown' });
-    } else {
-      const fmtUsd = (n) => !n ? 'N/A' : n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : n >= 1e3 ? `$${(n/1e3).toFixed(1)}K` : `$${n.toFixed(2)}`;
-      await ctx.telegram.sendMessage(ctx.chat.id,
-        `🔔 *Oracle Guardian — Baseline Set*\n` +
-        `\`${shortCa}\`\n` +
-        `• MC: ${fmtUsd(sig.marketCap)}\n` +
-        `• LP: ${fmtUsd(sig.lp)}\n` +
-        `• Holders: ${sig.holderCount ?? 'N/A'}\n` +
-        `• Top 10: ${sig.top10Pct != null ? sig.top10Pct.toFixed(1) + '%' : 'N/A'}\n` +
-        `• Top 50: ${sig.top50Pct != null ? sig.top50Pct.toFixed(1) + '%' : 'N/A'}\n` +
-        `• Vol/Liq (1h): ${sig.adjustedVolLiq != null ? sig.adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}\n\n` +
-        `_Next forensic poll in 60s. All triggers active._`,
-        { parse_mode: 'Markdown' });
-      if (sig.top50Pct == null || sig.holderCount == null) {
-        tracker.maybeEstablishBaseline(ca, bot);
-      }
-    }
+    await ctx.answerCbQuery(`✅ Tracking ${tracked.shortCa}`);
+    await ctx.telegram.sendMessage(ctx.chat.id, tracked.message);
   }
 });
 
@@ -758,6 +910,7 @@ bot.on('callback_query', async ctx => {
 
 try { tracker.startTracker(bot); }
 catch (e) { console.error('[startup] tracker.startTracker error:', e?.stack || e.message); }
+logMemoryStartupState();
 
 try { hunt.start(bot, buildKeyboard); }
 catch (e) { console.error('[startup] hunt.start error:', e?.stack || e.message); }
