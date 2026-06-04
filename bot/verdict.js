@@ -39,6 +39,29 @@ function fmtMult(n) {
 function recommendedSizing(result) {
   const cls = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
   const signals = result?.signals || {};
+  const blueprint = result?.blueprintMatch || null;
+  if (blueprint?.matched || blueprint?.action === 'BLOCK') {
+    const action = String(blueprint.action || '').toUpperCase();
+    const hasHardBlocks = (blueprint.hardBlocks || []).length > 0 || (result?.oracleScore?.hardBlocks || []).length > 0;
+    if (hasHardBlocks || action === 'BLOCK') {
+      return { size: '0 SOL', label: 'track-only — blueprint blocked by hard risk' };
+    }
+    if (action === 'BLUEPRINT_SCOUT') {
+      const sol = Number(blueprint.confidence || 0) >= 0.78
+        ? config.BLUEPRINT_SCOUT_STRONG_SIZE_SOL
+        : config.BLUEPRINT_SCOUT_SIZE_SOL;
+      return { size: sol.toFixed(2) + ' SOL', label: 'BLUEPRINT_SCOUT — controlled-dirty runner blueprint' };
+    }
+    if (action === 'BLUEPRINT_HOT_WATCH') {
+      return { size: config.BLUEPRINT_HOT_WATCH_SIZE_SOL.toFixed(2) + ' SOL max', label: 'BLUEPRINT_HOT_WATCH — scout only / high risk' };
+    }
+    if (action === 'EXTREME_CONCENTRATION_SCOUT' || action === 'HIGH_VOL_LOW_LP_SCOUT') {
+      return { size: config.BLUEPRINT_HOT_WATCH_SIZE_SOL.toFixed(2) + '-' + config.BLUEPRINT_SCOUT_SIZE_SOL.toFixed(2) + ' SOL max', label: `${action} — scout only / forced track` };
+    }
+    if (action === 'LOTTO_WATCH') {
+      return { size: 'track-only', label: 'LOTTO_WATCH — audit only, no Hunt sizing' };
+    }
+  }
   if (cls === 'ORACLE_BUY' || result?.verdict === 'BUY') {
     return { size: (result?.positionSizeSol != null ? String(result.positionSizeSol) : String(config.SESSION_SIZE_SOL)) + ' SOL', label: 'ORACLE_BUY' };
   }
@@ -62,23 +85,34 @@ function recommendedSizing(result) {
 
 function formatShortCard(result, ca) {
   const signals = result?.signals || {};
+  const blueprint = result?.blueprintMatch || null;
   const cls = String(result?.oracleScore?.class || result?.verdict || 'WATCH');
   const score = result?.oracleScore?.total != null ? String(result.oracleScore.total) + '/100' : 'N/A';
   const sizing = recommendedSizing(result);
   const risk = result?.noGoReason || result?.watchReason || result?.headlineType || 'risk mixed';
-  const whyShown = result?.missedWinnerMatch?.reasons?.length ? result.missedWinnerMatch.reasons.join(', ') : (result?.patternMatch?.reason || 'scanner and risk filters');
+  const whyShown = blueprint?.matched
+    ? blueprint.reason
+    : (result?.missedWinnerMatch?.reasons?.length ? result.missedWinnerMatch.reasons.join(', ') : (result?.patternMatch?.reason || 'scanner and risk filters'));
+  const tpPlan = cls === 'MISSED_WINNER_MATCH'
+    ? 'TP1 2x | TP2 5x | TP3 10x'
+    : cls === 'DIRTY_RUNNER_WATCH'
+      ? 'TP1 2x | TP2 4-5x | derisk fast | track Guardian'
+      : 'Use standard TP ladder';
   const lines = [];
+  lines.push(actionTimeLine(result?.context === 'hunt' ? 'Hunt Time' : 'Scan Time', result?.scannedAt || Date.now()));
   lines.push('🧾 ' + b('ORACLE EXEC CARD (SHORT)'));
   lines.push(b('Token:') + ' ' + esc(result?.ticker || result?.symbol || ca.slice(0, 8)));
   lines.push(b('Class:') + ' ' + b(cls) + ' | ' + b('Score:') + ' ' + b(score));
+  if (blueprint?.matched || blueprint?.action === 'BLOCK') {
+    const compactMatches = (blueprint.matches || []).slice(0, 3).join(', ') || 'NONE';
+    lines.push(b('Blueprint:') + ' ' + esc(`${blueprint.action} | ${compactMatches}`));
+  }
   lines.push(b('Suggested size:') + ' ' + b(sizing.size) + ' — ' + esc(sizing.label));
   lines.push(b('MC:') + ' ' + fmtUsd(signals.marketCap) + ' | ' + b('LP:') + ' ' + fmtUsd(signals.lp) + ' | ' + b('Adj Vol/Liq:') + ' ' + fmt(signals.adjustedVolLiq, 2) + 'x');
-  lines.push(b('Top10:') + ' ' + fmtPct(signals.top10Pct) + ' | ' + b('Bundle:') + ' ' + (signals.bundleCount ?? 0) + '/slot');
-  lines.push(b('Dev:') + ' ' + esc(result?.devProfile?.totalLaunches != null ? String(result.devProfile.totalLaunches) + ' launches | SR ' + ((signals.successRatePct ?? 0).toFixed(1)) + '%' : 'dev data partial'));
-  lines.push(b('Social/Narrative:') + ' ' + esc(result?.social?.available ? String(result.social.mentions15m) + ' mentions/15m' : 'social partial') + ' | ' + esc(signals.narrativeType || result?.narrativeType || 'NONE') + ' ' + String(signals.narrativeStrength ?? result?.narrativeStrength ?? 0) + '/5');
+  lines.push(b('Top10:') + ' ' + fmtPct(signals.top10Pct) + ' | ' + b('Bundle:') + ' ' + (signals.bundleCount ?? 0) + '/slot | ' + b('Wash:') + ' ' + fmtPct(signals.washPct, 0));
   lines.push(b('Main risk:') + ' ' + esc(risk));
   lines.push(b('Why shown:') + ' ' + esc(whyShown));
-  lines.push(b('TP plan:') + ' ' + esc(cls === 'MISSED_WINNER_MATCH' ? 'TP1 2x | TP2 5x | TP3 10x' : cls === 'DIRTY_RUNNER_WATCH' ? 'TP1 2x | TP2 4x | derisk fast' : 'Use standard TP ladder'));
+  lines.push(b('TP plan:') + ' ' + esc(tpPlan));
   lines.push('CA: ' + code(ca));
   return lines.join('\n');
 }
@@ -184,7 +218,7 @@ function washQualityDisplay(washPct) {
 
 function formatVerdict(result, ca, options = {}) {
   const mode = String(options.mode || "full").toLowerCase();
-  if (mode === "short") return formatShortCard(result, ca);
+  if (mode === "short") return formatShortCard({ ...result, context: options.context }, ca);
   const {
     verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
@@ -249,7 +283,7 @@ function formatVerdict(result, ca, options = {}) {
       signals.bundleCount != null ? `slot ${signals.bundleCount}/slot` : null,
     ].filter(Boolean).join(', ');
     L.push(`Risk flags: ${esc(flags || 'elevated concentration / runner profile')}`);
-    L.push(`Why shown: ${esc(result.patternMatch?.reason || 'matched dirty-runner pattern with sufficient confidence')}`);
+    L.push(`Why shown: ${esc(result.blueprintMatch?.reason || result.patternMatch?.reason || 'matched dirty-runner pattern with sufficient confidence')}`);
     L.push(`Sizing: scout only / human discretion`);
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
@@ -280,6 +314,9 @@ function formatVerdict(result, ca, options = {}) {
     if (result.oracleScore.softWarnings?.length) {
       L.push(`Soft warnings: ${esc(result.oracleScore.softWarnings.slice(0, 4).join(', '))}`);
     }
+  }
+  if (result.blueprintMatch?.matched || result.blueprintMatch?.action === 'BLOCK') {
+    L.push(`Blueprint: ${b(result.blueprintMatch.action)} | ${esc((result.blueprintMatch.matches || []).slice(0, 4).join(', ') || 'NONE')} | confidence ${fmt(result.blueprintMatch.confidence, 2)}`);
   }
   L.push('');
 

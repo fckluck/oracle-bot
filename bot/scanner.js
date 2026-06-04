@@ -1,4 +1,5 @@
 const config = require('./config');
+const { evaluateWinnerBlueprint } = require('./blueprints');
 
 // ── Eastern Time window ───────────────────────────────────────────────────────
 
@@ -647,16 +648,11 @@ function scan(data) {
   }
   if (['NO_GO', 'AVOID', 'SKIP'].includes(verdict) && oracleScore.class === 'WATCH') oracleScore.class = 'NO_GO';
 
-  return {
+  const blueprintInput = {
     verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
-    positionSizeSol, positionUnits, scribbliSlippageWarning,
-    pressureLabel, momentumStatus, ctoBehavior,
-    narrativeType,
-    narrativeStrength,
-    narrativeReason,
     devProfile,
     oracleScore,
-    socialUpgrade, socialBreakout, socialCto, effectiveCto,
+    social,
     signals: {
       lp, ageMinutes: ageMins, momentumStatus,
       volume1h:       codex?.volume1h     ?? null,
@@ -685,6 +681,29 @@ function scan(data) {
       totalLaunches: devLaunches, successRatePct, peakMultiplier, riskyRunnerReason,
       proPilotBuffer: isProPilot && adjustedVolLiq >= 3 && adjustedVolLiq < 5,
     },
+  };
+  const blueprintMatch = evaluateWinnerBlueprint(blueprintInput, { social });
+  if (blueprintMatch?.matched &&
+      blueprintMatch.alertClass === 'DIRTY_RUNNER_WATCH' &&
+      !(blueprintMatch.hardBlocks || []).length &&
+      !(oracleScore.hardBlocks || []).length &&
+      oracleScore.class !== 'ORACLE_BUY') {
+    oracleScore.class = 'DIRTY_RUNNER_WATCH';
+    if (!Array.isArray(oracleScore.softWarnings)) oracleScore.softWarnings = [];
+    if (!oracleScore.softWarnings.includes('winner_blueprint_match')) {
+      oracleScore.softWarnings.push('winner_blueprint_match');
+    }
+  }
+
+  return {
+    ...blueprintInput,
+    positionSizeSol, positionUnits, scribbliSlippageWarning,
+    pressureLabel, momentumStatus, ctoBehavior,
+    narrativeType,
+    narrativeStrength,
+    narrativeReason,
+    socialUpgrade, socialBreakout, socialCto, effectiveCto,
+    blueprintMatch,
   };
 }
 

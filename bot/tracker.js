@@ -1,6 +1,6 @@
 // Oracle Guardian v2.5 — Forensic Shield (Final)
 // 60s forensic loop: cluster exit (top50 -3%), dev fee-loader, momentum decay,
-// LP floor, ATH SL. 5m heartbeat: holders/top50/LP flow snapshot + saturation.
+// LP floor, Guardian Peak SL. 5m heartbeat: holders/top50/LP flow snapshot + saturation.
 // Lightweight fetch (fetchForensic) cuts per-poll API load ~70% vs full scan.
 // Positions persisted to disk — survive bot restarts/crashes.
 
@@ -75,6 +75,12 @@ function loadFromDisk() {
       p.top50Snapshots  = p.top50Snapshots || [];
       p.priceSnapshots  = p.priceSnapshots || [];
       p.hardDangerFlags = p.hardDangerFlags || [];
+      p.localLowMc = p.localLowMc ?? p.entryMc ?? null;
+      p.localLowAt = p.localLowAt ?? p.trackedAt ?? Date.now();
+      p.lastDipBuyAlertAt = p.lastDipBuyAlertAt ?? 0;
+      p.lastDipBuyLocalLowMc = p.lastDipBuyLocalLowMc ?? null;
+      p.lastDipBuyInvalidationAt = p.lastDipBuyInvalidationAt ?? 0;
+      p.entryAdjustedVolLiq = p.entryAdjustedVolLiq ?? null;
       positions.set(p.ca, p);
     }
     if (positions.size > 0) {
@@ -287,6 +293,14 @@ function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCo
     entryTop50Pct:    top50Pct   ?? null,
     holderSnapshots:  holderCount != null ? [{ ts: now, count: holderCount }] : [],
     top50Snapshots:   top50Pct   != null  ? [{ ts: now, pct: top50Pct }]     : [],
+    priceSnapshots:   currentMc != null && currentMc > 0 ? [{ ts: now, mc: currentMc }] : [],
+    hardDangerFlags:  [],
+    localLowMc:       currentMc != null && currentMc > 0 ? currentMc : null,
+    localLowAt:       now,
+    lastDipBuyAlertAt: 0,
+    lastDipBuyLocalLowMc: null,
+    lastDipBuyInvalidationAt: 0,
+    entryAdjustedVolLiq: null,
     alertedFlags: new Set(),
   };
   positions.set(ca, pos);
@@ -371,13 +385,15 @@ async function checkPosition(pos, bot) {
     const top10Pct       = sig.top10Pct;
     const top50Pct       = sig.top50Pct ?? null;
     const holderCount    = sig.holderCount;
+    const shortCa        = `${pos.ca.slice(0,6)}...${pos.ca.slice(-4)}`;
 
-    // Update ATH
+    // Update Guardian Peak
     if (mc && mc > pos.peakMc) pos.peakMc = mc;
 
     // Baseline retry on normal Guardian polls for pending entries.
     if (pos.entryMc == null || pos.entryMc <= 0) pos.entryMc = mc ?? pos.entryMc ?? 0;
     if (pos.entryLp == null && lp != null) pos.entryLp = lp;
+    if (pos.entryAdjustedVolLiq == null && adjustedVolLiq != null) pos.entryAdjustedVolLiq = adjustedVolLiq;
     if (pos.entryHolderCount == null && holderCount != null) {
       pos.entryHolderCount = holderCount;
       pos.holderSnapshots = [{ ts: now, count: holderCount }];
@@ -410,6 +426,10 @@ async function checkPosition(pos, bot) {
       pos.priceSnapshots.push({ ts: now, mc });
       const ninetySecAgo = now - 90 * 1000;
       pos.priceSnapshots = pos.priceSnapshots.filter(s => s.ts >= ninetySecAgo);
+      if (pos.localLowMc == null || pos.localLowMc <= 0 || mc < pos.localLowMc) {
+        pos.localLowMc = mc;
+        pos.localLowAt = now;
+      }
     }
 
     const slPct  = pos.timeWindow === 'DEAD_ZONE' ? 25 : 50;
@@ -487,24 +507,24 @@ async function checkPosition(pos, bot) {
       }
     }
 
-    // ── C. Saturation — holder stagnation at ATH ────────────────────────────
-    // Price at/near ATH but retail buy-side has stopped entering.
+    // ── C. Saturation — holder stagnation at Guardian Peak ──────────────────
+    // Price at/near Guardian Peak but retail buy-side has stopped entering.
     if (
       pos.holderSnapshots.length >= 2 &&
       pos.peakMc > 0 &&
       mc > 0 &&
       !pos.alertedFlags.has('STAGNATION')
     ) {
-      const nearATH  = mc >= pos.peakMc * 0.90;
+      const nearGuardianPeak  = mc >= pos.peakMc * 0.90;
       const oldest   = pos.holderSnapshots[0];
       const newest   = pos.holderSnapshots[pos.holderSnapshots.length - 1];
       const windowMs = newest.ts - oldest.ts;
-      if (nearATH && windowMs >= 8 * 60 * 1000 && oldest.count > 0) {
+      if (nearGuardianPeak && windowMs >= 8 * 60 * 1000 && oldest.count > 0) {
         const growthPct = ((newest.count - oldest.count) / oldest.count) * 100;
         if (growthPct < 1) {
           alerts.push(
             `🚨 *SATURATION DETECTED*\n` +
-            `Price near ATH (${fmtUsd(mc)}) but NO new buyers in last 10m\n` +
+            `Price near Guardian Peak (${fmtUsd(mc)}) but NO new buyers in last 10m\n` +
             `Holder growth: ${growthPct.toFixed(2)}% (${oldest.count} → ${newest.count})\n→ *SECURE INITIALS / EXIT 75%*`
           );
           pos.alertedFlags.add('STAGNATION');
@@ -538,7 +558,71 @@ async function checkPosition(pos, bot) {
       addHardDanger('TOP50_RISE', `top50 concentration rose ${((top50Pct - pos.entryTop50Pct)).toFixed(1)}%`, 'EXIT');
     }
 
-    // ── ATH stop-loss retrace + Shakeout Diagnostic ─────────────────────────
+    // ── Dip-buy setup / invalidation ────────────────────────────────────────
+    // This is an alert-only precision entry lane for tracked coins whose on-chain
+    // health remains intact during a 25-55% flush from Guardian Peak.
+    if (pos.peakMc > 0 && mc > 0) {
+      const hardActive = activeHardDanger();
+      const dipAlertActive = pos.lastDipBuyAlertAt > 0 &&
+        (!pos.lastDipBuyInvalidationAt || pos.lastDipBuyInvalidationAt < pos.lastDipBuyAlertAt);
+      const alertLow = pos.lastDipBuyLocalLowMc ?? pos.localLowMc;
+      const invalidationCooldownOk = now - (pos.lastDipBuyInvalidationAt || 0) >= 10 * 60 * 1000;
+      const lostLocalLow = alertLow != null && mc <= alertLow * 0.90;
+      if (dipAlertActive && invalidationCooldownOk && (lostLocalLow || hardActive.length > 0)) {
+        const reason = lostLocalLow ? 'local low lost' : 'hard danger active';
+        alerts.push(
+          `🔴 *DIP BUY INVALIDATED* — ${reason}.\n` +
+          `CA: \`${shortCa}\`\n` +
+          `Action: stand down until Guardian health resets.`
+        );
+        pos.lastDipBuyInvalidationAt = now;
+      }
+
+      const retracePct = ((pos.peakMc - mc) / pos.peakMc) * 100;
+      const localLow = pos.localLowMc ?? mc;
+      const bouncePct = localLow > 0 ? ((mc - localLow) / localLow) * 100 : 0;
+      const priorSnapshot = (pos.priceSnapshots || [])
+        .filter(s => now - s.ts >= 55 * 1000)
+        .sort((a, b) => b.ts - a.ts)[0];
+      const reclaimedPrior = !!(priorSnapshot && mc >= priorSnapshot.mc && localLow < priorSnapshot.mc * 0.98);
+      const holderStable = pos.entryHolderCount != null && holderCount != null &&
+        holderCount >= pos.entryHolderCount * 0.97;
+      const lpStable = pos.entryLp != null && lp != null &&
+        (pos.entryLp <= 0 || lp >= pos.entryLp * 0.90);
+      const top50Stable = pos.entryTop50Pct != null && top50Pct != null &&
+        top50Pct <= pos.entryTop50Pct + 3;
+      const volStable = adjustedVolLiq != null && (
+        adjustedVolLiq >= 3.5 ||
+        (pos.entryAdjustedVolLiq != null && pos.entryAdjustedVolLiq > 0 && adjustedVolLiq >= pos.entryAdjustedVolLiq * 0.50)
+      );
+      const setupCooldownOk = now - (pos.lastDipBuyAlertAt || 0) >= 10 * 60 * 1000;
+      const bounced = bouncePct >= 8 || reclaimedPrior;
+      if (
+        setupCooldownOk &&
+        hardActive.length === 0 &&
+        retracePct >= 25 &&
+        retracePct <= 55 &&
+        holderStable &&
+        lpStable &&
+        top50Stable &&
+        volStable &&
+        bounced
+      ) {
+        alerts.push(
+          `🟢 *GUARDIAN DIP BUY SETUP*\n` +
+          `CA: \`${shortCa}\`\n` +
+          `MC: ${fmtUsd(mc)} | Guardian Peak: ${fmtUsd(pos.peakMc)} | Local Low: ${fmtUsd(localLow)}\n` +
+          `Retrace: ${retracePct.toFixed(1)}% | Bounce: ${bouncePct.toFixed(1)}%\n` +
+          `Holders/LP/Top50 stable.\n` +
+          `Action: possible dip entry/re-entry. Invalidation: lose local low by 8-10%.`
+        );
+        pos.lastDipBuyAlertAt = now;
+        pos.lastDipBuyLocalLowMc = localLow;
+        pos.lastDipBuyInvalidationAt = 0;
+      }
+    }
+
+    // ── Guardian Peak stop-loss retrace + Shakeout Diagnostic ───────────────
     if (pos.peakMc > 0 && mc > 0) {
       const retracePct = ((pos.peakMc - mc) / pos.peakMc) * 100;
       const hardActive = activeHardDanger();
@@ -556,7 +640,7 @@ async function checkPosition(pos, bot) {
             ? `\n⚠️ *JEET EXIT:* Top 50 holding firm — weak hands are flushing.`
             : '';
           alerts.push(
-            `💎 *SHAKEOUT DETECTED* — Price flushed *${retracePct.toFixed(1)}%* from ATH.\n` +
+            `💎 *SHAKEOUT DETECTED* — Price flushed *${retracePct.toFixed(1)}%* from Guardian Peak.\n` +
             `Holders are NOT selling. LP is stable.${jeetLine}\n` +
             `→ *HOLD THE LINE. Reversal expected.*`
           );
@@ -583,7 +667,7 @@ async function checkPosition(pos, bot) {
             : '';
           alerts.push(
             `🛡️ *SL PAUSED — SHAKEOUT CONFIRMED*\n` +
-            `${retracePct.toFixed(1)}% retrace from ATH ${fmtUsd(pos.peakMc)} — but holders are firm.${jeetLine}\n` +
+            `${retracePct.toFixed(1)}% retrace from Guardian Peak ${fmtUsd(pos.peakMc)} — but holders are firm.${jeetLine}\n` +
             `→ *HOLD POSITION.* One SL grace given. If price continues lower, SL fires next poll.`
           );
           pos.alertedFlags.add('SHAKEOUT_SL_PAUSE');
@@ -598,7 +682,7 @@ async function checkPosition(pos, bot) {
         } else {
           // No shakeout detected (rug), or grace already used — fire the stop loss.
           alerts.push(
-            `🔴 *SL TRIGGERED* — ${retracePct.toFixed(1)}% retrace from ATH ${fmtUsd(pos.peakMc)}\n→ *EXIT MOON BAG (${slPct}% SL)*`
+            `🔴 *SL TRIGGERED* — ${retracePct.toFixed(1)}% retrace from Guardian Peak ${fmtUsd(pos.peakMc)}\n→ *EXIT MOON BAG (${slPct}% SL)*`
           );
           pos.alertedFlags.add('ATH_SL');
           positions.delete(pos.ca);
@@ -615,7 +699,6 @@ async function checkPosition(pos, bot) {
 
     // ── Alert message ────────────────────────────────────────────────────────
     const ageMin       = Math.floor((now - pos.trackedAt) / 60000);
-    const shortCa      = `${pos.ca.slice(0,6)}...${pos.ca.slice(-4)}`;
     const holdersAdded = (pos.entryHolderCount != null && holderCount != null)
       ? holderCount - pos.entryHolderCount : null;
     const top50Change  = (pos.entryTop50Pct != null && top50Pct != null)
@@ -628,7 +711,7 @@ async function checkPosition(pos, bot) {
       `CA: \`${shortCa}\` | Tracking: ${ageMin}m`,
       ``,
       `── *LIVE DIVERGENCE* ──`,
-      `• *MC:* ${fmtUsd(mc)} | ATH: ${fmtUsd(pos.peakMc)}`,
+      `• *MC:* ${fmtUsd(mc)} | Guardian Peak: ${fmtUsd(pos.peakMc)}`,
       `• *LP:* ${fmtUsd(lp)}${lpChange != null ? ` (${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} since entry)` : ''}`,
       holdersAdded != null ? `• *Holders Added:* ${holdersAdded >= 0 ? '+' : ''}${holdersAdded}` : null,
       top50Change  != null ? `• *Top 50 Change:* ${top50Change >= 0 ? '+' : ''}${top50Change.toFixed(1)}% (now ${top50Pct.toFixed(1)}%)` : null,
@@ -692,7 +775,7 @@ async function sendHeartbeat(pos, bot) {
       lpChange != null
         ? `• *LP Flow:* ${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} → ${fmtUsd(lp)}`
         : `• *LP:* ${fmtUsd(lp)}`,
-      `• *MC:* ${fmtUsd(mc)} | ATH: ${fmtUsd(pos.peakMc)}`,
+      `• *MC:* ${fmtUsd(mc)} | Guardian Peak: ${fmtUsd(pos.peakMc)}`,
       `• *Vol/Liq:* ${sig.adjustedVolLiq != null ? sig.adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}`,
     ].join('\n');
 

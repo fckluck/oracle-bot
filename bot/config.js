@@ -4,7 +4,7 @@ const config = {
   // Accept both names: Railway/live may use TELEGRAM_BOT_TOKEN,
   // older docs/dev env may use BOT_TOKEN.
   TELEGRAM_BOT_TOKEN:  process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '',
-  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v38.5 — Memory-Safe Adjustment',
+  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v38.6 — Controlled-Dirty Runner Patch',
   GMGN_API_KEY:        process.env.GMGN_API_KEY        || '',
   OWNER_TELEGRAM_ID:   process.env.OWNER_TELEGRAM_ID   || '',
   PUMPPORTAL_API_KEY:  process.env.PUMPPORTAL_API_KEY  || '',
@@ -36,6 +36,10 @@ const config = {
 
   DIRTY_RUNNER_WATCH_ENABLED: process.env.DIRTY_RUNNER_WATCH_ENABLED !== 'false',
   DIRTY_RUNNER_MIN_CONFIDENCE: parseFloat(process.env.DIRTY_RUNNER_MIN_CONFIDENCE || '0.70'),
+  BLUEPRINT_HUNT_MIN_CONFIDENCE: parseFloat(process.env.BLUEPRINT_HUNT_MIN_CONFIDENCE || '0.68'),
+  BLUEPRINT_SCOUT_SIZE_SOL: parseFloat(process.env.BLUEPRINT_SCOUT_SIZE_SOL || '0.05'),
+  BLUEPRINT_SCOUT_STRONG_SIZE_SOL: parseFloat(process.env.BLUEPRINT_SCOUT_STRONG_SIZE_SOL || '0.10'),
+  BLUEPRINT_HOT_WATCH_SIZE_SOL: parseFloat(process.env.BLUEPRINT_HOT_WATCH_SIZE_SOL || '0.03'),
 
   GROK_REQUIRED_FOR_BUY: process.env.GROK_REQUIRED_FOR_BUY === 'true',
   DEFADE_REQUIRED_FOR_BUY: process.env.DEFADE_REQUIRED_FOR_BUY === 'true',
@@ -64,9 +68,9 @@ const config = {
   // Optional comma-separated override, e.g. "BUY,RISKY_RUNNER".
   HUNT_ALERT_VERDICTS: process.env.HUNT_ALERT_VERDICTS || '',
 
-  // Card verbosity: default stays full, short mode trims execution cards for speed.
+  // Card verbosity: scan stays full by default; Hunt is short unless explicitly overridden.
   SCAN_CARD_MODE: process.env.SCAN_CARD_MODE || 'full',
-  HUNT_CARD_MODE: process.env.HUNT_CARD_MODE || process.env.SCAN_CARD_MODE || 'full',
+  HUNT_CARD_MODE: process.env.HUNT_CARD_MODE || 'short',
 
   // Winner-family promotion sizing (tradeable scout, never full-size override).
   MISSED_WINNER_MATCH_SIZE_SOL: parseFloat(process.env.MISSED_WINNER_MATCH_SIZE_SOL || '0.10'),
