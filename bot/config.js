@@ -4,7 +4,7 @@ const config = {
   // Accept both names: Railway/live may use TELEGRAM_BOT_TOKEN,
   // older docs/dev env may use BOT_TOKEN.
   TELEGRAM_BOT_TOKEN:  process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '',
-  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v38.0 — Reupholster',
+  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v38.5 — Memory-Safe Adjustment',
   GMGN_API_KEY:        process.env.GMGN_API_KEY        || '',
   OWNER_TELEGRAM_ID:   process.env.OWNER_TELEGRAM_ID   || '',
   PUMPPORTAL_API_KEY:  process.env.PUMPPORTAL_API_KEY  || '',
@@ -63,6 +63,16 @@ const config = {
   HUNT_ALERT_MODE: process.env.HUNT_ALERT_MODE || 'strict',
   // Optional comma-separated override, e.g. "BUY,RISKY_RUNNER".
   HUNT_ALERT_VERDICTS: process.env.HUNT_ALERT_VERDICTS || '',
+
+  // Card verbosity: default stays full, short mode trims execution cards for speed.
+  SCAN_CARD_MODE: process.env.SCAN_CARD_MODE || 'full',
+  HUNT_CARD_MODE: process.env.HUNT_CARD_MODE || process.env.SCAN_CARD_MODE || 'full',
+
+  // Winner-family promotion sizing (tradeable scout, never full-size override).
+  MISSED_WINNER_MATCH_SIZE_SOL: parseFloat(process.env.MISSED_WINNER_MATCH_SIZE_SOL || '0.10'),
+  MISSED_WINNER_MATCH_STRONG_SIZE_SOL: parseFloat(process.env.MISSED_WINNER_MATCH_STRONG_SIZE_SOL || '0.15'),
+  DIRTY_RUNNER_MIN_SIZE_SOL: parseFloat(process.env.DIRTY_RUNNER_MIN_SIZE_SOL || '0.05'),
+  DIRTY_RUNNER_MAX_SIZE_SOL: parseFloat(process.env.DIRTY_RUNNER_MAX_SIZE_SOL || '0.10'),
 
   // Hunt Mode resilience. PumpPortal remains primary; DexScreener latest-profile
   // polling is a low-volume fallback so Hunt Mode does not go blind when WS events

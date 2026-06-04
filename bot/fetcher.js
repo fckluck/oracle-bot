@@ -1138,10 +1138,37 @@ async function fetchSocialData(ca) {
     );
     const ctoSignal = ctoAccounts.size >= 3;
 
+    const allText = tweets
+      .map(t => (t.full_text || t.text || '').toLowerCase())
+      .join(' ');
+    const narrativeBuckets = [
+      { type: 'CELEBRITY', keywords: ['celebrity', 'kanye', 'drake', 'taylor', 'mrbeast'] },
+      { type: 'ELON', keywords: ['elon', 'x ai', 'xai', 'tesla', 'spacex'] },
+      { type: 'POLITICAL', keywords: ['trump', 'maga', 'biden', 'election', 'president', 'hillary'] },
+      { type: 'NEWS', keywords: ['breaking', 'headline', 'war', 'fed', 'cpi', 'rate cut'] },
+      { type: 'AI', keywords: ['ai', 'agent', 'gpt', 'llm', 'neural'] },
+      { type: 'CRYPTO_META', keywords: ['solana', 'dex', 'pump', 'airdrop', 'cto'] },
+      { type: 'VIRAL_X', keywords: ['viral', 'x trend', 'trending', 'tweet'] },
+      { type: 'MEME', keywords: ['meme', 'pepe', 'cat', 'dog', 'frog'] },
+    ];
+    let narrativeType = 'NONE';
+    let narrativeHits = 0;
+    for (const bucket of narrativeBuckets) {
+      const hits = bucket.keywords.filter(k => allText.includes(k)).length;
+      if (hits > narrativeHits) {
+        narrativeHits = hits;
+        narrativeType = bucket.type;
+      }
+    }
     const isTrending = mentions15m >= 30;
-    console.log(`[fetchSocialData] mentions15m=${mentions15m} unique=${uniqueAccounts} trending=${isTrending} cto=${ctoSignal}`);
-    markApi('SocialData', { ok: true, meta: { mentions15m, uniqueAccounts, ctoSignal, isTrending } });
-    return { available: true, mentions15m, uniqueAccounts, isTrending, ctoSignal };
+    let narrativeStrength = narrativeType === 'NONE' ? 0 : Math.min(5, narrativeHits + (isTrending ? 2 : 1));
+    if (mentions15m >= 40) narrativeStrength = Math.min(5, narrativeStrength + 1);
+    const narrativeReason = narrativeType === 'NONE'
+      ? 'No social narrative catalyst found.'
+      : `${narrativeType} keyword signals in 15m mentions`;
+    console.log(`[fetchSocialData] mentions15m=${mentions15m} unique=${uniqueAccounts} trending=${isTrending} cto=${ctoSignal} narrative=${narrativeType}:${narrativeStrength}`);
+    markApi('SocialData', { ok: true, meta: { mentions15m, uniqueAccounts, ctoSignal, isTrending, narrativeType, narrativeStrength } });
+    return { available: true, mentions15m, uniqueAccounts, isTrending, ctoSignal, narrativeType, narrativeStrength, narrativeReason };
   } catch (e) {
     console.error('[fetchSocialData] error:', e.message);
     markApi('SocialData', { ok: false, error: e.message });

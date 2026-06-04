@@ -51,16 +51,35 @@ function buildPatternMemoryBlock(patternMemory) {
 
   const parts = [];
 
-  if (patternMemory.missedWinners?.length) {
-    parts.push(`MISSED WINNERS — study these false rejections carefully: ${patternMemory.missedWinners.map(fmt).join(' | ')}`);
+  const missed = patternMemory.missedWinners3x || patternMemory.missedWinners || [];
+  if (missed.length) {
+    parts.push(`RECENT 3x+ MISSED WINNERS: ${missed.slice(0, 8).map(fmt).join(' | ')}`);
   }
 
-  if (patternMemory.winners?.length) {
-    parts.push(`RECENT WINNERS: ${patternMemory.winners.map(fmt).join(' | ')}`);
+  const monsters = patternMemory.monsterWinners10x || [];
+  if (monsters.length) {
+    parts.push(`RECENT 10x+ MONSTER WINNERS: ${monsters.slice(0, 8).map(fmt).join(' | ')}`);
   }
 
-  if (patternMemory.rugs?.length) {
-    parts.push(`RECENT RUGS / FLAT FAILURES: ${patternMemory.rugs.map(fmt).join(' | ')}`);
+  const failed = patternMemory.recentFailedAlerts || patternMemory.rugs || [];
+  if (failed.length) {
+    parts.push(`RECENT FAILED ALERTS / FLAT-RUGS: ${failed.slice(0, 10).map(fmt).join(' | ')}`);
+  }
+
+  const winnerFp = patternMemory.winnerFingerprints || [];
+  if (winnerFp.length) {
+    const compact = winnerFp.slice(-8).map(fp =>
+      `${fp.ticker || fp.symbol || '???'}(${fp.multiple != null ? fp.multiple.toFixed(1) + 'x' : '?x'}, top10 ${fp.top10Pct != null ? fp.top10Pct.toFixed(1) : 'N/A'}%, wash ${fp.washPct != null ? fp.washPct.toFixed(1) : 'N/A'}%, bundle ${fp.bundleCount ?? 'N/A'})`
+    );
+    parts.push(`WINNER-FAMILY FINGERPRINTS: ${compact.join(' | ')}`);
+  }
+
+  const failedFp = patternMemory.failedWarnings || patternMemory.failedFingerprints || [];
+  if (failedFp.length) {
+    const compact = failedFp.slice(0, 8).map(fp =>
+      `${fp.ticker || fp.symbol || '???'}(${fp.outcome || 'UNKNOWN'}, reason: ${fp.failureReason || 'n/a'})`
+    );
+    parts.push(`FAILED-FINGERPRINT WARNINGS: ${compact.join(' | ')}`);
   }
 
   if (!parts.length) return '';
@@ -127,7 +146,9 @@ Token Analysis Request:
 - Bundle Count: ${signals.bundleCount ?? 0}/slot
 - Social mentions (15m): ${scanResult.social?.mentions15m ?? tokenData.social?.mentions15m ?? 'N/A'}
 - Scanner hard gate/reason: ${scanResult.noGoReason ?? scanResult.watchReason ?? scanResult.headlineType ?? scanResult.momentumStatus ?? 'none'}
-Explain whether this is a prior winner pattern, rug/failure pattern, or uncertain pattern. Respect scanner hard gates.`;
+Explain whether this is a prior winner pattern, rug/failure pattern, or uncertain pattern.
+Question to answer directly: Does this token resemble recent missed winners more than recent failed alerts?
+Respect scanner hard gates.`;
 
   try {
     const data = await postGrok([
