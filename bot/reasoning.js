@@ -6,13 +6,12 @@ const XAI_API_URL = 'https://api.x.ai/v1/chat/completions';
 const TIMEOUT_MS  = 15_000;
 
 const HALL_OF_FAME = `
-ACTIVE WINNER BLUEPRINTS (fresh priority):
-- EARLY_EXPANSION_ZONE: NEAN, grug, IPO, BAMBIS, GGS, POLYOM, CAT, GOLDBANK, Hillary, ewok, SPSC, NEOW.
-- BUNDLE_BLOCKED_EXPANSION: DATBIHGAH, Friday 25x runner.
-- CONTROLLED_CONCENTRATION_WINNER: GRAIL, NEAN, SigeonPex, SOREN, ballish.
-- NARRATIVE_CATALYST_RUNNER: Hillary, ewok, duja.
-LEGACY REFERENCES (lower priority):
-- SOREN, GRAIL, ballish still valid but must not dominate if fresher matches exist.
+WINNERS (Blueprint Signatures):
+- $!ng: Elite Dev, 36% Top10, 9x organic vol -> $2M ATH. Key: high concentration + elite profile.
+- $SOREN: Elite Dev, 34% Top10, 14x vol -> $650K ATH. Key: same controlled-floor pattern.
+- $ballish: Elite Dev, 31% Top10, 15x vol -> $313K ATH. Key: trust the blueprint.
+- $SPEED: $19K MC, 12x organic vol, unverified holders -> $230K ATH. Key: nano-cap vol was the signal.
+- $GRAIL: Elite dev, high vol, managed concentration -> runner confirmed.
 HALL OF SHAME (Rug Signatures):
 - $MANNY: Inflated holders (>250% health), looked organic, was botted.
 - $Bingus: Age >60m, MC <$30K, negative 1H, zero X mentions. Classic stale rug.
@@ -28,9 +27,7 @@ RULES:
 3. If the scanner hard gate is sybil bundle, wash fail, distribution, top10 fail, or LP fail, explicitly respect that gate.
 4. If unclear, say [ UNCERTAIN PATTERN ] and give the strongest reason.
 5. You may say SOUL OVERRIDE CANDIDATE for human review, but never claim to override hard gates.
-6. Prioritize freshest 24-72h winner fingerprints over stale 5-9 day examples.
-7. Reference the closest fresh blueprint first (NEAN/grug/IPO/BAMBIS/DATBIHGAH/GGS/SPSC/NEOW/SigeonPex when appropriate).
-8. Keep total response under 3 sentences. No bullet points. No forced bullishness.`;
+6. Keep total response under 3 sentences. No bullet points. No forced bullishness.`;
 
 function parseSoulVerdict(text) {
   if (!text) return null;
@@ -54,35 +51,35 @@ function buildPatternMemoryBlock(patternMemory) {
 
   const parts = [];
 
-  if (patternMemory.activeBlueprints?.families) {
-    const f = patternMemory.activeBlueprints.families;
-    parts.push(
-      `ACTIVE BLUEPRINT REGISTRY (fresh): ` +
-      `EARLY_EXPANSION_ZONE=${(f.EARLY_EXPANSION_ZONE?.examples || []).join(', ')} | ` +
-      `BUNDLE_BLOCKED_EXPANSION=${(f.BUNDLE_BLOCKED_EXPANSION?.examples || []).join(', ')} | ` +
-      `CONTROLLED_CONCENTRATION_WINNER=${(f.CONTROLLED_CONCENTRATION_WINNER?.examples || []).join(', ')} | ` +
-      `NARRATIVE_CATALYST_RUNNER=${(f.NARRATIVE_CATALYST_RUNNER?.examples || []).join(', ')}`
+  const missed = patternMemory.missedWinners3x || patternMemory.missedWinners || [];
+  if (missed.length) {
+    parts.push(`RECENT 3x+ MISSED WINNERS: ${missed.slice(0, 8).map(fmt).join(' | ')}`);
+  }
+
+  const monsters = patternMemory.monsterWinners10x || [];
+  if (monsters.length) {
+    parts.push(`RECENT 10x+ MONSTER WINNERS: ${monsters.slice(0, 8).map(fmt).join(' | ')}`);
+  }
+
+  const failed = patternMemory.recentFailedAlerts || patternMemory.rugs || [];
+  if (failed.length) {
+    parts.push(`RECENT FAILED ALERTS / FLAT-RUGS: ${failed.slice(0, 10).map(fmt).join(' | ')}`);
+  }
+
+  const winnerFp = patternMemory.winnerFingerprints || [];
+  if (winnerFp.length) {
+    const compact = winnerFp.slice(-8).map(fp =>
+      `${fp.ticker || fp.symbol || '???'}(${fp.multiple != null ? fp.multiple.toFixed(1) + 'x' : '?x'}, top10 ${fp.top10Pct != null ? fp.top10Pct.toFixed(1) : 'N/A'}%, wash ${fp.washPct != null ? fp.washPct.toFixed(1) : 'N/A'}%, bundle ${fp.bundleCount ?? 'N/A'})`
     );
+    parts.push(`WINNER-FAMILY FINGERPRINTS: ${compact.join(' | ')}`);
   }
 
-  if (patternMemory.freshWinners24?.length) {
-    parts.push(`FRESH WINNERS (last 24h): ${patternMemory.freshWinners24.map(fmt).join(' | ')}`);
-  }
-
-  if (patternMemory.freshWinners72?.length) {
-    parts.push(`FRESH WINNERS (24-72h): ${patternMemory.freshWinners72.map(fmt).join(' | ')}`);
-  }
-
-  if (patternMemory.missedWinners?.length) {
-    parts.push(`MISSED WINNERS (fresh focus): ${patternMemory.missedWinners.map(fmt).join(' | ')}`);
-  }
-
-  if (patternMemory.staleWinners?.length) {
-    parts.push(`STALE WINNERS (secondary context only): ${patternMemory.staleWinners.map(fmt).join(' | ')}`);
-  }
-
-  if (patternMemory.rugs?.length) {
-    parts.push(`RECENT RUGS / FLAT FAILURES: ${patternMemory.rugs.map(fmt).join(' | ')}`);
+  const failedFp = patternMemory.failedWarnings || patternMemory.failedFingerprints || [];
+  if (failedFp.length) {
+    const compact = failedFp.slice(0, 8).map(fp =>
+      `${fp.ticker || fp.symbol || '???'}(${fp.outcome || 'UNKNOWN'}, reason: ${fp.failureReason || 'n/a'})`
+    );
+    parts.push(`FAILED-FINGERPRINT WARNINGS: ${compact.join(' | ')}`);
   }
 
   if (!parts.length) return '';
@@ -149,7 +146,9 @@ Token Analysis Request:
 - Bundle Count: ${signals.bundleCount ?? 0}/slot
 - Social mentions (15m): ${scanResult.social?.mentions15m ?? tokenData.social?.mentions15m ?? 'N/A'}
 - Scanner hard gate/reason: ${scanResult.noGoReason ?? scanResult.watchReason ?? scanResult.headlineType ?? scanResult.momentumStatus ?? 'none'}
-Explain whether this is a prior winner pattern, rug/failure pattern, or uncertain pattern. Respect scanner hard gates.`;
+Explain whether this is a prior winner pattern, rug/failure pattern, or uncertain pattern.
+Question to answer directly: Does this token resemble recent missed winners more than recent failed alerts?
+Respect scanner hard gates.`;
 
   try {
     const data = await postGrok([
