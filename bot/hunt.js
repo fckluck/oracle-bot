@@ -67,13 +67,15 @@ function buildWsUrl() {
 }
 
 function getAllowedHuntVerdicts() {
+  const strictAllowed = ['ORACLE_BUY', 'MISSED_WINNER_MATCH', 'DIRTY_RUNNER_WATCH'];
   if (config.HUNT_ALERT_VERDICTS) {
-    return config.HUNT_ALERT_VERDICTS
+    const envAllowed = config.HUNT_ALERT_VERDICTS
       .split(',')
       .map(v => v.trim().toUpperCase())
-      .filter(Boolean);
+      .filter(v => strictAllowed.includes(v));
+    return envAllowed.length ? envAllowed : strictAllowed;
   }
-  return ['ORACLE_BUY', 'MISSED_WINNER_MATCH', 'DIRTY_RUNNER_WATCH'];
+  return strictAllowed;
 }
 
 function shouldBroadcastHuntResult(result) {
@@ -84,6 +86,25 @@ function shouldBroadcastHuntResult(result) {
   }
   if (alertClass === 'ORACLE_BUY' && result.noGoReason) {
     return { ok: false, reason: `blocked noGoReason: ${result.noGoReason}` };
+  }
+  if (alertClass === 'DIRTY_RUNNER_WATCH') {
+    const blueprint = result?.blueprintMatch || {};
+    const blueprintPass = blueprint.matched === true &&
+      blueprint.alertClass === 'DIRTY_RUNNER_WATCH' &&
+      Number(blueprint.confidence || 0) >= (config.BLUEPRINT_HUNT_MIN_CONFIDENCE || 0.68) &&
+      !(blueprint.hardBlocks || []).length &&
+      !(result?.oracleScore?.hardBlocks || []).length &&
+      blueprint.action !== 'LOTTO_WATCH';
+
+    const learned = result?.patternMatch || {};
+    const learnedPass = learned.matched === true &&
+      Number(learned.confidence || 0) >= (config.DIRTY_RUNNER_MIN_CONFIDENCE || 0.70) &&
+      !(learned.catastrophic || []).length &&
+      !(result?.oracleScore?.hardBlocks || []).length;
+
+    if (!blueprintPass && !learnedPass) {
+      return { ok: false, reason: 'dirty runner suppressed: no high-confidence blueprint or learned winner match' };
+    }
   }
   return { ok: true, reason: null };
 }
@@ -332,6 +353,10 @@ async function runScan(job, broadcaster) {
       headlineType: result.headlineType,
       oracleScoreTotal: result.oracleScore?.total,
       oracleScoreClass: result.oracleScore?.class,
+      blueprintAction: result.blueprintMatch?.action,
+      blueprintConfidence: result.blueprintMatch?.confidence,
+      blueprintMatches: result.blueprintMatch?.matches,
+      blueprintReason: result.blueprintMatch?.reason,
       source:         'hunt',
     });
 
@@ -390,7 +415,7 @@ async function runScan(job, broadcaster) {
       rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
     };
 
-    const huntCardMode = String(config.HUNT_CARD_MODE || config.SCAN_CARD_MODE || 'full').toLowerCase() === 'short' ? 'short' : 'full';
+    const huntCardMode = String(config.HUNT_CARD_MODE || 'short').toLowerCase() === 'full' ? 'full' : 'short';
     const message = formatVerdict(result, ca, { context: 'hunt', mode: huntCardMode });
     const mc = result.signals?.marketCap || 0;
     const symbol = rawSym.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -418,6 +443,8 @@ async function runScan(job, broadcaster) {
       symbol,
       adjustedVolLiq,
       verdict: result.oracleScore?.class || result.verdict,
+      blueprintAction: result.blueprintMatch?.action || null,
+      blueprintMatches: result.blueprintMatch?.matches || [],
       mc,
       attempted: delivery.attempted,
       delivered: delivery.delivered,

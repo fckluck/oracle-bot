@@ -13,6 +13,7 @@ const HISTORY_LIMIT = 200;
 const BATCH_SIZE    = 5;
 const CYCLE_MS      = 30_000;
 const RESOLVE_MS    = 6 * 60 * 60 * 1000;
+const REMOVED_WINNER_IMPRINTS = new Set(['sigeonpex']);
 const MISSED_REJECT_VERDICTS = new Set([
   'SKIP',
   'NO_GO',
@@ -30,6 +31,19 @@ let auditHistory = [];
 let winnerFingerprints = [];
 let failedFingerprints = [];
 let updateTimer = null;
+
+function normalizeStringArray(value) {
+  if (Array.isArray(value)) return value.map(v => String(v)).filter(Boolean);
+  if (typeof value === 'string' && value.trim()) {
+    return value.split(',').map(v => v.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function isRemovedWinnerImprint(entry = {}) {
+  const name = String(entry.ticker || entry.symbol || '').toLowerCase();
+  return REMOVED_WINNER_IMPRINTS.has(name);
+}
 
 function normalizeRecord(rec) {
   const outcome = rec.outcome ?? 'UNRESOLVED';
@@ -73,6 +87,10 @@ function normalizeRecord(rec) {
     noGoReason: rec.noGoReason ?? null,
     watchReason: rec.watchReason ?? null,
     headlineType: rec.headlineType ?? null,
+    blueprintAction: rec.blueprintAction ?? null,
+    blueprintConfidence: rec.blueprintConfidence ?? null,
+    blueprintMatches: normalizeStringArray(rec.blueprintMatches),
+    blueprintReason: rec.blueprintReason ?? null,
     source: rec.source ?? null,
 
     resolved: rec.resolved ?? outcome !== 'UNRESOLVED',
@@ -114,6 +132,10 @@ function normalizeFingerprint(fp = {}) {
     noGoReason: fp.noGoReason ?? null,
     watchReason: fp.watchReason ?? null,
     headlineType: fp.headlineType ?? null,
+    blueprintAction: fp.blueprintAction ?? null,
+    blueprintConfidence: fp.blueprintConfidence ?? null,
+    blueprintMatches: normalizeStringArray(fp.blueprintMatches),
+    blueprintReason: fp.blueprintReason ?? null,
     outcome: fp.outcome ?? 'UNKNOWN',
     failureReason: fp.failureReason ?? null,
     resolvedAt: fp.resolvedAt ?? Date.now(),
@@ -247,6 +269,10 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
     headlineType: extra.headlineType,
     oracleScoreTotal: extra.oracleScoreTotal,
     oracleScoreClass: extra.oracleScoreClass,
+    blueprintAction: extra.blueprintAction,
+    blueprintConfidence: extra.blueprintConfidence,
+    blueprintMatches: extra.blueprintMatches,
+    blueprintReason: extra.blueprintReason,
     source: extra.source,
     resolved: false,
     outcome: 'UNRESOLVED',
@@ -260,6 +286,7 @@ function recordScan({
   isEliteDev, successRatePct, devLaunches, peakMultiplier, ageMinutes, timeWindow,
   socialMentions15m, uniqueAccounts, narrativeType, narrativeStrength, narrativeReason,
   noGoReason, watchReason, headlineType, oracleScoreTotal, oracleScoreClass, source,
+  blueprintAction, blueprintConfidence, blueprintMatches, blueprintReason,
 }) {
   addToAudit(ca, symbol, verdict, entryTier, mc, {
     adjustedVolLiq,
@@ -288,6 +315,10 @@ function recordScan({
     headlineType,
     oracleScoreTotal,
     oracleScoreClass,
+    blueprintAction,
+    blueprintConfidence,
+    blueprintMatches,
+    blueprintReason,
     source,
   });
 }
@@ -345,6 +376,10 @@ function buildFingerprint(entry, outcome) {
     noGoReason: entry.noGoReason,
     watchReason: entry.watchReason,
     headlineType: entry.headlineType,
+    blueprintAction: entry.blueprintAction,
+    blueprintConfidence: entry.blueprintConfidence,
+    blueprintMatches: entry.blueprintMatches,
+    blueprintReason: entry.blueprintReason,
     outcome,
     failureReason: outcome === 'WINNER' ? null : inferFailureReason(entry),
     resolvedAt: Date.now(),
@@ -384,9 +419,12 @@ async function processBatch(bot, fetchMcFn) {
 
         if (wasMissedOrDowngraded && multiplier != null && multiplier >= 3 && bot && process.env.OWNER_TELEGRAM_ID) {
           const label = entry.ticker ?? entry.ca.slice(0, 8);
+          const blueprintLine = `${entry.blueprintAction || 'N/A'} / ${(entry.blueprintMatches || []).length ? entry.blueprintMatches.join(', ') : 'N/A'}`;
           const msg = `🚨 AUDIT ALERT: Missed ${label} — ${multiplier.toFixed(1)}x from scan verdict ${entry.verdict}`
-            + `${entry.entryTier ? ` / ${entry.entryTier}` : ''}. `
-            + `Scan MC: $${(entry.scanMc / 1000).toFixed(1)}K → Peak: $${(entry.peakMc / 1000).toFixed(1)}K. `
+            + `${entry.entryTier ? ` / ${entry.entryTier}` : ''}\n`
+            + `CA: ${entry.ca}\n`
+            + `Scan MC: $${(entry.scanMc / 1000).toFixed(1)}K → Peak: $${(entry.peakMc / 1000).toFixed(1)}K\n`
+            + `Blueprint: ${blueprintLine}\n`
             + `Pattern memory updated.`;
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
         }
@@ -466,7 +504,7 @@ function getPatternMemory() {
   loadAudit();
 
   const winners = auditHistory
-    .filter(r => r.outcome === 'WINNER' || r.outcome === 'RUNNER')
+    .filter(r => (r.outcome === 'WINNER' || r.outcome === 'RUNNER') && !isRemovedWinnerImprint(r))
     .sort((a, b) => b.scanTime - a.scanTime)
     .slice(0, 8);
 
@@ -480,14 +518,23 @@ function getPatternMemory() {
     .slice(0, 5);
 
   const missedWinners3x = [...winnerFingerprints]
-    .filter(fp => fp.multiple != null && fp.multiple >= 3 && MISSED_REJECT_VERDICTS.has(fp.verdict))
+    .filter(fp => fp.multiple != null && fp.multiple >= 3 && MISSED_REJECT_VERDICTS.has(fp.verdict) && !isRemovedWinnerImprint(fp))
     .sort((a, b) => (b.resolvedAt || 0) - (a.resolvedAt || 0))
     .slice(0, 8);
 
   const monsterWinners10x = [...winnerFingerprints]
-    .filter(fp => fp.multiple != null && fp.multiple >= 10)
+    .filter(fp => fp.multiple != null && fp.multiple >= 10 && !isRemovedWinnerImprint(fp))
     .sort((a, b) => (b.multiple || 0) - (a.multiple || 0))
     .slice(0, 8);
+
+  const blueprintWinners = [...winnerFingerprints]
+    .filter(fp => !isRemovedWinnerImprint(fp) &&
+      fp.multiple != null &&
+      fp.multiple >= 3 &&
+      Array.isArray(fp.blueprintMatches) &&
+      fp.blueprintMatches.length > 0)
+    .sort((a, b) => (b.resolvedAt || 0) - (a.resolvedAt || 0))
+    .slice(0, 12);
 
   const recentFailedAlerts = [...failedFingerprints]
     .sort((a, b) => (b.resolvedAt || 0) - (a.resolvedAt || 0))
@@ -502,6 +549,7 @@ function getPatternMemory() {
     rugs.length === 0 &&
     missedWinners.length === 0 &&
     missedWinners3x.length === 0 &&
+    blueprintWinners.length === 0 &&
     monsterWinners10x.length === 0 &&
     recentFailedAlerts.length === 0
   ) return null;
@@ -511,9 +559,10 @@ function getPatternMemory() {
     rugs,
     missedWinners,
     missedWinners3x,
+    blueprintWinners,
     monsterWinners10x,
     recentFailedAlerts,
-    winnerFingerprints: [...winnerFingerprints].slice(-50),
+    winnerFingerprints: [...winnerFingerprints].filter(fp => !isRemovedWinnerImprint(fp)).slice(-50),
     failedFingerprints: [...failedFingerprints].slice(-50),
     failedWarnings,
   };
@@ -579,7 +628,7 @@ function getAuditPendingReport() {
 
 function matchLearnedPattern(result) {
   const memory = getPatternMemory();
-  if (!memory?.winnerFingerprints?.length && !memory?.missedWinners3x?.length) {
+  if (!memory?.winnerFingerprints?.length && !memory?.missedWinners3x?.length && !memory?.blueprintWinners?.length) {
     return { matched: false, strong: false, action: null, type: null, confidence: 0, reason: 'No winner-fingerprint history yet.' };
   }
 
@@ -654,6 +703,7 @@ function matchLearnedPattern(result) {
   }
 
   const fpMatches = (memory.winnerFingerprints || []).filter(fp => {
+    if (isRemovedWinnerImprint(fp)) return false;
     if (!(fp.scanMc > 0) || !(fp.multiple >= 3)) return false;
     const mcNear = candidate.mc > 0 ? Math.abs(candidate.mc - fp.scanMc) / Math.max(candidate.mc, fp.scanMc) <= 0.7 : false;
     const top10Near = fp.top10Pct == null || candidate.top10 === 0 ? false : Math.abs(candidate.top10 - fp.top10Pct) <= 12;

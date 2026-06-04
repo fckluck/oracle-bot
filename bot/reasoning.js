@@ -6,15 +6,13 @@ const XAI_API_URL = 'https://api.x.ai/v1/chat/completions';
 const TIMEOUT_MS  = 15_000;
 
 const HALL_OF_FAME = `
-WINNERS (Blueprint Signatures):
-- $!ng: Elite Dev, 36% Top10, 9x organic vol -> $2M ATH. Key: high concentration + elite profile.
-- $SOREN: Elite Dev, 34% Top10, 14x vol -> $650K ATH. Key: same controlled-floor pattern.
-- $ballish: Elite Dev, 31% Top10, 15x vol -> $313K ATH. Key: trust the blueprint.
-- $SPEED: $19K MC, 12x organic vol, unverified holders -> $230K ATH. Key: nano-cap vol was the signal.
-- $GRAIL: Elite dev, high vol, managed concentration -> runner confirmed.
-HALL OF SHAME (Rug Signatures):
-- $MANNY: Inflated holders (>250% health), looked organic, was botted.
-- $Bingus: Age >60m, MC <$30K, negative 1H, zero X mentions. Classic stale rug.
+CONTROLLED-DIRTY WINNER SIGNATURES:
+- Early MC $9K-$90K, adjusted Vol/Liq 4.25x-20x+, clean/tolerable wash, no confirmed sybil.
+- Controlled concentration can be scoutable when Top10 is 31%-40% and organic demand is real.
+- Elevated Top10 45%-58% is scout-only and needs strict clean wash, small bundle, holder sanity, and social confirmation.
+- Moderate bundle 5-10/slot is tolerated only when adjusted Vol/Liq is strong and wash is clean.
+RUG / FAILURE SIGNATURES:
+- Confirmed sybil, wash >50%, malformed MC/liquidity, LP drain, holder collapse, or Top10 death-zone must be respected.
 `;
 
 const SYSTEM_PROMPT = `You are the Oracle Soul - a pattern-matching risk analyst.
@@ -22,12 +20,14 @@ Your job is to compare incoming token data to prior winner, prior rug/failure, o
 You explain risk; you do not override scanner verdicts.
 ${HALL_OF_FAME}
 RULES:
-1. If it resembles a prior winner, say [ WINNER PATTERN ] and name the matching imprint.
+1. If a deterministic blueprint action exists, explain that action first.
 2. If it resembles a rug/failure or scanner hard gate, say [ RISK PATTERN ] and explain the danger.
 3. If the scanner hard gate is sybil bundle, wash fail, distribution, top10 fail, or LP fail, explicitly respect that gate.
-4. If unclear, say [ UNCERTAIN PATTERN ] and give the strongest reason.
-5. You may say SOUL OVERRIDE CANDIDATE for human review, but never claim to override hard gates.
-6. Keep total response under 3 sentences. No bullet points. No forced bullishness.`;
+4. Use fresh blueprint memory before stale Hall-of-Fame examples.
+5. Do not mention removed failed/loss examples as positive winner comparables.
+6. Grok does not override scanner or blueprint decisions; explanation and learning only.
+7. If unclear, say [ UNCERTAIN PATTERN ] and give the strongest reason.
+8. Keep total response under 3 sentences, and under 2 sentences for Hunt mode. No bullet points. No forced bullishness.`;
 
 function parseSoulVerdict(text) {
   if (!text) return null;
@@ -50,6 +50,22 @@ function buildPatternMemoryBlock(patternMemory) {
   };
 
   const parts = [];
+
+  const blueprintWinners = (patternMemory.blueprintWinners || []).filter(r =>
+    String(r.symbol || r.ticker || '').toLowerCase() !== 'sigeonpex'
+  );
+  if (blueprintWinners.length) {
+    const compact = blueprintWinners.slice(0, 12).map(r => {
+      const mult = r.multiple != null ? `${r.multiple.toFixed(1)}x` : '?x';
+      const matches = (r.blueprintMatches || []).slice(0, 3).join('+') || 'blueprint';
+      const top10 = r.top10Pct != null ? `${r.top10Pct.toFixed(1)}% top10` : 'top10 N/A';
+      const vol = r.adjustedVolLiq != null ? `${r.adjustedVolLiq.toFixed(1)}x vol` : 'vol N/A';
+      const wash = r.washPct != null ? `${r.washPct.toFixed(1)}% wash` : 'wash N/A';
+      const bundle = r.bundleCount != null ? `${r.bundleCount}/slot` : 'bundle N/A';
+      return `$${r.symbol ?? r.ticker ?? '???'}: ${mult}, ${matches}, ${top10}, ${vol}, ${wash}, ${bundle}`;
+    });
+    parts.push(`BLUEPRINT WINNERS: ${compact.join(' | ')}`);
+  }
 
   const missed = patternMemory.missedWinners3x || patternMemory.missedWinners || [];
   if (missed.length) {
@@ -128,6 +144,7 @@ async function getSoulVerdict(scanResult, tokenData = {}) {
     };
   }
   const { signals = {}, devProfile = {} } = scanResult;
+  const blueprint = scanResult.blueprintMatch || {};
   const patternMemoryBlock = buildPatternMemoryBlock(tokenData.patternMemory ?? scanResult.patternMemory);
   const ticker = tokenData.codex?.symbol || tokenData.pump?.symbol || tokenData.symbol || 'UNKNOWN';
   const userMessage = `
@@ -145,6 +162,10 @@ Token Analysis Request:
 - Is Elite Dev: ${signals.isEliteDev}
 - Bundle Count: ${signals.bundleCount ?? 0}/slot
 - Social mentions (15m): ${scanResult.social?.mentions15m ?? tokenData.social?.mentions15m ?? 'N/A'}
+- Deterministic Blueprint Action: ${blueprint.action ?? 'NONE'}
+- Blueprint Matches: ${(blueprint.matches || []).join(', ') || 'none'}
+- Blueprint Confidence: ${blueprint.confidence != null ? blueprint.confidence : 'N/A'}
+- Blueprint Reason: ${blueprint.reason || 'none'}
 - Scanner hard gate/reason: ${scanResult.noGoReason ?? scanResult.watchReason ?? scanResult.headlineType ?? scanResult.momentumStatus ?? 'none'}
 Explain whether this is a prior winner pattern, rug/failure pattern, or uncertain pattern.
 Question to answer directly: Does this token resemble recent missed winners more than recent failed alerts?
