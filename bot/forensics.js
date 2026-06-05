@@ -88,10 +88,10 @@ function evaluateHolderCohort({
     return {
       status: 'UNKNOWN',
       icon: '🟡',
-      oneLine: '🔎 Forensics: 🟡 Unknown — insufficient wallet data; no confirmed farm.',
+      oneLine: '🔎 Forensics: 🟡 Unknown — no confirmed farm; wallet edge not proven yet.',
       blockPromotion: false,
       suppressPromotion: false,
-      reason: 'insufficient wallet data',
+      reason: 'wallet edge not proven yet',
       features: {},
     };
   }
@@ -171,7 +171,7 @@ function evaluateHolderCohort({
 
   let status = 'UNKNOWN';
   let icon = '🟡';
-  let labelReason = 'insufficient wallet identity edge';
+  let labelReason = 'no confirmed farm; wallet edge not proven yet';
   let blockPromotion = false;
   let suppressPromotion = false;
 

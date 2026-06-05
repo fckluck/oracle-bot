@@ -33,6 +33,41 @@ let winnerFingerprints = [];
 let failedFingerprints = [];
 let updateTimer = null;
 
+function escHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function codeHtml(str) {
+  return `<code>${escHtml(str)}</code>`;
+}
+
+function promotionKeyboard(ca, mc = 0) {
+  const safeMc = Math.floor(Number(mc || 0));
+  return {
+    inline_keyboard: [
+      [
+        { text: '👀 TRACK', callback_data: `track:${ca}:${safeMc}` },
+        { text: '🔔 ALERT', callback_data: `alert:${ca}:${safeMc}` },
+      ],
+      [
+        { text: '📌 LEARN', callback_data: `learn:${ca}` },
+        { text: '🧠 DETAILS', callback_data: `details:${ca}` },
+      ],
+      [
+        { text: '🔎 FORENSICS', callback_data: `forensics:${ca}:${safeMc}` },
+      ],
+    ],
+  };
+}
+
+function friendlyClass(rawClass, score = null) {
+  return resolveTraderClass(rawClass || 'WATCH', score).label;
+}
+
 function normalizeStringArray(value) {
   if (Array.isArray(value)) return value.map(v => String(v)).filter(Boolean);
   if (typeof value === 'string' && value.trim()) {
@@ -56,6 +91,16 @@ function normalizeRecord(rec) {
   const firstSeenAt = rec.firstSeenAt ?? rec.scanTime ?? rec.scannedAt ?? Date.now();
   const alertAt = rec.alertAt ?? rec.scanTime ?? rec.scannedAt ?? Date.now();
   const currentMc = rec.currentMc ?? scanMc ?? null;
+  const lastObservedMc = rec.lastObservedMc ?? currentMc ?? scanMc ?? null;
+  const lastObservedAt = rec.lastObservedAt ?? rec.scanTime ?? rec.scannedAt ?? null;
+  const lastObservedSource = rec.lastObservedSource ?? rec.source ?? null;
+  const externalMc = rec.externalMc ?? null;
+  const externalMcSource = rec.externalMcSource ?? null;
+  const externalMcCheckedAt = rec.externalMcCheckedAt ?? null;
+  const lastMcSource = rec.lastMcSource ?? externalMcSource ?? null;
+  const lastMcCheckedAt = rec.lastMcCheckedAt ?? externalMcCheckedAt ?? null;
+  const mcUncertain = !!rec.mcUncertain;
+  const mcDisagreementPct = rec.mcDisagreementPct ?? null;
   const multipleFromFirstSeen = firstSeenMc > 0 && peakMc > 0 ? peakMc / firstSeenMc : null;
   const multipleFromAlert = alertMc > 0 && peakMc > 0 ? peakMc / alertMc : null;
   const promotionDelayMinutes = firstSeenAt > 0 && alertAt > 0
@@ -89,6 +134,16 @@ function normalizeRecord(rec) {
     multipleFromFirstSeen,
     multipleFromAlert,
     promotionAlerted: !!rec.promotionAlerted,
+    lastObservedMc,
+    lastObservedAt,
+    lastObservedSource,
+    externalMc,
+    externalMcSource,
+    externalMcCheckedAt,
+    lastMcSource,
+    lastMcCheckedAt,
+    mcUncertain,
+    mcDisagreementPct,
     lastChecked: rec.lastChecked ?? 0,
     adjustedVolLiq: rec.adjustedVolLiq ?? null,
     rawVolLiq: rec.rawVolLiq ?? null,
@@ -297,8 +352,14 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
   const existingIdx = auditQueue.findIndex(e => e.ca === ca && !e.resolved);
   if (existingIdx >= 0) {
     const existing = auditQueue[existingIdx];
-    const currentMc = scanMc ?? existing.currentMc ?? existing.scanMc ?? existing.firstSeenMc ?? null;
-    const peakMc = Math.max(existing.peakMc ?? 0, currentMc ?? 0, existing.currentMc ?? 0);
+    const observedMc = scanMc ?? null;
+    const observedAt = now;
+    const observedSource = extra.source ?? existing.source ?? null;
+    let bestCurrentMc = existing.currentMc ?? existing.lastObservedMc ?? existing.scanMc ?? null;
+    if (observedMc != null && observedMc > 0) {
+      bestCurrentMc = observedMc;
+    }
+    const peakMc = Math.max(existing.peakMc ?? 0, bestCurrentMc ?? 0, observedMc ?? 0);
     const incomingClass = extra.oracleScoreClass || verdict;
     const prevClass = existing.alertClass || existing.oracleScoreClass || existing.verdict;
     const classChanged = String(prevClass || '').toUpperCase() !== String(incomingClass || '').toUpperCase();
@@ -313,15 +374,25 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
       entryTier: entryTier ?? existing.entryTier,
       oracleScoreClass: incomingClass ?? existing.oracleScoreClass,
       oracleScoreTotal: extra.oracleScoreTotal ?? existing.oracleScoreTotal,
-      currentMc: currentMc ?? existing.currentMc,
+      currentMc: bestCurrentMc ?? existing.currentMc,
       peakMc,
       firstSeenMc: existing.firstSeenMc ?? existing.scanMc ?? scanMc ?? null,
       firstSeenAt: existing.firstSeenAt ?? existing.scanTime ?? now,
       firstSeenSource: existing.firstSeenSource ?? existing.source ?? extra.source ?? null,
       firstSeenClass: existing.firstSeenClass ?? existing.oracleScoreClass ?? existing.verdict ?? incomingClass,
-      alertMc: shouldRefreshAlert ? (currentMc ?? existing.alertMc ?? existing.scanMc ?? null) : (existing.alertMc ?? existing.scanMc ?? currentMc ?? null),
+      alertMc: shouldRefreshAlert ? (bestCurrentMc ?? existing.alertMc ?? existing.scanMc ?? null) : (existing.alertMc ?? existing.scanMc ?? bestCurrentMc ?? null),
       alertAt: shouldRefreshAlert ? now : (existing.alertAt ?? existing.scanTime ?? now),
       alertClass: shouldRefreshAlert ? incomingClass : (existing.alertClass ?? incomingClass),
+      lastObservedMc: observedMc ?? existing.lastObservedMc ?? existing.currentMc ?? existing.scanMc ?? null,
+      lastObservedAt: observedMc != null ? observedAt : (existing.lastObservedAt ?? existing.scanTime ?? now),
+      lastObservedSource: observedMc != null ? observedSource : (existing.lastObservedSource ?? existing.source ?? null),
+      externalMc: extra.externalMc ?? existing.externalMc ?? null,
+      externalMcSource: extra.externalMcSource ?? existing.externalMcSource ?? null,
+      externalMcCheckedAt: extra.externalMcCheckedAt ?? existing.externalMcCheckedAt ?? null,
+      lastMcSource: extra.lastMcSource ?? existing.lastMcSource ?? null,
+      lastMcCheckedAt: extra.lastMcCheckedAt ?? existing.lastMcCheckedAt ?? null,
+      mcUncertain: extra.mcUncertain ?? existing.mcUncertain ?? false,
+      mcDisagreementPct: extra.mcDisagreementPct ?? existing.mcDisagreementPct ?? null,
       lastChecked: now,
       adjustedVolLiq: extra.adjustedVolLiq ?? existing.adjustedVolLiq,
       rawVolLiq: extra.rawVolLiq ?? existing.rawVolLiq,
@@ -385,6 +456,16 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
     alertMc: scanMc ?? null,
     alertAt: now,
     alertClass: extra.oracleScoreClass ?? verdict,
+    lastObservedMc: scanMc ?? null,
+    lastObservedAt: now,
+    lastObservedSource: extra.source ?? null,
+    externalMc: extra.externalMc ?? null,
+    externalMcSource: extra.externalMcSource ?? null,
+    externalMcCheckedAt: extra.externalMcCheckedAt ?? null,
+    lastMcSource: extra.lastMcSource ?? null,
+    lastMcCheckedAt: extra.lastMcCheckedAt ?? null,
+    mcUncertain: extra.mcUncertain ?? false,
+    mcDisagreementPct: extra.mcDisagreementPct ?? null,
     promotionDelayMinutes: 0,
     trackEntryMc: extra.trackEntryMc ?? null,
     guardianPeakMc: extra.guardianPeakMc ?? scanMc ?? null,
@@ -577,13 +658,47 @@ async function processBatch(bot, fetchMcFn) {
 
   for (const entry of pending) {
     try {
-      const currentMc = await resolveMc(fetchMcFn, entry.ca);
+      const mcResult = await fetchMcFn(entry.ca, { auditMode: true });
+      const fetchedMc = typeof mcResult === 'number' ? mcResult : mcResult?.mc ?? null;
       entry.lastChecked = Date.now();
-      if (currentMc == null) continue;
-      entry.currentMc = currentMc;
-      if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
-      if (entry.trueAthMc == null || currentMc > entry.trueAthMc) entry.trueAthMc = currentMc;
-      entry.guardianPeakMc = Math.max(entry.guardianPeakMc || 0, entry.peakMc || 0, currentMc || 0);
+      if (mcResult && typeof mcResult === 'object') {
+        entry.lastMcSource = mcResult.source || null;
+        entry.lastMcCheckedAt = mcResult.fetchedAt || Date.now();
+        entry.mcUncertain = !!mcResult.uncertain;
+        entry.mcDisagreementPct = mcResult.disagreementPct ?? null;
+      }
+      if (fetchedMc == null || !(Number(fetchedMc) > 0)) continue;
+
+      const nowMs = Date.now();
+      const observedMc = Number(entry.lastObservedMc || entry.currentMc || entry.scanMc || 0);
+      const observedAt = Number(entry.lastObservedAt || entry.scanTime || 0);
+      const observedAgeMs = observedAt > 0 ? nowMs - observedAt : Infinity;
+
+      entry.externalMc = Number(fetchedMc);
+      entry.externalMcSource = typeof mcResult === 'object' ? (mcResult.source || null) : 'unknown';
+      entry.externalMcCheckedAt = typeof mcResult === 'object' ? (mcResult.fetchedAt || nowMs) : nowMs;
+
+      const disagreementPct = observedMc > 0
+        ? Math.abs(Number(fetchedMc) - observedMc) / Math.max(observedMc, Number(fetchedMc)) * 100
+        : 0;
+      entry.mcDisagreementPct = disagreementPct;
+
+      const recentObserved = observedMc > 0 && observedAgeMs <= 2 * 60 * 1000;
+      const source = String(entry.externalMcSource || '').toLowerCase();
+      const laggySource = source.includes('dexscreener') || source.includes('jupiter');
+      if (recentObserved && laggySource && disagreementPct >= 25) {
+        entry.mcUncertain = true;
+        entry.currentMc = observedMc;
+      } else {
+        entry.mcUncertain = disagreementPct >= 35 || !!(mcResult && typeof mcResult === 'object' && mcResult.uncertain);
+        entry.currentMc = Number(fetchedMc);
+      }
+
+      if (entry.peakMc == null || entry.currentMc > entry.peakMc) entry.peakMc = entry.currentMc;
+      if (entry.externalMc > entry.peakMc) entry.peakMc = Math.max(entry.peakMc, entry.externalMc);
+      if (entry.trueAthMc == null || entry.currentMc > entry.trueAthMc) entry.trueAthMc = entry.currentMc;
+      if (entry.externalMc > (entry.trueAthMc || 0)) entry.trueAthMc = entry.externalMc;
+      entry.guardianPeakMc = Math.max(entry.guardianPeakMc || 0, entry.peakMc || 0, entry.currentMc || 0);
       entry.multipleFromFirstSeen = entry.firstSeenMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.firstSeenMc : null;
       entry.multipleFromAlert = entry.alertMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.alertMc : null;
       entry.promotionDelayMinutes = entry.firstSeenAt > 0 && entry.alertAt > 0
@@ -599,7 +714,14 @@ async function processBatch(bot, fetchMcFn) {
       const forensicsBlocked = forensicsStatus === 'SCAMMERS' || forensicsStatus === 'BOTTED';
       const firstSeen = Number(entry.firstSeenMc || entry.scanMc || 0);
       const peak = Number(entry.peakMc || 0);
-      const current = Number(entry.currentMc || 0);
+      const displayCurrent = Number(entry.currentMc || entry.lastObservedMc || entry.externalMc || 0);
+      const conservativeCandidates = [entry.currentMc, entry.lastObservedMc, entry.externalMc]
+        .map(Number)
+        .filter(v => Number.isFinite(v) && v > 0);
+      const conservativeCurrent = conservativeCandidates.length ? Math.min(...conservativeCandidates) : 0;
+      const current = Number.isFinite(conservativeCurrent) && conservativeCurrent > 0
+        ? conservativeCurrent
+        : displayCurrent;
       const drawdownFromPeak = peak > 0 && current > 0 ? (peak - current) / peak : 1;
       const livePearl =
         firstSeen > 0 &&
@@ -607,6 +729,8 @@ async function processBatch(bot, fetchMcFn) {
         peak > 0 &&
         current >= peak * 0.65 &&
         drawdownFromPeak <= 0.35;
+      const sourceUncertain = !!entry.mcUncertain || Number(entry.mcDisagreementPct || 0) >= 25;
+      const safeToPromoteLive = livePearl && !sourceUncertain;
       if (
         bot &&
         process.env.OWNER_TELEGRAM_ID &&
@@ -621,29 +745,65 @@ async function processBatch(bot, fetchMcFn) {
         !forensicsBlocked
       ) {
         const symbol = entry.ticker || entry.symbol || entry.ca.slice(0, 8);
-        if (livePearl) {
-          const msg = `🦪 HUNT PEARL PROMOTED\n\n`
-            + `Hunt saw this earlier.\n`
-            + `Token: ${symbol}\n`
-            + `CA: ${entry.ca}\n`
-            + `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n`
-            + `Current/Peak: ${fmtUsdCompact(entry.currentMc)}/${fmtUsdCompact(entry.peakMc)}\n`
-            + `Move From First Seen: ${moveFromFirst.toFixed(2)}x\n`
-            + `Original Class: ${entry.firstSeenClass || entry.verdict}\n\n`
-            + `Action: chart/track now. Chase guard applies; no blind entry if already extended.`;
-          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
+        const sourceLabel = entry.lastMcSource ? ` (${escHtml(entry.lastMcSource)})` : '';
+        const mcLineLabel = entry.mcUncertain ? 'Last Oracle MC' : 'Live Check MC';
+        const originalRead = friendlyClass(entry.firstSeenClass || entry.verdict, entry.oracleScoreTotal);
+        if (safeToPromoteLive) {
+          const msg =
+            `🦪 HUNT PEARL PROMOTED\n\n` +
+            `Hunt saw this earlier.\n` +
+            `Token: ${escHtml(symbol)}\n` +
+            `CA: ${codeHtml(entry.ca)}\n\n` +
+            `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n` +
+            `${mcLineLabel}: ${fmtUsdCompact(displayCurrent)}${sourceLabel}\n` +
+            `Peak Seen: ${fmtUsdCompact(entry.peakMc)}\n` +
+            `Move From First Seen: ${moveFromFirst.toFixed(2)}x\n` +
+            `Original Read: ${escHtml(originalRead)}\n` +
+            `Forensics: ${escHtml(entry.forensicsStatus || 'UNKNOWN')}${entry.forensicsReason ? ` — ${escHtml(entry.forensicsReason)}` : ''}\n\n` +
+            `Action: chart/track now. Chase guard applies; no blind entry if already extended.`;
+          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            reply_markup: promotionKeyboard(entry.ca, displayCurrent),
+          }).catch(() => {});
           entry.promotionAlerted = true;
+        } else if (livePearl && sourceUncertain) {
+          entry.promotionAlerted = true;
+          entry.failureReason = `mc_source_uncertain_${Number(entry.mcDisagreementPct || 0).toFixed(0)}pct`;
+          const uncertainMsg =
+            `🟠 PEARL MOVE DETECTED — MC UNCERTAIN\n\n` +
+            `Hunt saw this earlier, but live MC sources disagree.\n` +
+            `Token: ${escHtml(symbol)}\n` +
+            `CA: ${codeHtml(entry.ca)}\n\n` +
+            `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n` +
+            `Oracle MC: ${fmtUsdCompact(displayCurrent)}\n` +
+            `Peak Seen: ${fmtUsdCompact(entry.peakMc)}\n` +
+            `MC Source: ${escHtml(entry.lastMcSource || 'unknown')}\n` +
+            `Disagreement: ${Number(entry.mcDisagreementPct || 0).toFixed(0)}%\n\n` +
+            `Action: chart only. No blind entry.`;
+          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, uncertainMsg, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            reply_markup: promotionKeyboard(entry.ca, displayCurrent),
+          }).catch(() => {});
         } else if (moveFromFirst >= 1.5) {
           entry.outcome = 'FAILED_PEARL';
           entry.failureReason = 'moved then died before promotion';
           entry.promotionAlerted = true;
-          const failMsg = `🔴 FAILED PEARL\n`
-            + `Hunt saw this earlier, but it died before promotion.\n`
-            + `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n`
-            + `Peak MC: ${fmtUsdCompact(entry.peakMc)}\n`
-            + `Current MC: ${fmtUsdCompact(entry.currentMc)}\n`
-            + `Lesson saved. No entry.`;
-          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, failMsg).catch(() => {});
+          const failMsg =
+            `🔴 FAILED PEARL\n\n` +
+            `Hunt saw this earlier, but it died before promotion.\n` +
+            `Token: ${escHtml(entry.ticker || entry.symbol || entry.ca.slice(0, 8))}\n` +
+            `CA: ${codeHtml(entry.ca)}\n\n` +
+            `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n` +
+            `Peak MC: ${fmtUsdCompact(entry.peakMc)}\n` +
+            `Current MC: ${fmtUsdCompact(displayCurrent)}\n` +
+            `Lesson saved. No entry.`;
+          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, failMsg, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            reply_markup: promotionKeyboard(entry.ca, displayCurrent),
+          }).catch(() => {});
         }
       } else if (
         moveFromFirst >= 1.5 &&
@@ -710,7 +870,7 @@ function getAuditReport() {
   const pendingSnapshot = auditQueue
     .filter(e => !e.resolved)
     .map(e => {
-      const current = e.currentMc ?? e.peakMc ?? e.scanMc ?? 0;
+      const current = e.currentMc ?? e.lastObservedMc ?? e.externalMc ?? e.peakMc ?? e.scanMc ?? 0;
       const peak = Math.max(e.peakMc ?? 0, current);
       const multiple = e.scanMc > 0 && peak > 0 ? peak / e.scanMc : 0;
       return { ...e, current, peak, multiple };
@@ -729,11 +889,17 @@ function getAuditReport() {
   const pendingLines = pendingSnapshot.length
     ? pendingSnapshot.map(e => {
       const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
-      return `PENDING ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Current/Peak: ${fmtUsdCompact(e.current)}/${fmtUsdCompact(e.peak)} (${e.multiple > 0 ? e.multiple.toFixed(1) : '0.0'}x) | age: ${formatAge(Date.now() - (e.scanTime || Date.now()))} | ${classLabel}`;
+      const sourceParts = [];
+      if (e.mcUncertain) sourceParts.push('MC uncertain');
+      if (e.lastObservedSource) sourceParts.push(`seen:${e.lastObservedSource}`);
+      if (e.externalMcSource) sourceParts.push(`fetch:${e.externalMcSource}`);
+      const sourceNote = sourceParts.length ? ` | ${sourceParts.join(' / ')}` : '';
+      const shortCa = e.ca ? `${e.ca.slice(0, 6)}...${e.ca.slice(-4)}` : 'unknown';
+      return `PENDING ${e.ticker ?? shortCa} (${shortCa}) | Scan: ${fmtUsdCompact(e.scanMc)} -> Current/Peak: ${fmtUsdCompact(e.current)}/${fmtUsdCompact(e.peak)} (${e.multiple > 0 ? e.multiple.toFixed(1) : '0.0'}x) | age: ${formatAge(Date.now() - (e.scanTime || Date.now()))} | ${classLabel}${sourceNote}`;
     })
     : ['No pending entries.'];
 
-  return `AUDIT - Last 10 Resolved\n\n${resolvedLines.join('\n')}\n\nPENDING SNAPSHOT (Top 10 by current multiple)\n\n${pendingLines.join('\n')}\n\nPending means not old enough to finalize yet. Peaks are updated live.`;
+  return `AUDIT - Last 10 Resolved\n\n${resolvedLines.join('\n')}\n\nPENDING SNAPSHOT (Top 10 by current multiple)\n\n${pendingLines.join('\n')}\n\nPending means not old enough to finalize yet. Current/Peak are Oracle-seen values and may lag fast Pump/Axiom moves when sources disagree.`;
 }
 
 function getAll() {
@@ -836,12 +1002,46 @@ async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false,
 
   let resolved = 0;
   for (const entry of pending) {
-    const currentMc = await resolveMc((ca) => fetchMcFn(ca, { allowBirdeye, deepMode }), entry.ca);
+    const mcResult = await fetchMcFn(entry.ca, { allowBirdeye, deepMode, auditMode: true });
+    const fetchedMc = typeof mcResult === 'number' ? mcResult : mcResult?.mc ?? null;
     entry.lastChecked = Date.now();
-    if (currentMc == null) continue;
-    entry.currentMc = currentMc;
-    if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
-    if (entry.trueAthMc == null || currentMc > entry.trueAthMc) entry.trueAthMc = currentMc;
+    if (mcResult && typeof mcResult === 'object') {
+      entry.lastMcSource = mcResult.source || null;
+      entry.lastMcCheckedAt = mcResult.fetchedAt || Date.now();
+      entry.mcUncertain = !!mcResult.uncertain;
+      entry.mcDisagreementPct = mcResult.disagreementPct ?? null;
+    }
+    if (fetchedMc == null || !(Number(fetchedMc) > 0)) continue;
+
+    const nowMs = Date.now();
+    const observedMc = Number(entry.lastObservedMc || entry.currentMc || entry.scanMc || 0);
+    const observedAt = Number(entry.lastObservedAt || entry.scanTime || 0);
+    const observedAgeMs = observedAt > 0 ? nowMs - observedAt : Infinity;
+
+    entry.externalMc = Number(fetchedMc);
+    entry.externalMcSource = typeof mcResult === 'object' ? (mcResult.source || null) : 'unknown';
+    entry.externalMcCheckedAt = typeof mcResult === 'object' ? (mcResult.fetchedAt || nowMs) : nowMs;
+
+    const disagreementPct = observedMc > 0
+      ? Math.abs(Number(fetchedMc) - observedMc) / Math.max(observedMc, Number(fetchedMc)) * 100
+      : 0;
+    entry.mcDisagreementPct = disagreementPct;
+
+    const recentObserved = observedMc > 0 && observedAgeMs <= 2 * 60 * 1000;
+    const source = String(entry.externalMcSource || '').toLowerCase();
+    const laggySource = source.includes('dexscreener') || source.includes('jupiter');
+    if (recentObserved && laggySource && disagreementPct >= 25) {
+      entry.mcUncertain = true;
+      entry.currentMc = observedMc;
+    } else {
+      entry.mcUncertain = disagreementPct >= 35 || !!(mcResult && typeof mcResult === 'object' && mcResult.uncertain);
+      entry.currentMc = Number(fetchedMc);
+    }
+
+    if (entry.peakMc == null || entry.currentMc > entry.peakMc) entry.peakMc = entry.currentMc;
+    if (entry.externalMc > entry.peakMc) entry.peakMc = Math.max(entry.peakMc, entry.externalMc);
+    if (entry.trueAthMc == null || entry.currentMc > entry.trueAthMc) entry.trueAthMc = entry.currentMc;
+    if (entry.externalMc > (entry.trueAthMc || 0)) entry.trueAthMc = entry.externalMc;
     entry.multipleFromFirstSeen = entry.firstSeenMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.firstSeenMc : null;
     entry.multipleFromAlert = entry.alertMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.alertMc : null;
     if (Date.now() - entry.scanTime >= RESOLVE_MS) {
@@ -866,11 +1066,17 @@ function getAuditPendingReport() {
   if (!pending.length) return 'No unresolved audit entries.';
   const shown = pending.length <= 25 ? pending : pending.slice(0, 25);
   const lines = shown.map((e, idx) => {
-    const current = e.currentMc ?? e.peakMc ?? e.scanMc ?? 0;
+    const current = e.currentMc ?? e.lastObservedMc ?? e.externalMc ?? e.peakMc ?? e.scanMc ?? 0;
     const peak = e.peakMc ?? current;
     const mult = e.scanMc > 0 && peak > 0 ? (peak / e.scanMc).toFixed(2) : 'N/A';
     const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
-    return `${idx + 1}. ${e.ticker || e.ca.slice(0, 8)} | Scan ${fmtUsdCompact(e.scanMc)} | Current/Peak ${fmtUsdCompact(current)}/${fmtUsdCompact(peak)} | ${mult}x | age ${formatAge(now - (e.scanTime || now))} | ${classLabel}`;
+    const sourceParts = [];
+    if (e.mcUncertain) sourceParts.push('MC uncertain');
+    if (e.lastObservedSource) sourceParts.push(`seen:${e.lastObservedSource}`);
+    if (e.externalMcSource) sourceParts.push(`fetch:${e.externalMcSource}`);
+    const sourceNote = sourceParts.length ? ` | ${sourceParts.join(' / ')}` : '';
+    const shortCa = e.ca ? `${e.ca.slice(0, 6)}...${e.ca.slice(-4)}` : 'unknown';
+    return `${idx + 1}. ${(e.ticker || shortCa)} (${shortCa}) | Scan ${fmtUsdCompact(e.scanMc)} | Current/Peak ${fmtUsdCompact(current)}/${fmtUsdCompact(peak)} | ${mult}x | age ${formatAge(now - (e.scanTime || now))} | ${classLabel}${sourceNote}`;
   });
   const suffix = pending.length > shown.length ? `\n\nShowing first ${shown.length} of ${pending.length} pending entries.` : '';
   return lines.join('\n') + suffix;
