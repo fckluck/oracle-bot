@@ -143,12 +143,19 @@ async function fetchSolanaTrackerHolders(ca) {
     const total = typeof data?.total === 'number' ? data.total : null;
     if (!total) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: 'no total holders' }); return null; }
     const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+    const top20Pct = accounts.slice(0, 20).reduce((s, a) => s + (a.percentage || 0), 0) || null;
+    const topWallets = accounts.slice(0, 50).map(a => ({
+      address: a.address || a.wallet || a.owner || null,
+      owner: a.owner || a.wallet || a.address || null,
+      uiAmount: a.uiAmount ?? a.amount ?? a.balance ?? null,
+      percentage: a.percentage ?? null,
+    }));
     const top3Pct  = accounts.slice(0, 3).reduce((s, a)  => s + (a.percentage || 0), 0) || null;
     const top10Pct = accounts.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0) || null;
     const top50Pct = accounts.slice(0, 50).reduce((s, a) => s + (a.percentage || 0), 0) || null;
     console.log(`[fetchSolanaTrackerHolders] total=${total} top10=${top10Pct?.toFixed(1)}% top50=${top50Pct?.toFixed(1)}%`);
     markApi('SolanaTracker', { ok: true, meta: { endpoint: 'holders', holders: total, top10Pct } });
-    return { holderCount: total, top3Pct, top10Pct, top50Pct, source: 'solanatracker-holders' };
+    return { holderCount: total, top3Pct, top10Pct, top20Pct, top50Pct, topWallets, source: 'solanatracker-holders' };
   } catch (e) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchSolanaTrackerHolders] error:', e.message); return null; }
 }
 
@@ -827,6 +834,15 @@ async function fetchHeliusHolders(ca) {
     const data = await res.json();
     const accounts = data?.result?.value || [];
     if (!accounts.length) { markApi('Helius', { ok: false, meta: { endpoint: 'holders' }, error: 'no accounts' }); return null; }
+    const topWallets = accounts.map(a => ({
+      address: a.address,
+      owner: a.owner || null,
+      uiAmount: parseFloat(a.uiAmount || 0),
+      amount: a.amount || null,
+      decimals: a.decimals ?? null,
+    }));
+    const top20Balance = accounts.slice(0, 20)
+      .reduce((sum, a) => sum + parseFloat(a.uiAmount || 0), 0);
 
     const top10Balance = accounts.slice(0, 10)
       .reduce((sum, a) => sum + parseFloat(a.uiAmount || 0), 0);
@@ -840,7 +856,9 @@ async function fetchHeliusHolders(ca) {
       holderCount: null,
       topAccountCount: accounts.length,
       top10Pct: (top10Balance / PUMPFUN_TOTAL_SUPPLY) * 100,
+      top20Pct: (top20Balance / PUMPFUN_TOTAL_SUPPLY) * 100,
       top3Pct:  (top3Balance  / PUMPFUN_TOTAL_SUPPLY) * 100,
+      topWallets,
       source: 'helius',
     };
   } catch (e) { markApi('Helius', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchHeliusHolders] error:', e.message); return null; }
@@ -1035,11 +1053,11 @@ async function fetchAll(ca, opts = {}) {
 
       if (beOverview?.holderCount) {
         console.log(`[fetchAll] holders: Birdeye count=${beOverview.holderCount} (no concentration)`);
-        return { holderCount: beOverview.holderCount, top10Pct: null, top3Pct: null, source: 'birdeye' };
+        return { holderCount: beOverview.holderCount, top10Pct: null, top20Pct: null, top3Pct: null, topWallets: [], source: 'birdeye' };
       }
       if (pump?.holderCount) {
         console.log(`[fetchAll] holders: PumpPortal count=${pump.holderCount} (no concentration)`);
-        return { holderCount: pump.holderCount, top10Pct: null, top3Pct: null, source: 'pumpportal' };
+        return { holderCount: pump.holderCount, top10Pct: null, top20Pct: null, top3Pct: null, topWallets: [], source: 'pumpportal' };
       }
 
       console.log('[fetchAll] holders: null — UNVERIFIED');
@@ -1208,7 +1226,11 @@ async function fetchForensic(ca) {
     adjustedVolLiq,
     holderCount:    holders?.holderCount ?? null,
     top10Pct:       holders?.top10Pct    ?? null,
+    top20Pct:       holders?.top20Pct    ?? null,
     top50Pct:       holders?.top50Pct    ?? null,
+    topWallets:     holders?.topWallets  ?? [],
+    holderSource:   holders?.source      ?? null,
+    ageMinutes:     dex.ageMinutes       ?? null,
     priceChange5m:  birdeye?.priceChange5m ?? null,
   };
 }
