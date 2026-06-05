@@ -26,6 +26,11 @@ function friendlySetupLabel(rawName) {
     EXTREME_CONCENTRATION_EXCEPTION: '🏰 Controlled Floor',
     HIGH_VOL_LOW_LP_EXCEPTION: '🌊 Volume Surge',
     LOW_VOL_MOMENTUM_LOTTO: '⚡ Momentum',
+    BLUEPRINT_SCOUT: 'Scout',
+    BLUEPRINT_HOT_WATCH: 'Hot Watch',
+    EXTREME_CONCENTRATION_SCOUT: 'Extreme Concentration Scout',
+    HIGH_VOL_LOW_LP_SCOUT: 'High Volume Low LP Scout',
+    LOTTO_WATCH: 'Lotto Watch',
   };
   return map[key] || null;
 }
@@ -34,12 +39,21 @@ function resolveTraderClass(rawClass, scoreInput = null) {
   const cls = String(rawClass || '').toUpperCase();
   const score = toNum(scoreInput, 0);
 
+  if (cls === 'PEARL_WATCH') {
+    return {
+      key: 'PEARL',
+      label: '🦪 PEARL WATCH',
+      movePotential: 'early sendor / inspect now',
+      auditLabel: '🦪 PEARL',
+    };
+  }
+
   if (['NO_GO', 'AVOID', 'SKIP'].includes(cls)) {
     return {
-      key: 'PASS',
-      label: '🔴 PASS',
+      key: 'FAIL',
+      label: '🔴 FAIL',
       movePotential: 'flat/rug / low probability',
-      auditLabel: '🔴 PASS',
+      auditLabel: '🔴 FAIL',
     };
   }
 
@@ -129,7 +143,8 @@ function shortRisk(result) {
   if (toNum(signals.top10Pct, 0) > 45) return 'high concentration can unwind fast';
   if (toNum(signals.bundleCount, 0) >= 8) return 'bundle pressure from clustered entries';
   if (signals.isSerialDeployer) return 'serial deployer risk profile';
-  return result?.noGoReason || result?.watchReason || result?.headlineType || 'early structure still fragile';
+  const raw = result?.noGoReason || result?.watchReason || result?.headlineType || 'early structure still fragile';
+  return String(raw).replace(/watch only/gi, 'needs confirmation');
 }
 
 function whyRunText(result) {
@@ -161,8 +176,23 @@ function oracleReadText(traderClassKey) {
   if (traderClassKey === 'MONSTER') return 'Ugly but explosive. High-risk asymmetric runner profile.';
   if (traderClassKey === 'RUNNER') return 'Structured momentum with room to trend if flow stays organic.';
   if (traderClassKey === 'SCOUT') return 'Tradeable setup, but fragile and needs confirmation.';
-  if (traderClassKey === 'PASS') return 'Risk outweighs edge right now.';
+  if (traderClassKey === 'PEARL') return 'Early sendor profile. Track/chart first; avoid blind chase.';
+  if (traderClassKey === 'FAIL') return 'Risk outweighs edge right now.';
   return 'Developing setup. Wait for cleaner confirmation.';
+}
+
+function friendlyBlueprintActionLabel(rawAction) {
+  const key = String(rawAction || '').toUpperCase();
+  const map = {
+    BLUEPRINT_SCOUT: 'Scout',
+    BLUEPRINT_HOT_WATCH: 'Hot Watch',
+    EXTREME_CONCENTRATION_SCOUT: 'Extreme Concentration Scout',
+    HIGH_VOL_LOW_LP_SCOUT: 'High Volume Low LP Scout',
+    LOTTO_WATCH: 'Lotto Watch',
+    BLOCK: 'Blocked',
+    NONE: 'None',
+  };
+  return map[key] || (rawAction ? String(rawAction) : 'None');
 }
 
 function dedupe(list) {
@@ -182,6 +212,7 @@ function setupTagsFromResult(result) {
   if (signals.earlyExpansionZone) tags.push('🚀 Early Expansion');
   if (toNum(signals.adjustedVolLiq, 0) >= 8) tags.push('🌊 Volume Surge');
   if (toNum(signals.narrativeStrength, 0) >= 3) tags.push('📰 Narrative');
+  if (String(result?.oracleScore?.class || '').toUpperCase() === 'PEARL_WATCH') tags.push('🦪 Pearl Structure');
   if (result?.patternMatch?.matched || String(result?.oracleScore?.class || '').toUpperCase() === 'MISSED_WINNER_MATCH') {
     tags.push('🧠 Learned Pattern');
   }
@@ -204,4 +235,5 @@ module.exports = {
   whyFailText,
   oracleReadText,
   setupTagsFromResult,
+  friendlyBlueprintActionLabel,
 };

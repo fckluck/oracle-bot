@@ -1,5 +1,6 @@
 const config = require('./config');
 const { evaluateWinnerBlueprint } = require('./blueprints');
+const { evaluatePearlWatch } = require('./pearl');
 
 // ── Eastern Time window ───────────────────────────────────────────────────────
 
@@ -187,29 +188,52 @@ function buildOracleScore(result, data = {}) {
 function evaluateRequiredStack(result, data) {
   const reasons = [];
   const cls = result?.oracleScore?.class || 'WATCH';
+  const marketDataOk = !!(data?.codex || data?.pump || data?.jupiter);
   const dexOk = !!data?.codex;
   const stOk = !!data?.stToken || !!data?.stDeployer || data?.holders?.source === 'solanatracker-holders';
   const socialOk = !!(result?.social?.available || data?.social?.available);
-  const bundleDone = !!result?.signals?.bundle;
+  const bundleDone = result?.signals?.bundle != null || result?.signals?.bundleCount != null;
   const sybil = !!result?.signals?.sybilFunded;
   const wash = result?.signals?.washPct;
+  const mc = Number(result?.signals?.marketCap || 0);
+  const hardBlocks = result?.oracleScore?.hardBlocks || [];
+  const catastrophic = ['confirmed_sybil', 'wash_over_50', 'malformed_or_missing_market_cap', 'liquidity_malformed', 'defade_hard_skip'];
+  const hasCatastrophic = hardBlocks.some(h => catastrophic.includes(h));
 
-  if (!dexOk) reasons.push('dex_missing');
-  if (!stOk) reasons.push('solanatracker_missing');
-  if (!bundleDone) reasons.push('bundle_heuristic_incomplete');
+  if (!marketDataOk) reasons.push('market_data_missing');
+  if (!(mc > 0)) reasons.push('market_cap_invalid');
   if (sybil) reasons.push('confirmed_sybil');
   if (wash != null && wash > 50) reasons.push('wash_over_50');
+  if (hasCatastrophic) reasons.push('catastrophic_hard_block');
 
   if (cls === 'ORACLE_BUY') {
+    if (!dexOk) reasons.push('dex_missing');
+    if (!stOk) reasons.push('solanatracker_missing');
+    if (!bundleDone) reasons.push('bundle_heuristic_incomplete');
     if (!socialOk) reasons.push('socialdata_missing');
     if (config.GROK_REQUIRED_FOR_BUY && !(result?.soulVerdict?.available)) reasons.push('grok_required_missing');
     if (config.DEFADE_REQUIRED_FOR_BUY) {
       const a = result?.deFadeVerification?.action;
       if (!a || ['SKIPPED', 'UNAVAILABLE', 'AUTH_FAIL', 'PLAN_RESTRICTED'].includes(a)) reasons.push('defade_required_missing');
     }
+  } else if (cls === 'PEARL_WATCH') {
+    // PEARL_WATCH is an early discovery lane, not a paid-stack kill-switch lane.
+    if (!bundleDone) reasons.push('bundle_heuristic_unavailable');
+  } else if (cls === 'DIRTY_RUNNER_WATCH' || cls === 'MISSED_WINNER_MATCH') {
+    const confidence = cls === 'MISSED_WINNER_MATCH'
+      ? Number(result?.missedWinnerMatch?.confidence || result?.patternMatch?.confidence || 0)
+      : Number(result?.blueprintMatch?.confidence || result?.patternMatch?.confidence || 0);
+    const threshold = cls === 'MISSED_WINNER_MATCH' ? 0.62 : (config.DIRTY_RUNNER_MIN_CONFIDENCE || 0.7);
+    if (!(confidence >= threshold)) reasons.push('confidence_below_threshold');
   }
 
-  return { pass: reasons.length === 0, reasons };
+  const unique = [...new Set(reasons)];
+  // PEARL_WATCH only fails on hard safety/missing-market conditions.
+  if (cls === 'PEARL_WATCH') {
+    const hardFail = unique.filter(r => ['market_data_missing', 'market_cap_invalid', 'confirmed_sybil', 'wash_over_50', 'catastrophic_hard_block'].includes(r));
+    return { pass: hardFail.length === 0, reasons: unique, hardFailReasons: hardFail };
+  }
+  return { pass: unique.length === 0, reasons: unique };
 }
 // ── Main scan (v8.4 Anti-Wash Predator) ──────────────────────────────────────
 
@@ -695,6 +719,25 @@ function scan(data) {
     }
   }
 
+  // PEARL_WATCH lane: surfaces early candidates that are promising but not full BUY quality.
+  const pearlWatch = evaluatePearlWatch({
+    ...blueprintInput,
+    blueprintMatch,
+    patternMatch: data?.patternMatch || null,
+  }, data);
+  const catastrophicHardBlocks = ['confirmed_sybil', 'wash_over_50', 'malformed_or_missing_market_cap', 'liquidity_malformed', 'defade_hard_skip'];
+  const hasCatastrophicHardBlock = (oracleScore.hardBlocks || []).some(h => catastrophicHardBlocks.includes(h));
+  if (
+    pearlWatch?.matched &&
+    !['ORACLE_BUY', 'MISSED_WINNER_MATCH'].includes(String(oracleScore.class || '').toUpperCase()) &&
+    !hasCatastrophicHardBlock
+  ) {
+    verdict = 'PEARL_WATCH';
+    oracleScore.class = 'PEARL_WATCH';
+    noGoReason = null;
+    watchReason = `PEARL WATCH — ${pearlWatch.reason}. Early alert only; track/chart first, no blind chase.`;
+  }
+
   return {
     ...blueprintInput,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
@@ -704,6 +747,8 @@ function scan(data) {
     narrativeReason,
     socialUpgrade, socialBreakout, socialCto, effectiveCto,
     blueprintMatch,
+    pearlWatch,
+    pearlTraits: pearlWatch?.traits || [],
   };
 }
 

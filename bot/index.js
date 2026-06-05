@@ -185,6 +185,7 @@ async function executeOracleScan(ca, {
   includeReasoning = true,
   recordAuditEntry = false,
 } = {}) {
+  const original = findOriginalScanEntry(ca);
   const [data, social] = await Promise.all([
     fetchAll(ca, {
       manualMode: true,
@@ -199,6 +200,7 @@ async function executeOracleScan(ca, {
   }
 
   data.social = social;
+  data.firstSeenMc = original?.firstSeenMc ?? original?.scanMc ?? null;
   const result = scan(data);
   result.scannedAt = Date.now();
   result.social = social;
@@ -206,7 +208,7 @@ async function executeOracleScan(ca, {
   const memoryMatch = matchLearnedPattern(result);
   result.patternMatch = memoryMatch;
   const currentClass = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
-  const classEligible = ['NO_GO', 'WATCH', 'WATCH_VOL', 'WATCH_WASH', 'DIRTY_RUNNER_WATCH', 'RISKY_RUNNER', 'SKIP'].includes(currentClass);
+  const classEligible = ['NO_GO', 'WATCH', 'WATCH_VOL', 'WATCH_WASH', 'DIRTY_RUNNER_WATCH', 'PEARL_WATCH', 'RISKY_RUNNER', 'SKIP'].includes(currentClass);
   const catastrophic = ['confirmed_sybil', 'wash_over_50', 'malformed_or_missing_market_cap', 'liquidity_malformed'];
   const hasCatastrophic = (result?.oracleScore?.hardBlocks || []).some(b => catastrophic.includes(b));
   if (classEligible && memoryMatch?.matched && !hasCatastrophic) {
@@ -333,9 +335,10 @@ const HELP_MENU =
   `• /memorybackup — Snapshot /data/audit.json and /data/positions.json\n` +
   `• /defadetest [CA] — DeFade endpoint/cache/action test\n\n` +
   `<b>── HUNT MODE (Automated) ──</b>\n` +
-  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Trader-grade MONSTER/RUNNER/SCOUT alerts\n` +
+  `• /hunt — 🎯 <b>ACTIVATE 24/7 HUNTER.</b> Trader-grade MONSTER/RUNNER/SCOUT/PEARL alerts\n` +
   `• /unhunt — Disable automated alerts\n` +
   `• /huntstatus — Live hunt diagnostics (scanned/broadcast/queue)\n` +
+  `• /huntskips — Rolling 60m skip counters + suppression buffers\n` +
   `• /huntdebug — Deep lifecycle debug (start/watchdog/connect counters)\n` +
   `• /huntping — Force one Dex fallback poll and report results\n` +
   `• /huntmode [strict|watch|all] — Legacy toggle (v38 still enforces class gates)\n` +
@@ -423,7 +426,7 @@ bot.command('memorybackup', async ctx => {
 bot.command('hunt', ctx => {
   const added = hunt.addHunter(ctx.chat.id);
   return ctx.replyWithHTML(added
-    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts now use clean MONSTER / RUNNER / SCOUT / ALERT / PASS classes.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
+    ? `${actionTimeLine('Hunt Time')}\n\n🎯 <b>Hunt Mode: ON</b>\nFree Hunt scan is active. Alerts now use clean MONSTER / RUNNER / SCOUT / PEARL / ALERT / FAIL classes.\nPumpPortal WS is primary; DexScreener fallback arms automatically if WS goes stale.\nUse /unhunt to stop.`
     : `${actionTimeLine('Hunt Time')}\n\n🎯 Hunt Mode already <b>ON</b> for this chat. Use /unhunt to stop.`);
 });
 
@@ -507,6 +510,17 @@ bot.command('huntstatus', ctx => {
     `Last suppressed at: ${ago(h.lastSkippedAt)}\n` +
     `SocialData key configured: ${h.socialDataKeyConfigured ? 'yes' : 'no'} | calls: ${h.socialDataCalls ?? 0}\n` +
     `Grok key configured: ${h.grokKeyConfigured ? 'yes' : 'no'} | calls: ${h.grokCalls ?? 0} | fails: ${h.grokFails ?? 0}\n\n` +
+    `<b>Skip Counters (rolling 60m)</b>\n` +
+    `below vol/liq floor: ${h.skipCounts60m?.belowVolLiqFloor ?? 0}\n` +
+    `market data missing: ${h.skipCounts60m?.marketDataMissing ?? 0}\n` +
+    `required stack failed: ${h.skipCounts60m?.requiredStackFailed ?? 0}\n` +
+    `class not allowed: ${h.skipCounts60m?.classNotAllowed ?? 0}\n` +
+    `dirty runner confidence low: ${h.skipCounts60m?.dirtyRunnerConfidenceTooLow ?? 0}\n` +
+    `Pearl Watch sent: ${h.skipCounts60m?.pearlWatchSent ?? 0}\n` +
+    `suppressed Pearl candidates: ${h.skipCounts60m?.suppressedPearlCandidates ?? 0}\n` +
+    `hard blocks: ${h.skipCounts60m?.hardBlocks ?? 0}\n` +
+    `broadcast eligible: ${h.skipCounts60m?.broadcastEligible ?? 0}\n` +
+    `delivered: ${h.skipCounts60m?.delivered ?? 0}\n\n` +
     `<b>Broadcast delivery</b>\n` +
     `Candidates (passed filter): ${h.broadcastCandidates ?? h.broadcast ?? 0}\n` +
     `Telegram attempts:  ${h.broadcastAttempts ?? 0}\n` +
@@ -531,6 +545,31 @@ bot.command('huntstatus', ctx => {
     extra.reply_markup = { inline_keyboard: [[{ text: '🔄 RECONNECT', callback_data: 'hunt:reconnect' }]] };
   }
   return ctx.reply(text, extra);
+});
+
+bot.command('huntskips', ctx => {
+  const h = hunt.status();
+  const scans = (h.lastScans || []).slice(0, 10).map((s, i) =>
+    `${i + 1}. ${s.ca ? s.ca.slice(0, 8) + '...' : 'unknown'} | MC ${fmtUsd(s.mc)} | Vol/Liq ${s.adjustedVolLiq != null ? Number(s.adjustedVolLiq).toFixed(2) + 'x' : 'N/A'} | ${s.cls || 'N/A'}${s.skipReason ? ` | skip: ${s.skipReason}` : ''}`
+  );
+  const suppressed = (h.lastSuppressed || []).slice(0, 10).map((s, i) =>
+    `${i + 1}. ${s.ca ? s.ca.slice(0, 8) + '...' : 'unknown'} | MC ${fmtUsd(s.mc)} | Vol/Liq ${s.adjustedVolLiq != null ? Number(s.adjustedVolLiq).toFixed(2) + 'x' : 'N/A'} | ${s.cls || 'N/A'} | ${s.reason || 'suppressed'}`
+  );
+  const text =
+    `<b>Hunt Skips (rolling 60m)</b>\n\n` +
+    `below vol/liq floor: ${h.skipCounts60m?.belowVolLiqFloor ?? 0}\n` +
+    `market data missing: ${h.skipCounts60m?.marketDataMissing ?? 0}\n` +
+    `required stack failed: ${h.skipCounts60m?.requiredStackFailed ?? 0}\n` +
+    `class not allowed: ${h.skipCounts60m?.classNotAllowed ?? 0}\n` +
+    `dirty runner confidence low: ${h.skipCounts60m?.dirtyRunnerConfidenceTooLow ?? 0}\n` +
+    `Pearl Watch sent: ${h.skipCounts60m?.pearlWatchSent ?? 0}\n` +
+    `suppressed Pearl candidates: ${h.skipCounts60m?.suppressedPearlCandidates ?? 0}\n` +
+    `hard blocks: ${h.skipCounts60m?.hardBlocks ?? 0}\n` +
+    `broadcast eligible: ${h.skipCounts60m?.broadcastEligible ?? 0}\n` +
+    `delivered: ${h.skipCounts60m?.delivered ?? 0}\n\n` +
+    `<b>lastScans (10)</b>\n${scans.length ? scans.join('\n') : 'none'}\n\n` +
+    `<b>lastSuppressed (10)</b>\n${suppressed.length ? suppressed.join('\n') : 'none'}`;
+  return ctx.replyWithHTML(text);
 });
 
 bot.action('hunt:reconnect', async ctx => {
@@ -926,7 +965,7 @@ bot.on('callback_query', async ctx => {
         `CA: \`${shortCa}\`\n` +
         `Baseline MC: $${fmtUsd(baselineMc)}\n\n` +
         `I will notify only when a high-quality retrace/retest forms:\n` +
-        `• retrace from ATH\n` +
+        `• retrace from Guardian Peak\n` +
         `• LP/holder stability\n` +
         `• concentration stability\n` +
         `• no drain danger\n` +

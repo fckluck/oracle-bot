@@ -9,7 +9,9 @@ const {
   whyFailText,
   oracleReadText,
   setupTagsFromResult,
+  friendlyBlueprintActionLabel,
 } = require('./trader-ui');
+const { evaluateEntryValidity, entryLabel } = require('./entry-validity');
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
@@ -45,6 +47,14 @@ function fmtMult(n) {
   if (n >= 10)  return `${n.toFixed(1)}x`;
   return `${n.toFixed(2)}x`;
 }
+
+function liquidityDisplay(signals = {}) {
+  if (Number(signals.lp || 0) <= 0 && !signals.isPostCurve) {
+    if (Number(signals.marketCap || 0) > 0) return `Curve / pre-migration (MC proxy ${fmtUsd(signals.marketCap)})`;
+    return 'Curve / pre-migration';
+  }
+  return fmtUsd(signals.lp);
+}
 function recommendedSizing(result) {
   const cls = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
   const signals = result?.signals || {};
@@ -59,20 +69,25 @@ function recommendedSizing(result) {
       const sol = Number(blueprint.confidence || 0) >= 0.78
         ? config.BLUEPRINT_SCOUT_STRONG_SIZE_SOL
         : config.BLUEPRINT_SCOUT_SIZE_SOL;
-      return { size: sol.toFixed(2) + ' SOL', label: 'BLUEPRINT_SCOUT — controlled-dirty runner blueprint' };
+      return { size: sol.toFixed(2) + ' SOL', label: `${friendlyBlueprintActionLabel(action)} — controlled-dirty runner blueprint` };
     }
     if (action === 'BLUEPRINT_HOT_WATCH') {
-      return { size: config.BLUEPRINT_HOT_WATCH_SIZE_SOL.toFixed(2) + ' SOL max', label: 'BLUEPRINT_HOT_WATCH — scout only / high risk' };
+      return { size: config.BLUEPRINT_HOT_WATCH_SIZE_SOL.toFixed(2) + ' SOL max', label: `${friendlyBlueprintActionLabel(action)} — scout only / high risk` };
     }
     if (action === 'EXTREME_CONCENTRATION_SCOUT' || action === 'HIGH_VOL_LOW_LP_SCOUT') {
-      return { size: config.BLUEPRINT_HOT_WATCH_SIZE_SOL.toFixed(2) + '-' + config.BLUEPRINT_SCOUT_SIZE_SOL.toFixed(2) + ' SOL max', label: `${action} — scout only / forced track` };
+      return { size: config.BLUEPRINT_HOT_WATCH_SIZE_SOL.toFixed(2) + '-' + config.BLUEPRINT_SCOUT_SIZE_SOL.toFixed(2) + ' SOL max', label: `${friendlyBlueprintActionLabel(action)} — scout only / forced track` };
     }
     if (action === 'LOTTO_WATCH') {
-      return { size: 'track-only', label: 'LOTTO_WATCH — audit only, no Hunt sizing' };
+      return { size: 'track-only', label: `${friendlyBlueprintActionLabel(action)} — audit only, no Hunt sizing` };
     }
   }
   if (cls === 'ORACLE_BUY' || result?.verdict === 'BUY') {
-    return { size: (result?.positionSizeSol != null ? String(result.positionSizeSol) : String(config.SESSION_SIZE_SOL)) + ' SOL', label: 'ORACLE_BUY' };
+    const hasHardBlocks = (result?.oracleScore?.hardBlocks || []).length > 0;
+    const proposed = Number(result?.positionSizeSol != null ? result.positionSizeSol : config.SESSION_SIZE_SOL);
+    if (!(proposed > 0) && !hasHardBlocks) {
+      return { size: String(config.SESSION_SIZE_SOL) + ' SOL', label: 'ORACLE_BUY' };
+    }
+    return { size: (proposed > 0 ? String(proposed) : '0') + ' SOL', label: 'ORACLE_BUY' };
   }
   if (cls === 'MISSED_WINNER_MATCH' || result?.verdict === 'MISSED_WINNER_MATCH') {
     const strong = !!result?.missedWinnerMatch?.strong;
@@ -85,6 +100,9 @@ function recommendedSizing(result) {
       size: trackOnly ? 'track-only' : config.DIRTY_RUNNER_MIN_SIZE_SOL.toFixed(2) + '-' + config.DIRTY_RUNNER_MAX_SIZE_SOL.toFixed(2) + ' SOL',
       label: 'HIGH RISK WATCH — not clean enough for full confidence',
     };
+  }
+  if (cls === 'PEARL_WATCH' || result?.verdict === 'PEARL_WATCH') {
+    return { size: 'track/chart/tiny scout only', label: 'PEARL_WATCH' };
   }
   if (['NO_GO', 'AVOID', 'SKIP'].includes(cls) || ['NO_GO', 'AVOID', 'SKIP'].includes(String(result?.verdict || '').toUpperCase())) {
     return { size: '0 SOL', label: 'No position' };
@@ -99,7 +117,14 @@ function formatShortCard(result, ca) {
   const score = scoreRaw != null && Number.isFinite(Number(scoreRaw))
     ? `${Math.round(Number(scoreRaw))}/100`
     : 'N/A';
-  const traderClass = resolveTraderClass(rawClass, scoreRaw);
+  let traderClass = resolveTraderClass(rawClass, scoreRaw);
+  if (traderClass.key === 'MONSTER' && Number(signals.adjustedVolLiq || 0) < 5) {
+    traderClass = resolveTraderClass('PEARL_WATCH', scoreRaw);
+  }
+  const sizing = recommendedSizing(result);
+  if ((sizing.size === '0 SOL' || sizing.size === '0') && ['MONSTER', 'RUNNER'].includes(traderClass.key)) {
+    traderClass = resolveTraderClass('NO_GO', scoreRaw);
+  }
   const confidence = `${confidenceFromResult(result).toFixed(1)}/10`;
   const setupTags = setupTagsFromResult(result);
   const ageMinutes = signals.ageMinutes != null ? `${Math.round(Number(signals.ageMinutes))}m` : 'N/A';
@@ -107,6 +132,15 @@ function formatShortCard(result, ca) {
   const runLine = whyRunText(result);
   const failLine = whyFailText(result);
   const oracleRead = oracleReadText(traderClass.key);
+  const entryState = evaluateEntryValidity({
+    firstSeenMc: result?.firstSeenMc ?? signals.marketCap,
+    alertMc: result?.alertMc ?? signals.marketCap,
+    currentMc: signals.marketCap,
+    peakMc: result?.peakMc ?? result?.currentPeakMc ?? signals.marketCap,
+    momentumStrength: Number(signals.adjustedVolLiq || 0) >= 5 ? 3 : Number(signals.adjustedVolLiq || 0) >= 2.5 ? 2 : 1,
+    structureStrength: Number(signals.top10Pct || 100) <= 45 ? 3 : 1,
+    healthIntact: !signals.sybilFunded && (signals.washPct == null || signals.washPct <= 30),
+  });
   const lines = [];
   lines.push(actionTimeLine(result?.context === 'hunt' ? 'Hunt Time' : 'Scan Time', result?.scannedAt || Date.now()));
   lines.push('');
@@ -116,6 +150,7 @@ function formatShortCard(result, ca) {
   lines.push(b('Score:') + ' ' + b(score));
   lines.push(b('Move Potential:') + ' ' + b(traderClass.movePotential));
   lines.push(b('Confidence:') + ' ' + b(confidence));
+  lines.push(b(entryLabel(entryState)));
   lines.push('');
   lines.push(b('Setup:'));
   if (setupTags.length) {
@@ -126,7 +161,12 @@ function formatShortCard(result, ca) {
   lines.push('');
   lines.push(b('Core:'));
   lines.push(`MC: ${fmtUsd(signals.marketCap)}`);
-  lines.push(`LP: ${fmtUsd(signals.lp)}`);
+  if (Number(signals.lp || 0) <= 0 && !signals.isPostCurve) {
+    lines.push(`LP: Curve / pre-migration`);
+    if (Number(signals.marketCap || 0) > 0) lines.push(`Curve Liquidity: MC proxy ${fmtUsd(signals.marketCap)}`);
+  } else {
+  lines.push(`LP: ${liquidityDisplay(signals)}`);
+  }
   lines.push(`Vol/Liq: ${fmt(signals.adjustedVolLiq, 2)}x`);
   lines.push(`Wash: ${fmtPct(signals.washPct, 0)}`);
   lines.push(`Top10: ${fmtPct(signals.top10Pct, 1)}`);
@@ -317,6 +357,10 @@ function formatVerdict(result, ca, options = {}) {
     L.push(`Risk flags: ${esc(flags || 'elevated concentration / runner profile')}`);
     L.push(`Why shown: ${esc(result.blueprintMatch?.reason || result.patternMatch?.reason || 'matched dirty-runner pattern with sufficient confidence')}`);
     L.push(`Sizing: scout only / human discretion`);
+  } else if (verdict === 'PEARL_WATCH' || result.oracleScore?.class === 'PEARL_WATCH') {
+    L.push(`🦪 ${b('PEARL WATCH — EARLY SENDOR FORMING')}`);
+    L.push(`Action: track/chart first, tiny scout only. No blind chase.`);
+    L.push(`Reason: ${esc(result.watchReason || result.pearlWatch?.reason || 'early expansion traits active with controlled risk')}`);
   } else if (verdict === 'WATCH_VOL') {
     L.push(`🟡 ${b('ORACLE VERDICT: WATCH — Volume Pending')}`);
     L.push(`${esc(watchReason)}`);
@@ -348,7 +392,7 @@ function formatVerdict(result, ca, options = {}) {
     }
   }
   if (result.blueprintMatch?.matched || result.blueprintMatch?.action === 'BLOCK') {
-    L.push(`Blueprint: ${b(result.blueprintMatch.action)} | ${esc((result.blueprintMatch.matches || []).slice(0, 4).join(', ') || 'NONE')} | confidence ${fmt(result.blueprintMatch.confidence, 2)}`);
+    L.push(`Blueprint: ${b(friendlyBlueprintActionLabel(result.blueprintMatch.action))} | ${esc((result.blueprintMatch.matches || []).slice(0, 4).join(', ') || 'NONE')} | confidence ${fmt(result.blueprintMatch.confidence, 2)}`);
   }
   L.push('');
 
@@ -607,7 +651,7 @@ function formatVerdict(result, ca, options = {}) {
   // ── LIVE METRICS ──────────────────────────────────────────────────────────
 
   L.push(b('── LIVE METRICS ──'));
-  L.push(`• ${b('MC:')} ${fmtUsd(mc)} | ${b('LP:')} ${fmtUsd(signals.lp)} | ${b('Vol 1h:')} ${fmtUsd(signals.volume1h)}`);
+  L.push(`• ${b('MC:')} ${fmtUsd(mc)} | ${b('LP:')} ${liquidityDisplay(signals)} | ${b('Vol 1h:')} ${fmtUsd(signals.volume1h)}`);
   L.push(`• ${b('Price:')} $${signals.priceUsd != null ? signals.priceUsd.toFixed(8) : 'N/A'} | ${b('1H \u0394:')} ${fmtChange(signals.change1h)}`);
   L.push(`• ${b('Age:')} ${signals.ageMinutes != null ? signals.ageMinutes + 'min' : 'N/A'} | ${b('Buys/Sells:')} ${signals.buyCount ?? 'N/A'}/${signals.sellCount ?? 'N/A'}`);
   L.push('');
@@ -620,13 +664,13 @@ function formatVerdict(result, ca, options = {}) {
       L.push('TP1: 2x');
       L.push('TP2: 5x');
       L.push('TP3: 10x');
-      L.push('Trail: 35–50% ATH retrace');
+      L.push('Trail: 25–35% Guardian Peak retrace');
       L.push(`Sizing: ${recommendedSizing(result).size} scout`);
     } else if (oracleClass === 'DIRTY_RUNNER_WATCH' || verdict === 'DIRTY_RUNNER_WATCH') {
       L.push('TP1: 2x');
       L.push('TP2: 5x');
       L.push('TP3: 10x');
-      L.push('Trail: 35–50% ATH retrace');
+      L.push('Trail: 25–35% Guardian Peak retrace');
       L.push(`Sizing: ${recommendedSizing(result).size}`);
       if (signals.isSerialDeployer) {
         L.push('Serial deployer note: faster TP cadence, smaller scout, moonbag only after principal removed');
