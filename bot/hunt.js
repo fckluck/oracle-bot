@@ -68,7 +68,7 @@ function buildWsUrl() {
 }
 
 function getAllowedHuntVerdicts() {
-  const strictAllowed = ['ORACLE_BUY', 'MISSED_WINNER_MATCH', 'DIRTY_RUNNER_WATCH'];
+  const strictAllowed = ['ORACLE_BUY', 'MISSED_WINNER_MATCH', 'DIRTY_RUNNER_WATCH', 'PEARL_WATCH'];
   if (config.HUNT_ALERT_VERDICTS) {
     const envAllowed = config.HUNT_ALERT_VERDICTS
       .split(',')
@@ -116,6 +116,19 @@ function markSuppressed(ca, result, reason) {
   stats.lastSkippedCA = ca;
   stats.lastSkippedVerdict = result?.verdict ?? null;
   stats.lastSkippedAt = Date.now();
+  pushBuffer('lastSuppressed', {
+    ts: Date.now(),
+    ca,
+    mc: result?.signals?.marketCap ?? null,
+    adjustedVolLiq: result?.signals?.adjustedVolLiq ?? null,
+    cls: result?.oracleScore?.class || result?.verdict || null,
+    reason,
+  });
+  if (/class .*not allowed/i.test(reason)) markRolling('classNotAllowed');
+  if (/required stack failed/i.test(reason)) markRolling('requiredStackFailed');
+  if (/dirty runner suppressed/i.test(reason)) markRolling('dirtyRunnerConfidenceTooLow');
+  if (String(result?.oracleScore?.class || '').toUpperCase() === 'PEARL_WATCH') markRolling('suppressedPearlCandidates');
+  if ((result?.oracleScore?.hardBlocks || []).length) markRolling('hardBlocks');
   console.log(`[hunt] suppressed ${ca.slice(0, 8)} — ${reason}`);
 }
 
@@ -210,12 +223,50 @@ const stats = {
   hardReconnects: 0,
   lastReconnectReason: null,
   lastWsClose: null,
+  skipWindow: {
+    belowVolLiqFloor: [],
+    marketDataMissing: [],
+    requiredStackFailed: [],
+    classNotAllowed: [],
+    dirtyRunnerConfidenceTooLow: [],
+    pearlWatchSent: [],
+    suppressedPearlCandidates: [],
+    hardBlocks: [],
+    broadcastEligible: [],
+    delivered: [],
+  },
+  lastScans: [],
+  lastSuppressed: [],
 };
 
 // Ring buffer of last N candidates that passed the Hunt vol/liq filter.
 // Persists in memory only — used by /huntlast to show delivery status.
 const lastCandidates = [];
 const MAX_LAST_CANDIDATES = 5;
+const MAX_LAST_BUFFERS = 10;
+const ROLLING_WINDOW_MS = 60 * 60 * 1000;
+
+function markRolling(bucket, count = 1) {
+  const arr = stats.skipWindow[bucket];
+  if (!Array.isArray(arr)) return;
+  const now = Date.now();
+  for (let i = 0; i < count; i++) arr.push(now);
+  while (arr.length && now - arr[0] > ROLLING_WINDOW_MS) arr.shift();
+}
+
+function rollingCount(bucket) {
+  const arr = stats.skipWindow[bucket];
+  if (!Array.isArray(arr)) return 0;
+  const now = Date.now();
+  while (arr.length && now - arr[0] > ROLLING_WINDOW_MS) arr.shift();
+  return arr.length;
+}
+
+function pushBuffer(key, value) {
+  if (!Array.isArray(stats[key])) stats[key] = [];
+  stats[key].unshift(value);
+  if (stats[key].length > MAX_LAST_BUFFERS) stats[key].pop();
+}
 
 function enqueue(job, broadcaster) {
   job.enqueuedAt = Date.now();
@@ -274,7 +325,12 @@ async function runScan(job, broadcaster) {
       }),
       fetchSocialData(ca),
     ]);
-    if (!data?.codex) { stats.skipped++; return; }
+    if (!data?.codex && !data?.pump) {
+      stats.skipped++;
+      markRolling('marketDataMissing');
+      pushBuffer('lastScans', { ts: Date.now(), ca, mc: null, adjustedVolLiq: null, cls: null, skipReason: 'market data missing' });
+      return;
+    }
     data.social = social;
 
     const result = scan(data);
@@ -282,12 +338,25 @@ async function runScan(job, broadcaster) {
     result.scannedAt = Date.now();
     result.patternMatch = matchLearnedPattern(result);
     const adjustedVolLiq = result.signals?.adjustedVolLiq ?? 0;
+    if ((result?.oracleScore?.hardBlocks || []).length) markRolling('hardBlocks');
 
     // Pro/Elite dev floor: 2.0x — see proven devs before they move, not after.
     // Standard floor (MIN_VOLLIQ_BROADCAST = 3.0x) applies to everyone else.
     const isPilotDev     = result.signals?.isEliteDev || result.signals?.isProPilot;
     const broadcastFloor = isPilotDev ? 2.0 : MIN_VOLLIQ_BROADCAST;
-    if (adjustedVolLiq < broadcastFloor) { stats.skipped++; return; }
+    if (adjustedVolLiq < broadcastFloor) {
+      stats.skipped++;
+      markRolling('belowVolLiqFloor');
+      pushBuffer('lastScans', {
+        ts: Date.now(),
+        ca,
+        mc: result.signals?.marketCap ?? null,
+        adjustedVolLiq,
+        cls: result.oracleScore?.class || result.verdict,
+        skipReason: `below vol/liq floor (${adjustedVolLiq.toFixed(2)}x < ${broadcastFloor.toFixed(2)}x)`,
+      });
+      return;
+    }
 
     // Age gate for Dex-fallback candidates: DexScreener token-profiles and
     // community-takeovers endpoints return tokens of ANY age.
@@ -295,7 +364,16 @@ async function runScan(job, broadcaster) {
     const AGE_MAX_FALLBACK = (config.AGE_MAX_MIN || 60) * 3; // 3h for profile/CTO
     if (source?.startsWith('dexscreener') && ageMinutes !== null && ageMinutes > AGE_MAX_FALLBACK) {
       console.log(`[hunt] ${ca} age-gated: ${ageMinutes}m > ${AGE_MAX_FALLBACK}m (${source})`);
-      stats.skipped++; return;
+      stats.skipped++;
+      pushBuffer('lastScans', {
+        ts: Date.now(),
+        ca,
+        mc: result.signals?.marketCap ?? null,
+        adjustedVolLiq,
+        cls: result.oracleScore?.class || result.verdict,
+        skipReason: `age-gated fallback (${ageMinutes}m)`,
+      });
+      return;
     }
 
     const rawSym = data.codex?.symbol || data.pump?.symbol || '???';
@@ -365,6 +443,14 @@ async function runScan(job, broadcaster) {
     result.requiredStack = requiredStack;
     if (!requiredStack.pass) {
       markSuppressed(ca, result, `required stack failed: ${requiredStack.reasons.join(', ')}`);
+      pushBuffer('lastScans', {
+        ts: Date.now(),
+        ca,
+        mc: result.signals?.marketCap ?? null,
+        adjustedVolLiq,
+        cls: result.oracleScore?.class || result.verdict,
+        skipReason: `required stack failed: ${requiredStack.reasons.join(', ')}`,
+      });
       return;
     }
 
@@ -384,8 +470,20 @@ async function runScan(job, broadcaster) {
         };
       } else {
         markSuppressed(ca, result, finalGate.reason);
+        pushBuffer('lastScans', {
+          ts: Date.now(),
+          ca,
+          mc: result.signals?.marketCap ?? null,
+          adjustedVolLiq,
+          cls: result.oracleScore?.class || result.verdict,
+          skipReason: finalGate.reason,
+        });
         return;
       }
+    }
+    markRolling('broadcastEligible');
+    if (String(result.oracleScore?.class || result.verdict || '').toUpperCase() === 'PEARL_WATCH') {
+      markRolling('pearlWatchSent');
     }
 
     // Grok executes only after final gate and only when Telegram attempts will occur.
@@ -439,6 +537,7 @@ async function runScan(job, broadcaster) {
 
     const delivery = await broadcaster(ca, mc, header + message, result.oracleScore?.class || result.verdict);
     recentlyBroadcast.set(ca, Date.now());
+    if (delivery.delivered > 0) markRolling('delivered');
 
     const candidateEntry = {
       ca,
@@ -456,6 +555,14 @@ async function runScan(job, broadcaster) {
     };
     lastCandidates.unshift(candidateEntry);
     if (lastCandidates.length > MAX_LAST_CANDIDATES) lastCandidates.pop();
+    pushBuffer('lastScans', {
+      ts: Date.now(),
+      ca,
+      mc,
+      adjustedVolLiq,
+      cls: result.oracleScore?.class || result.verdict,
+      skipReason: delivery.delivered > 0 ? null : (delivery.errors[0] || 'delivery_failed'),
+    });
 
     console.log(`[hunt] broadcast ${ca.slice(0,8)} — delivered:${delivery.delivered} failed:${delivery.failed}${delivery.errors[0] ? ` err:${delivery.errors[0]}` : ''}`);
   } catch (e) {
@@ -849,8 +956,20 @@ function stopDexFallback() {
 function status() {
   const staleWs = connectedAt !== null && wsIsStale();
   const apiStats = getApiStats();
+  const skipCounts60m = {
+    belowVolLiqFloor: rollingCount('belowVolLiqFloor'),
+    marketDataMissing: rollingCount('marketDataMissing'),
+    requiredStackFailed: rollingCount('requiredStackFailed'),
+    classNotAllowed: rollingCount('classNotAllowed'),
+    dirtyRunnerConfidenceTooLow: rollingCount('dirtyRunnerConfidenceTooLow'),
+    pearlWatchSent: rollingCount('pearlWatchSent'),
+    suppressedPearlCandidates: rollingCount('suppressedPearlCandidates'),
+    hardBlocks: rollingCount('hardBlocks'),
+    broadcastEligible: rollingCount('broadcastEligible'),
+    delivered: rollingCount('delivered'),
+  };
   return {
-    alertMode: 'strict-v38',
+    alertMode: 'strict-v40',
     allowedVerdicts: getAllowedHuntVerdicts(),
     socialDataKeyConfigured: !!process.env.SOCIALDATA_API_KEY,
     socialDataCalls: apiStats.SocialData?.calls ?? 0,
@@ -879,6 +998,9 @@ function status() {
     lastConstructError,
     wsReadyState: ws ? ws.readyState : null,
     lastCandidates: [...lastCandidates],
+    skipCounts60m,
+    lastScans: [...(stats.lastScans || [])],
+    lastSuppressed: [...(stats.lastSuppressed || [])],
     ...stats,
   };
 }

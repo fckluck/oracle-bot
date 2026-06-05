@@ -49,6 +49,18 @@ function isRemovedWinnerImprint(entry = {}) {
 function normalizeRecord(rec) {
   const outcome = rec.outcome ?? 'UNRESOLVED';
   const holderHealthPct = rec.holderHealthPct ?? rec.holderHealth?.healthPct ?? null;
+  const scanMc = rec.scanMc ?? rec.mc ?? null;
+  const peakMc = rec.peakMc ?? scanMc ?? null;
+  const firstSeenMc = rec.firstSeenMc ?? scanMc ?? null;
+  const alertMc = rec.alertMc ?? scanMc ?? null;
+  const firstSeenAt = rec.firstSeenAt ?? rec.scanTime ?? rec.scannedAt ?? Date.now();
+  const alertAt = rec.alertAt ?? rec.scanTime ?? rec.scannedAt ?? Date.now();
+  const currentMc = rec.currentMc ?? scanMc ?? null;
+  const multipleFromFirstSeen = firstSeenMc > 0 && peakMc > 0 ? peakMc / firstSeenMc : null;
+  const multipleFromAlert = alertMc > 0 && peakMc > 0 ? peakMc / alertMc : null;
+  const promotionDelayMinutes = firstSeenAt > 0 && alertAt > 0
+    ? Math.max(0, Math.round((alertAt - firstSeenAt) / 60000))
+    : null;
 
   return {
     ca: rec.ca,
@@ -58,11 +70,25 @@ function normalizeRecord(rec) {
     oracleScoreTotal: rec.oracleScoreTotal ?? rec.oracleScore?.total ?? null,
     oracleScoreClass: rec.oracleScoreClass ?? rec.oracleScore?.class ?? null,
     entryTier: rec.entryTier ?? null,
-    scanMc: rec.scanMc ?? rec.mc ?? null,
-    peakMc: rec.peakMc ?? rec.scanMc ?? rec.mc ?? null,
-    currentMc: rec.currentMc ?? null,
+    scanMc,
+    peakMc,
+    currentMc,
     scannedAt: rec.scannedAt ?? rec.scanTime ?? Date.now(),
     scanTime: rec.scanTime ?? rec.scannedAt ?? Date.now(),
+    firstSeenMc,
+    firstSeenAt,
+    firstSeenSource: rec.firstSeenSource ?? rec.source ?? null,
+    firstSeenClass: rec.firstSeenClass ?? rec.oracleScoreClass ?? rec.verdict ?? null,
+    alertMc,
+    alertAt,
+    alertClass: rec.alertClass ?? rec.oracleScoreClass ?? rec.verdict ?? null,
+    promotionDelayMinutes,
+    trackEntryMc: rec.trackEntryMc ?? null,
+    guardianPeakMc: rec.guardianPeakMc ?? rec.peakMc ?? null,
+    trueAthMc: rec.trueAthMc ?? null,
+    multipleFromFirstSeen,
+    multipleFromAlert,
+    promotionAlerted: !!rec.promotionAlerted,
     lastChecked: rec.lastChecked ?? 0,
     adjustedVolLiq: rec.adjustedVolLiq ?? null,
     rawVolLiq: rec.rawVolLiq ?? null,
@@ -153,6 +179,33 @@ function normalizeFingerprint(fp = {}) {
   };
 }
 
+function classPriority(cls) {
+  const key = String(cls || '').toUpperCase();
+  const rank = {
+    ORACLE_BUY: 100,
+    MISSED_WINNER_MATCH: 90,
+    DIRTY_RUNNER_WATCH: 80,
+    PEARL_WATCH: 70,
+    RISKY_RUNNER: 60,
+    WATCH_VOL: 50,
+    WATCH_WASH: 45,
+    WATCH: 40,
+    ALERT: 35,
+    SKIP: 30,
+    NO_GO: 20,
+    AVOID: 10,
+  };
+  return rank[key] ?? 0;
+}
+
+function isCatastrophicRecord(entry = {}) {
+  if (entry.sybilFunded) return true;
+  if (entry.washPct != null && Number(entry.washPct) > 50) return true;
+  if (!(Number(entry.scanMc || entry.firstSeenMc || 0) > 0)) return true;
+  if (entry.lp != null && Number(entry.lp) < 0) return true;
+  return false;
+}
+
 function archiveCorruptFile(filePath, reason) {
   try {
     if (!fs.existsSync(filePath)) return null;
@@ -238,8 +291,74 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
   loadAudit();
 
   const now = Date.now();
-  const dupeWindowMs = 5 * 60 * 1000;
-  if (auditQueue.some(e => e.ca === ca && now - e.scanTime < dupeWindowMs)) return;
+  const existingIdx = auditQueue.findIndex(e => e.ca === ca && !e.resolved);
+  if (existingIdx >= 0) {
+    const existing = auditQueue[existingIdx];
+    const currentMc = scanMc ?? existing.currentMc ?? existing.scanMc ?? existing.firstSeenMc ?? null;
+    const peakMc = Math.max(existing.peakMc ?? 0, currentMc ?? 0, existing.currentMc ?? 0);
+    const incomingClass = extra.oracleScoreClass || verdict;
+    const prevClass = existing.alertClass || existing.oracleScoreClass || existing.verdict;
+    const classChanged = String(prevClass || '').toUpperCase() !== String(incomingClass || '').toUpperCase();
+    const classImproved = classPriority(incomingClass) > classPriority(prevClass);
+    const shouldRefreshAlert = classChanged || classImproved;
+
+    const updated = normalizeRecord({
+      ...existing,
+      ticker: ticker || existing.ticker,
+      symbol: ticker || existing.symbol,
+      verdict,
+      entryTier: entryTier ?? existing.entryTier,
+      oracleScoreClass: incomingClass ?? existing.oracleScoreClass,
+      oracleScoreTotal: extra.oracleScoreTotal ?? existing.oracleScoreTotal,
+      currentMc: currentMc ?? existing.currentMc,
+      peakMc,
+      firstSeenMc: existing.firstSeenMc ?? existing.scanMc ?? scanMc ?? null,
+      firstSeenAt: existing.firstSeenAt ?? existing.scanTime ?? now,
+      firstSeenSource: existing.firstSeenSource ?? existing.source ?? extra.source ?? null,
+      firstSeenClass: existing.firstSeenClass ?? existing.oracleScoreClass ?? existing.verdict ?? incomingClass,
+      alertMc: shouldRefreshAlert ? (currentMc ?? existing.alertMc ?? existing.scanMc ?? null) : (existing.alertMc ?? existing.scanMc ?? currentMc ?? null),
+      alertAt: shouldRefreshAlert ? now : (existing.alertAt ?? existing.scanTime ?? now),
+      alertClass: shouldRefreshAlert ? incomingClass : (existing.alertClass ?? incomingClass),
+      lastChecked: now,
+      adjustedVolLiq: extra.adjustedVolLiq ?? existing.adjustedVolLiq,
+      rawVolLiq: extra.rawVolLiq ?? existing.rawVolLiq,
+      lp: extra.lp ?? existing.lp,
+      top10Pct: extra.top10Pct ?? existing.top10Pct,
+      top50Pct: extra.top50Pct ?? existing.top50Pct,
+      holderCount: extra.holderCount ?? existing.holderCount,
+      holderHealthPct: extra.holderHealthPct ?? existing.holderHealthPct,
+      bundleCount: extra.bundleCount ?? existing.bundleCount,
+      sybilFunded: extra.sybilFunded ?? existing.sybilFunded,
+      washPct: extra.washPct ?? existing.washPct,
+      isEliteDev: extra.isEliteDev ?? existing.isEliteDev,
+      successRatePct: extra.successRatePct ?? existing.successRatePct,
+      devLaunches: extra.devLaunches ?? existing.devLaunches,
+      peakMultiplier: extra.peakMultiplier ?? existing.peakMultiplier,
+      ageMinutes: extra.ageMinutes ?? existing.ageMinutes,
+      timeWindow: extra.timeWindow ?? existing.timeWindow,
+      socialMentions15m: extra.socialMentions15m ?? existing.socialMentions15m,
+      uniqueAccounts: extra.uniqueAccounts ?? existing.uniqueAccounts,
+      narrativeType: extra.narrativeType ?? existing.narrativeType,
+      narrativeStrength: extra.narrativeStrength ?? existing.narrativeStrength,
+      narrativeReason: extra.narrativeReason ?? existing.narrativeReason,
+      noGoReason: extra.noGoReason ?? existing.noGoReason,
+      watchReason: extra.watchReason ?? existing.watchReason,
+      headlineType: extra.headlineType ?? existing.headlineType,
+      blueprintAction: extra.blueprintAction ?? existing.blueprintAction,
+      blueprintConfidence: extra.blueprintConfidence ?? existing.blueprintConfidence,
+      blueprintMatches: extra.blueprintMatches ?? existing.blueprintMatches,
+      blueprintReason: extra.blueprintReason ?? existing.blueprintReason,
+      trackEntryMc: extra.trackEntryMc ?? existing.trackEntryMc,
+      guardianPeakMc: extra.guardianPeakMc ?? existing.guardianPeakMc,
+      trueAthMc: extra.trueAthMc ?? existing.trueAthMc,
+      source: extra.source ?? existing.source,
+      resolved: false,
+      outcome: 'UNRESOLVED',
+    });
+    auditQueue[existingIdx] = updated;
+    saveAudit();
+    return;
+  }
 
   if (auditQueue.length >= MAX_ENTRIES) auditQueue.shift();
   auditQueue.push(normalizeRecord({
@@ -250,8 +369,23 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
     entryTier,
     scanMc: scanMc ?? null,
     peakMc: scanMc ?? null,
+    currentMc: scanMc ?? null,
     scannedAt: now,
     scanTime: now,
+    firstSeenMc: scanMc ?? null,
+    firstSeenAt: now,
+    firstSeenSource: extra.source ?? null,
+    firstSeenClass: extra.oracleScoreClass ?? verdict,
+    alertMc: scanMc ?? null,
+    alertAt: now,
+    alertClass: extra.oracleScoreClass ?? verdict,
+    promotionDelayMinutes: 0,
+    trackEntryMc: extra.trackEntryMc ?? null,
+    guardianPeakMc: extra.guardianPeakMc ?? scanMc ?? null,
+    trueAthMc: extra.trueAthMc ?? null,
+    multipleFromFirstSeen: 1,
+    multipleFromAlert: 1,
+    promotionAlerted: false,
     lastChecked: 0,
     adjustedVolLiq: extra.adjustedVolLiq,
     rawVolLiq: extra.rawVolLiq,
@@ -297,6 +431,7 @@ function recordScan({
   socialMentions15m, uniqueAccounts, narrativeType, narrativeStrength, narrativeReason,
   noGoReason, watchReason, headlineType, oracleScoreTotal, oracleScoreClass, source,
   blueprintAction, blueprintConfidence, blueprintMatches, blueprintReason,
+  trackEntryMc, guardianPeakMc, trueAthMc,
 }) {
   addToAudit(ca, symbol, verdict, entryTier, mc, {
     adjustedVolLiq,
@@ -329,6 +464,9 @@ function recordScan({
     blueprintConfidence,
     blueprintMatches,
     blueprintReason,
+    trackEntryMc,
+    guardianPeakMc,
+    trueAthMc,
     source,
   });
 }
@@ -408,6 +546,16 @@ function pushFingerprint(entry) {
 }
 
 async function processBatch(bot, fetchMcFn) {
+  const promotableOriginalClasses = new Set([
+    'WATCH',
+    'WATCH_VOL',
+    'DIRTY_RUNNER_WATCH',
+    'PEARL_WATCH',
+    'SKIP',
+    'NO_GO',
+    'RISKY_RUNNER',
+    'ALERT',
+  ]);
   const pending = auditQueue
     .filter(e => !e.resolved)
     .sort((a, b) => (a.lastChecked || 0) - (b.lastChecked || 0))
@@ -419,7 +567,46 @@ async function processBatch(bot, fetchMcFn) {
       const currentMc = await resolveMc(fetchMcFn, entry.ca);
       entry.lastChecked = Date.now();
       if (currentMc == null) continue;
+      entry.currentMc = currentMc;
       if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
+      if (entry.trueAthMc == null || currentMc > entry.trueAthMc) entry.trueAthMc = currentMc;
+      entry.guardianPeakMc = Math.max(entry.guardianPeakMc || 0, entry.peakMc || 0, currentMc || 0);
+      entry.multipleFromFirstSeen = entry.firstSeenMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.firstSeenMc : null;
+      entry.multipleFromAlert = entry.alertMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.alertMc : null;
+      entry.promotionDelayMinutes = entry.firstSeenAt > 0 && entry.alertAt > 0
+        ? Math.max(0, Math.round((entry.alertAt - entry.firstSeenAt) / 60000))
+        : null;
+
+      const firstSeenClass = String(entry.firstSeenClass || entry.verdict || '').toUpperCase();
+      const firstSeenMc = Number(entry.firstSeenMc || 0);
+      const moveFromFirst = Number(entry.multipleFromFirstSeen || 0);
+      const isHuntOrigin = String(entry.firstSeenSource || entry.source || '').toLowerCase().includes('hunt');
+      const catastrophic = isCatastrophicRecord(entry);
+      if (
+        bot &&
+        process.env.OWNER_TELEGRAM_ID &&
+        !entry.promotionAlerted &&
+        !entry.resolved &&
+        isHuntOrigin &&
+        firstSeenMc >= 9_000 &&
+        firstSeenMc <= 45_000 &&
+        moveFromFirst >= 1.5 &&
+        promotableOriginalClasses.has(firstSeenClass) &&
+        !catastrophic
+      ) {
+        const symbol = entry.ticker || entry.symbol || entry.ca.slice(0, 8);
+        const msg = `🦪 HUNT PEARL PROMOTED\n\n`
+          + `Hunt saw this earlier.\n`
+          + `Token: ${symbol}\n`
+          + `CA: ${entry.ca}\n`
+          + `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n`
+          + `Current/Peak: ${fmtUsdCompact(entry.currentMc)}/${fmtUsdCompact(entry.peakMc)}\n`
+          + `Move From First Seen: ${moveFromFirst.toFixed(2)}x\n`
+          + `Original Class: ${entry.firstSeenClass || entry.verdict}\n\n`
+          + `Action: chart/track now. Chase guard applies; no blind entry if already extended.`;
+        bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
+        entry.promotionAlerted = true;
+      }
 
       if (Date.now() - entry.scanTime >= RESOLVE_MS) {
         entry.resolved = true;
@@ -607,6 +794,9 @@ async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false,
     if (currentMc == null) continue;
     entry.currentMc = currentMc;
     if (entry.peakMc == null || currentMc > entry.peakMc) entry.peakMc = currentMc;
+    if (entry.trueAthMc == null || currentMc > entry.trueAthMc) entry.trueAthMc = currentMc;
+    entry.multipleFromFirstSeen = entry.firstSeenMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.firstSeenMc : null;
+    entry.multipleFromAlert = entry.alertMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.alertMc : null;
     if (Date.now() - entry.scanTime >= RESOLVE_MS) {
       entry.resolved = true;
       entry.outcome = classify(entry);
@@ -790,7 +980,8 @@ function findOriginalScanEntry(ca) {
   }, 0);
   return {
     ...original,
-    highestPeakMc: highestPeak || (original.scanMc ?? original.originalScanMc ?? 0),
+    scanMc: original.scanMc ?? original.firstSeenMc ?? original.originalScanMc ?? null,
+    highestPeakMc: highestPeak || (original.peakMc ?? original.scanMc ?? original.firstSeenMc ?? original.originalScanMc ?? 0),
   };
 }
 

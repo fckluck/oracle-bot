@@ -4,7 +4,7 @@ const config = {
   // Accept both names: Railway/live may use TELEGRAM_BOT_TOKEN,
   // older docs/dev env may use BOT_TOKEN.
   TELEGRAM_BOT_TOKEN:  process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '',
-  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v38.6 — Controlled-Dirty Runner Patch',
+  ORACLE_VERSION:      process.env.ORACLE_VERSION || 'Oracle v40.0 — Pearl Extraction Stability Freeze',
   GMGN_API_KEY:        process.env.GMGN_API_KEY        || '',
   OWNER_TELEGRAM_ID:   process.env.OWNER_TELEGRAM_ID   || '',
   PUMPPORTAL_API_KEY:  process.env.PUMPPORTAL_API_KEY  || '',

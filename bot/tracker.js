@@ -1,6 +1,6 @@
-// Oracle Guardian v2.5 — Forensic Shield (Final)
-// 60s forensic loop: cluster exit (top50 -3%), dev fee-loader, momentum decay,
-// LP floor, Guardian Peak SL. 5m heartbeat: holders/top50/LP flow snapshot + saturation.
+// Oracle Guardian v2.6 — Forensic Shield (Stability Freeze)
+// 60s forensic loop: top50 decentralization-aware exits, dev fee-loader, momentum decay,
+// LP floor, Guardian Peak SL, capture/reclaim alerts. 5m heartbeat snapshots.
 // Lightweight fetch (fetchForensic) cuts per-poll API load ~70% vs full scan.
 // Positions persisted to disk — survive bot restarts/crashes.
 
@@ -81,6 +81,8 @@ function loadFromDisk() {
       p.lastDipBuyLocalLowMc = p.lastDipBuyLocalLowMc ?? null;
       p.lastDipBuyInvalidationAt = p.lastDipBuyInvalidationAt ?? 0;
       p.entryAdjustedVolLiq = p.entryAdjustedVolLiq ?? null;
+      p.retraceWarningAt = p.retraceWarningAt ?? 0;
+      p.lastReclaimAlertAt = p.lastReclaimAlertAt ?? 0;
       positions.set(p.ca, p);
     }
     if (positions.size > 0) {
@@ -103,6 +105,11 @@ function fmtUsd(n) {
 function fmtChange(n) {
   if (n == null || isNaN(n)) return 'N/A';
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+}
+
+function fmtLpDisplay(lp, mc) {
+  if (lp != null && lp <= 0 && mc != null && mc > 0) return `Curve / pre-migration (MC proxy ${fmtUsd(mc)})`;
+  return fmtUsd(lp);
 }
 
 function heliusRpc() {
@@ -301,6 +308,8 @@ function track(ca, chatId, currentMc, entryTier, timeWindow, devWallet, holderCo
     lastDipBuyLocalLowMc: null,
     lastDipBuyInvalidationAt: 0,
     entryAdjustedVolLiq: null,
+    retraceWarningAt: 0,
+    lastReclaimAlertAt: 0,
     alertedFlags: new Set(),
   };
   positions.set(ca, pos);
@@ -472,10 +481,9 @@ async function checkPosition(pos, bot) {
       }
     }
 
-    // ── A. Top-50 Cluster Exit ───────────────────────────────────────────────
-    // Watches combined supply % held by top 50 wallets.
-    // If it drops >3% from the baseline snapshot, sub-wallets are coordinating an exit.
-    // Uses 5-minute rolling window to confirm the move is sustained (not a blip).
+    // ── A. Top-50 decentralization vs cluster exit ───────────────────────────
+    // Top50 drop is often healthy distribution; only treat as cluster exit when
+    // accompanied by at least two damage flags.
     if (
       top50Pct !== null &&
       pos.entryTop50Pct !== null &&
@@ -483,14 +491,81 @@ async function checkPosition(pos, bot) {
     ) {
       const drop = pos.entryTop50Pct - top50Pct;
       if (drop >= 3) {
-        addHardDanger('CLUSTER_EXIT', `top50 supply dropped ${drop.toFixed(1)}%`, 'EXIT');
+        const holdersDown = pos.entryHolderCount != null && holderCount != null && holderCount < pos.entryHolderCount * 0.97;
+        const lpDown = pos.entryLp != null && lp != null && pos.entryLp > 0 && lp < pos.entryLp * 0.90;
+        const mcWeak = pos.entryMc != null && mc != null && pos.entryMc > 0 && mc < pos.entryMc * 0.90;
+        const volWeak = adjustedVolLiq != null && adjustedVolLiq < 2 && (sig.change1h ?? 0) < 0;
+        const top10Worse = pos.entryTop10Pct != null && top10Pct != null && top10Pct > pos.entryTop10Pct + 2;
+        const damageFlags = [holdersDown, lpDown, mcWeak, volWeak, top10Worse].filter(Boolean);
+        const healthyTop50Drop =
+          !holdersDown &&
+          !lpDown &&
+          !top10Worse &&
+          (mc == null || pos.entryMc == null || mc >= pos.entryMc * 0.90 || mc >= pos.peakMc * 0.85) &&
+          (adjustedVolLiq == null || adjustedVolLiq >= 3 || (pos.entryAdjustedVolLiq != null && adjustedVolLiq >= pos.entryAdjustedVolLiq * 0.80));
+
+        if (damageFlags.length >= 2) {
+          addHardDanger('CLUSTER_EXIT', `top50 drop ${drop.toFixed(1)}% + ${damageFlags.length} damage flags`, 'EXIT');
+          alerts.push(
+            `🚨 *CLUSTER EXIT DETECTED*\n` +
+            `Top 50 supply dropped *${drop.toFixed(1)}%* ` +
+            `(${pos.entryTop50Pct.toFixed(1)}% → ${top50Pct.toFixed(1)}%)\n` +
+            `Damage flags: ${damageFlags.length} (holders/LP/MC/flow/top10 deterioration).\n→ *EXIT 100% NOW*`
+          );
+          pos.alertedFlags.add('CLUSTER_EXIT');
+        } else if (healthyTop50Drop && !pos.alertedFlags.has('TOP50_DECENTRALIZING')) {
+          alerts.push(
+            `✅ *TOP50 DECENTRALIZING*\n` +
+            `Top50 supply dropped *${drop.toFixed(1)}%* while holders/LP/flow remain intact.\n` +
+            `Read: healthy distribution / buyer expansion, not cluster exit.`
+          );
+          pos.alertedFlags.add('TOP50_DECENTRALIZING');
+        }
+      }
+    }
+
+    // ── A2. Capture mode (Guardian Peak-based, never ATH wording) ───────────
+    if (pos.entryMc > 0 && mc > 0) {
+      const gainPct = ((mc - pos.entryMc) / pos.entryMc) * 100;
+      const gpRetracePct = pos.peakMc > 0 ? ((pos.peakMc - mc) / pos.peakMc) * 100 : 0;
+
+      if (gainPct >= 35 && !pos.alertedFlags.has('CAPTURE_35')) {
+        alerts.push(`🛡️ *CAPTURE MODE +35%*\nMove from entry: *+${gainPct.toFixed(1)}%*.\nAction: protect initials now.`);
+        pos.alertedFlags.add('CAPTURE_35');
+      }
+      if (gainPct >= 50 && !pos.alertedFlags.has('CAPTURE_50')) {
+        alerts.push(`🛡️ *CAPTURE MODE +50%*\nMove from entry: *+${gainPct.toFixed(1)}%*.\nAction: trim required.`);
+        pos.alertedFlags.add('CAPTURE_50');
+      }
+      if (gainPct >= 70 && !pos.alertedFlags.has('CAPTURE_70')) {
+        alerts.push(`🛡️ *CAPTURE MODE +70% to +100%*\nMove from entry: *+${gainPct.toFixed(1)}%*.\nAction: exit most or trail tightly from Guardian Peak.`);
+        pos.alertedFlags.add('CAPTURE_70');
+      }
+
+      if (gpRetracePct >= 25 && gpRetracePct <= 30 && !pos.alertedFlags.has('GUARDIAN_PEAK_RETRACE_WARN')) {
         alerts.push(
-          `🚨 *CLUSTER EXIT DETECTED*\n` +
-          `Top 50 supply dropped *${drop.toFixed(1)}%* ` +
-          `(${pos.entryTop50Pct.toFixed(1)}% → ${top50Pct.toFixed(1)}%)\n` +
-          `Sub-wallets are coordinating an exit.\n→ *EXIT 100% NOW*`
+          `🔴 *GUARDIAN PEAK RETRACE WARNING*\n` +
+          `Retrace: *${gpRetracePct.toFixed(1)}%* from Guardian Peak ${fmtUsd(pos.peakMc)}.\n` +
+          `Action: tighten risk immediately.`
         );
-        pos.alertedFlags.add('CLUSTER_EXIT');
+        pos.alertedFlags.add('GUARDIAN_PEAK_RETRACE_WARN');
+        pos.retraceWarningAt = now;
+      }
+      if (
+        pos.retraceWarningAt > 0 &&
+        now - pos.retraceWarningAt >= 2 * POLL_INTERVAL &&
+        mc < pos.peakMc * 0.80 &&
+        (sig.change1h ?? 0) < 0 &&
+        adjustedVolLiq != null &&
+        adjustedVolLiq < 2.5 &&
+        !pos.alertedFlags.has('FAILED_RECLAIM_WARNING')
+      ) {
+        alerts.push(
+          `🔴 *FAILED RECLAIM AFTER DUMP*\n` +
+          `Price failed to reclaim after Guardian Peak retrace.\n` +
+          `Action: exit warning — avoid blind hold.`
+        );
+        pos.alertedFlags.add('FAILED_RECLAIM_WARNING');
       }
     }
 
@@ -620,6 +695,36 @@ async function checkPosition(pos, bot) {
         pos.lastDipBuyLocalLowMc = localLow;
         pos.lastDipBuyInvalidationAt = 0;
       }
+
+      const hadPriorWarning =
+        pos.alertedFlags.has('CAPTURE_50') ||
+        pos.alertedFlags.has('GUARDIAN_PEAK_RETRACE_WARN') ||
+        pos.alertedFlags.has('FAILED_RECLAIM_WARNING') ||
+        pos.alertedFlags.has('ATH_SL');
+      const reclaimCooldownOk = now - (pos.lastReclaimAlertAt || 0) >= 10 * 60 * 1000;
+      const reclaimThreshold = Math.max(localLow * 1.15, (pos.entryMc || 0) * 0.95, (pos.lastDipBuyLocalLowMc || 0) * 1.12);
+      const reclaiming = mc >= reclaimThreshold && mc < pos.peakMc;
+      if (
+        hadPriorWarning &&
+        reclaimCooldownOk &&
+        hardActive.length === 0 &&
+        reclaiming &&
+        holderStable &&
+        lpStable &&
+        top50Stable &&
+        volStable &&
+        !pos.alertedFlags.has('RECLAIM_SECOND_CHANCE')
+      ) {
+        alerts.push(
+          `🟢 *RECLAIM WATCH / SECOND CHANCE*\n` +
+          `CA: \`${shortCa}\`\n` +
+          `MC reclaimed local level after pullback.\n` +
+          `Holders/LP/Top50 remain stable and flow is still active.\n` +
+          `Action: continuation watch only — no blind chase.`
+        );
+        pos.alertedFlags.add('RECLAIM_SECOND_CHANCE');
+        pos.lastReclaimAlertAt = now;
+      }
     }
 
     // ── Guardian Peak stop-loss retrace + Shakeout Diagnostic ───────────────
@@ -712,7 +817,7 @@ async function checkPosition(pos, bot) {
       ``,
       `── *LIVE DIVERGENCE* ──`,
       `• *MC:* ${fmtUsd(mc)} | Guardian Peak: ${fmtUsd(pos.peakMc)}`,
-      `• *LP:* ${fmtUsd(lp)}${lpChange != null ? ` (${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} since entry)` : ''}`,
+      `• *LP:* ${fmtLpDisplay(lp, mc)}${lpChange != null ? ` (${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} since entry)` : ''}`,
       holdersAdded != null ? `• *Holders Added:* ${holdersAdded >= 0 ? '+' : ''}${holdersAdded}` : null,
       top50Change  != null ? `• *Top 50 Change:* ${top50Change >= 0 ? '+' : ''}${top50Change.toFixed(1)}% (now ${top50Pct.toFixed(1)}%)` : null,
       ``,
@@ -773,8 +878,8 @@ async function sendHeartbeat(pos, bot) {
         ? `• *Top 50 Change:* ${top50Change >= 0 ? '+' : ''}${top50Change.toFixed(1)}% (now ${top50Pct.toFixed(1)}%)`
         : `• *Top 50:* ${top50Pct != null ? top50Pct.toFixed(1) + '%' : 'N/A'}`,
       lpChange != null
-        ? `• *LP Flow:* ${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} → ${fmtUsd(lp)}`
-        : `• *LP:* ${fmtUsd(lp)}`,
+        ? `• *LP Flow:* ${lpChange >= 0 ? '+' : ''}${fmtUsd(lpChange)} → ${fmtLpDisplay(lp, mc)}`
+        : `• *LP:* ${fmtLpDisplay(lp, mc)}`,
       `• *MC:* ${fmtUsd(mc)} | Guardian Peak: ${fmtUsd(pos.peakMc)}`,
       `• *Vol/Liq:* ${sig.adjustedVolLiq != null ? sig.adjustedVolLiq.toFixed(2) + 'x' : 'N/A'}`,
     ].join('\n');
