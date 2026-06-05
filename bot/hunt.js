@@ -25,6 +25,7 @@ const { scan, evaluateRequiredStack } = require('./scanner');
 const { formatVerdict }    = require('./verdict');
 const { getSoulVerdict }   = require('./reasoning');
 const { recordScan, getPatternMemory, matchLearnedPattern } = require('./audit');
+const { evaluateHolderCohort } = require('./forensics');
 const { actionTimeLine } = require('./time');
 const { getApiStats, markApi } = require('./telemetry');
 const config               = require('./config');
@@ -334,6 +335,15 @@ async function runScan(job, broadcaster) {
     data.social = social;
 
     const result = scan(data);
+    const forensic = evaluateHolderCohort({
+      ca,
+      marketCap: result.signals?.marketCap,
+      ageMinutes: result.signals?.ageMinutes,
+      holders: data.holders,
+      topWallets: data.holders?.topWallets || [],
+      bundle: data.bundle,
+    });
+    result.forensics = forensic;
     result.social = social;
     result.scannedAt = Date.now();
     result.patternMatch = matchLearnedPattern(result);
@@ -436,6 +446,9 @@ async function runScan(job, broadcaster) {
       blueprintConfidence: result.blueprintMatch?.confidence,
       blueprintMatches: result.blueprintMatch?.matches,
       blueprintReason: result.blueprintMatch?.reason,
+      forensicsStatus: result.forensics?.status,
+      forensicsReason: result.forensics?.reason,
+      forensicsFeatures: result.forensics?.features,
       source:         'hunt',
     });
 
@@ -450,6 +463,19 @@ async function runScan(job, broadcaster) {
         adjustedVolLiq,
         cls: result.oracleScore?.class || result.verdict,
         skipReason: `required stack failed: ${requiredStack.reasons.join(', ')}`,
+      });
+      return;
+    }
+
+    if (result.forensics?.status === 'SCAMMERS' || result.forensics?.status === 'BOTTED') {
+      markSuppressed(ca, result, `forensics suppressed: ${result.forensics.status} — ${result.forensics.reason}`);
+      pushBuffer('lastScans', {
+        ts: Date.now(),
+        ca,
+        mc: result.signals?.marketCap ?? null,
+        adjustedVolLiq,
+        cls: result.oracleScore?.class || result.verdict,
+        skipReason: `forensics suppressed: ${result.forensics.status}`,
       });
       return;
     }
@@ -512,6 +538,9 @@ async function runScan(job, broadcaster) {
       grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || (config.GROK_REQUIRED_FOR_BUY ? 'required_missing' : 'not_required') },
       gmgn: { status: 'skipped', reason: 'audit_only' },
       rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
+      forensics: result.forensics
+        ? { status: result.forensics.status === 'UNKNOWN' ? 'skipped' : 'ok', reason: result.forensics.reason }
+        : { status: 'skipped', reason: 'not_run' },
     };
 
     const huntCardMode = String(config.HUNT_CARD_MODE || 'short').toLowerCase() === 'full' ? 'full' : 'short';

@@ -118,6 +118,9 @@ function normalizeRecord(rec) {
     blueprintConfidence: rec.blueprintConfidence ?? null,
     blueprintMatches: normalizeStringArray(rec.blueprintMatches),
     blueprintReason: rec.blueprintReason ?? null,
+    forensicsStatus: rec.forensicsStatus ?? null,
+    forensicsReason: rec.forensicsReason ?? null,
+    forensicsFeatures: rec.forensicsFeatures ?? null,
     source: rec.source ?? null,
 
     resolved: rec.resolved ?? outcome !== 'UNRESOLVED',
@@ -348,6 +351,9 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
       blueprintConfidence: extra.blueprintConfidence ?? existing.blueprintConfidence,
       blueprintMatches: extra.blueprintMatches ?? existing.blueprintMatches,
       blueprintReason: extra.blueprintReason ?? existing.blueprintReason,
+      forensicsStatus: extra.forensicsStatus ?? existing.forensicsStatus ?? null,
+      forensicsReason: extra.forensicsReason ?? existing.forensicsReason ?? null,
+      forensicsFeatures: extra.forensicsFeatures ?? existing.forensicsFeatures ?? null,
       trackEntryMc: extra.trackEntryMc ?? existing.trackEntryMc,
       guardianPeakMc: extra.guardianPeakMc ?? existing.guardianPeakMc,
       trueAthMc: extra.trueAthMc ?? existing.trueAthMc,
@@ -417,6 +423,9 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
     blueprintConfidence: extra.blueprintConfidence,
     blueprintMatches: extra.blueprintMatches,
     blueprintReason: extra.blueprintReason,
+    forensicsStatus: extra.forensicsStatus,
+    forensicsReason: extra.forensicsReason,
+    forensicsFeatures: extra.forensicsFeatures,
     source: extra.source,
     resolved: false,
     outcome: 'UNRESOLVED',
@@ -432,6 +441,7 @@ function recordScan({
   noGoReason, watchReason, headlineType, oracleScoreTotal, oracleScoreClass, source,
   blueprintAction, blueprintConfidence, blueprintMatches, blueprintReason,
   trackEntryMc, guardianPeakMc, trueAthMc,
+  forensicsStatus, forensicsReason, forensicsFeatures,
 }) {
   addToAudit(ca, symbol, verdict, entryTier, mc, {
     adjustedVolLiq,
@@ -464,6 +474,9 @@ function recordScan({
     blueprintConfidence,
     blueprintMatches,
     blueprintReason,
+    forensicsStatus,
+    forensicsReason,
+    forensicsFeatures,
     trackEntryMc,
     guardianPeakMc,
     trueAthMc,
@@ -582,6 +595,18 @@ async function processBatch(bot, fetchMcFn) {
       const moveFromFirst = Number(entry.multipleFromFirstSeen || 0);
       const isHuntOrigin = String(entry.firstSeenSource || entry.source || '').toLowerCase().includes('hunt');
       const catastrophic = isCatastrophicRecord(entry);
+      const forensicsStatus = String(entry.forensicsStatus || '').toUpperCase();
+      const forensicsBlocked = forensicsStatus === 'SCAMMERS' || forensicsStatus === 'BOTTED';
+      const firstSeen = Number(entry.firstSeenMc || entry.scanMc || 0);
+      const peak = Number(entry.peakMc || 0);
+      const current = Number(entry.currentMc || 0);
+      const drawdownFromPeak = peak > 0 && current > 0 ? (peak - current) / peak : 1;
+      const livePearl =
+        firstSeen > 0 &&
+        current >= firstSeen * 1.15 &&
+        peak > 0 &&
+        current >= peak * 0.65 &&
+        drawdownFromPeak <= 0.35;
       if (
         bot &&
         process.env.OWNER_TELEGRAM_ID &&
@@ -592,19 +617,41 @@ async function processBatch(bot, fetchMcFn) {
         firstSeenMc <= 45_000 &&
         moveFromFirst >= 1.5 &&
         promotableOriginalClasses.has(firstSeenClass) &&
-        !catastrophic
+        !catastrophic &&
+        !forensicsBlocked
       ) {
         const symbol = entry.ticker || entry.symbol || entry.ca.slice(0, 8);
-        const msg = `🦪 HUNT PEARL PROMOTED\n\n`
-          + `Hunt saw this earlier.\n`
-          + `Token: ${symbol}\n`
-          + `CA: ${entry.ca}\n`
-          + `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n`
-          + `Current/Peak: ${fmtUsdCompact(entry.currentMc)}/${fmtUsdCompact(entry.peakMc)}\n`
-          + `Move From First Seen: ${moveFromFirst.toFixed(2)}x\n`
-          + `Original Class: ${entry.firstSeenClass || entry.verdict}\n\n`
-          + `Action: chart/track now. Chase guard applies; no blind entry if already extended.`;
-        bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
+        if (livePearl) {
+          const msg = `🦪 HUNT PEARL PROMOTED\n\n`
+            + `Hunt saw this earlier.\n`
+            + `Token: ${symbol}\n`
+            + `CA: ${entry.ca}\n`
+            + `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n`
+            + `Current/Peak: ${fmtUsdCompact(entry.currentMc)}/${fmtUsdCompact(entry.peakMc)}\n`
+            + `Move From First Seen: ${moveFromFirst.toFixed(2)}x\n`
+            + `Original Class: ${entry.firstSeenClass || entry.verdict}\n\n`
+            + `Action: chart/track now. Chase guard applies; no blind entry if already extended.`;
+          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
+          entry.promotionAlerted = true;
+        } else if (moveFromFirst >= 1.5) {
+          entry.outcome = 'FAILED_PEARL';
+          entry.failureReason = 'moved then died before promotion';
+          entry.promotionAlerted = true;
+          const failMsg = `🔴 FAILED PEARL\n`
+            + `Hunt saw this earlier, but it died before promotion.\n`
+            + `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n`
+            + `Peak MC: ${fmtUsdCompact(entry.peakMc)}\n`
+            + `Current MC: ${fmtUsdCompact(entry.currentMc)}\n`
+            + `Lesson saved. No entry.`;
+          bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, failMsg).catch(() => {});
+        }
+      } else if (
+        moveFromFirst >= 1.5 &&
+        !entry.promotionAlerted &&
+        forensicsBlocked
+      ) {
+        entry.outcome = 'FAILED_PEARL';
+        entry.failureReason = `forensics_blocked_${forensicsStatus.toLowerCase()}`;
         entry.promotionAlerted = true;
       }
 

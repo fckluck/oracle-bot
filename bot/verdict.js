@@ -48,12 +48,34 @@ function fmtMult(n) {
   return `${n.toFixed(2)}x`;
 }
 
-function liquidityDisplay(signals = {}) {
-  if (Number(signals.lp || 0) <= 0 && !signals.isPostCurve) {
-    if (Number(signals.marketCap || 0) > 0) return `Curve / pre-migration (MC proxy ${fmtUsd(signals.marketCap)})`;
-    return 'Curve / pre-migration';
+function isPumpLikeToken(signals = {}, ca = '') {
+  const caText = String(ca || signals.ca || '');
+  const source = String(signals.source || signals.detectedSource || signals.huntSource || '').toLowerCase();
+
+  return (
+    caText.endsWith('pump') ||
+    signals.curvePct != null ||
+    signals.isMigration === true ||
+    signals.isPump === true ||
+    source.includes('pump') ||
+    source.includes('migration')
+  );
+}
+
+function liquidityDisplay(signals = {}, ca = '') {
+  const lp = Number(signals.lp || 0);
+  const mc = Number(signals.marketCap || 0);
+
+  if (lp > 0) return fmtUsd(lp);
+
+  if (isPumpLikeToken(signals, ca)) {
+    if (mc > 0) return `Curve / migration pending (MC proxy ${fmtUsd(mc)})`;
+    return 'Curve / migration pending';
   }
-  return fmtUsd(signals.lp);
+
+  if (mc > 0) return `LP unavailable (MC proxy ${fmtUsd(mc)})`;
+
+  return 'LP unavailable';
 }
 function recommendedSizing(result) {
   const cls = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
@@ -161,17 +183,16 @@ function formatShortCard(result, ca) {
   lines.push('');
   lines.push(b('Core:'));
   lines.push(`MC: ${fmtUsd(signals.marketCap)}`);
-  if (Number(signals.lp || 0) <= 0 && !signals.isPostCurve) {
-    lines.push(`LP: Curve / pre-migration`);
-    if (Number(signals.marketCap || 0) > 0) lines.push(`Curve Liquidity: MC proxy ${fmtUsd(signals.marketCap)}`);
-  } else {
-  lines.push(`LP: ${liquidityDisplay(signals)}`);
-  }
+  lines.push(`LP: ${liquidityDisplay(signals, ca)}`);
   lines.push(`Vol/Liq: ${fmt(signals.adjustedVolLiq, 2)}x`);
   lines.push(`Wash: ${fmtPct(signals.washPct, 0)}`);
   lines.push(`Top10: ${fmtPct(signals.top10Pct, 1)}`);
   lines.push(`Bundle: ${signals.bundleCount ?? 0}/slot`);
   lines.push(`Age: ${ageMinutes}`);
+  if (result.forensics?.oneLine) {
+    lines.push('');
+    lines.push(esc(result.forensics.oneLine));
+  }
   lines.push('');
   lines.push(b('Main Risk:'));
   lines.push(esc(mainRisk));
@@ -648,10 +669,15 @@ function formatVerdict(result, ca, options = {}) {
   L.push(`API Integrity: ${apiIntegrity}`);
   L.push('');
 
+  if (result.forensics?.oneLine) {
+    L.push(esc(result.forensics.oneLine));
+    L.push('');
+  }
+
   // ── LIVE METRICS ──────────────────────────────────────────────────────────
 
   L.push(b('── LIVE METRICS ──'));
-  L.push(`• ${b('MC:')} ${fmtUsd(mc)} | ${b('LP:')} ${liquidityDisplay(signals)} | ${b('Vol 1h:')} ${fmtUsd(signals.volume1h)}`);
+  L.push(`• ${b('MC:')} ${fmtUsd(mc)} | ${b('LP:')} ${liquidityDisplay(signals, ca)} | ${b('Vol 1h:')} ${fmtUsd(signals.volume1h)}`);
   L.push(`• ${b('Price:')} $${signals.priceUsd != null ? signals.priceUsd.toFixed(8) : 'N/A'} | ${b('1H \u0394:')} ${fmtChange(signals.change1h)}`);
   L.push(`• ${b('Age:')} ${signals.ageMinutes != null ? signals.ageMinutes + 'min' : 'N/A'} | ${b('Buys/Sells:')} ${signals.buyCount ?? 'N/A'}/${signals.sellCount ?? 'N/A'}`);
   L.push('');

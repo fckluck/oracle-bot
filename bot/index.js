@@ -9,6 +9,7 @@ const { actionTimeLine } = require('./time');
 const { apiStatusHtml, markApi } = require('./telemetry');
 const config    = require('./config');
 const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
+const { evaluateHolderCohort } = require('./forensics');
 const {
   recordScan,
   startAuditLoop,
@@ -125,6 +126,9 @@ function buildKeyboard(ca, currentMc, verdict) {
       { text: '📌 LEARN', callback_data: `learn:${ca}` },
       { text: '🧠 DETAILS', callback_data: `details:${ca}` },
     ],
+    [
+      { text: '🔎 FORENSICS', callback_data: `forensics:${ca}:${mc}` },
+    ],
   ];
   return { inline_keyboard: rows };
 }
@@ -156,6 +160,19 @@ async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
   const holders = sig?.holderCount ?? null;
   const top10 = sig?.top10Pct ?? null;
   const top50 = sig?.top50Pct ?? null;
+  const forensic = evaluateHolderCohort({
+    ca,
+    marketCap: sig?.marketCap ?? entryMc,
+    ageMinutes: sig?.ageMinutes ?? null,
+    holders: {
+      holderCount: sig?.holderCount ?? null,
+      top10Pct: sig?.top10Pct ?? null,
+      top20Pct: sig?.top20Pct ?? null,
+      top50Pct: sig?.top50Pct ?? null,
+    },
+    topWallets: sig?.topWallets || [],
+    bundle: null,
+  });
 
   const added = tracker.track(ca, chatId, entryMc, 'MANUAL', 'DISCOVERY', null, holders, top10, top50, entryLp);
   if (!added) {
@@ -173,6 +190,7 @@ async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
     `Holders: ${holders ?? 'N/A'}\n` +
     `Top 10: ${top10 != null ? top10.toFixed(1) + '%' : 'N/A'}\n` +
     `Top 50: ${top50 != null ? top50.toFixed(1) + '%' : 'N/A'}\n` +
+    `${forensic.oneLine}\n` +
     `Baseline: ${baseline}\n` +
     `Next poll: 60s`;
 
@@ -202,6 +220,15 @@ async function executeOracleScan(ca, {
   data.social = social;
   data.firstSeenMc = original?.firstSeenMc ?? original?.scanMc ?? null;
   const result = scan(data);
+  const forensic = evaluateHolderCohort({
+    ca,
+    marketCap: result.signals?.marketCap,
+    ageMinutes: result.signals?.ageMinutes,
+    holders: data.holders,
+    topWallets: data.holders?.topWallets || [],
+    bundle: data.bundle,
+  });
+  result.forensics = forensic;
   result.scannedAt = Date.now();
   result.social = social;
 
@@ -276,6 +303,9 @@ async function executeOracleScan(ca, {
     gmgn: { status: 'skipped', reason: 'audit_only_or_not_wired' },
     rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
   };
+  result.dataUsed.forensics = result.forensics
+    ? { status: result.forensics.status === 'UNKNOWN' ? 'skipped' : 'ok', reason: result.forensics.reason }
+    : { status: 'skipped', reason: 'not_run' };
 
   if (recordAuditEntry) {
     recordScan({
@@ -310,6 +340,9 @@ async function executeOracleScan(ca, {
       headlineType: result.headlineType,
       oracleScoreTotal: result.oracleScore?.total,
       oracleScoreClass: result.oracleScore?.class,
+      forensicsStatus: result.forensics?.status,
+      forensicsReason: result.forensics?.reason,
+      forensicsFeatures: result.forensics?.features,
       source,
     });
   }
@@ -351,6 +384,7 @@ const HELP_MENU =
   `• /untrack [CA] — Stop monitoring a specific token\n\n` +
   `<b>── RESEARCH ──</b>\n` +
   `• /scanfull [CA] or /details [CA] — Force full forensic card\n` +
+  `• /forensics [CA] — one-line holder cohort read\n` +
   `• /watchlist — Tokens with active dip/re-entry alerts\n` +
   `• /log — Recent audit log with clean class labels\n` +
   `• /logca [CA] — Recent audit entries for one CA\n` +
@@ -586,7 +620,7 @@ bot.command('huntlast', ctx => {
   if (!candidates.length) {
     return ctx.replyWithHTML(
       `<b>Hunt Last Candidates</b>\n\nNo candidates recorded yet this session.\n` +
-      `<i>Hunt has scanned ${h.scanned ?? 0} token(s) but none passed the Vol/Liq ≥ 5x filter, or the session just started.</i>`
+      `<i>Hunt has scanned ${h.scanned ?? 0} token(s) but none reached the active Hunt broadcast gate, or the session just started.</i>`
     );
   }
   const now = Date.now();
@@ -696,6 +730,34 @@ bot.command('watchlist', ctx => {
     lines.join('\n') +
     `\n\n<i>Alerts auto-expire after 12 hours.</i>`
   );
+});
+
+bot.command('forensics', async ctx => {
+  const ca = (ctx.message.text.split(/\s+/)[1] || '').trim();
+  if (!isSolanaCA(ca)) return ctx.reply('Usage: /forensics [CA]');
+
+  try {
+    const sig = await fetchForensic(ca);
+    if (!sig) return ctx.reply('🔎 Forensics: 🟡 Unknown — no live data returned.');
+
+    const forensic = evaluateHolderCohort({
+      ca,
+      marketCap: sig.marketCap,
+      ageMinutes: sig.ageMinutes,
+      holders: {
+        holderCount: sig.holderCount,
+        top10Pct: sig.top10Pct,
+        top20Pct: sig.top20Pct,
+        top50Pct: sig.top50Pct,
+      },
+      topWallets: sig.topWallets || [],
+      bundle: null,
+    });
+
+    return ctx.reply(forensic.oneLine);
+  } catch (e) {
+    return ctx.reply(`🔎 Forensics: 🟡 Unknown — check failed: ${String(e.message).slice(0, 80)}`);
+  }
 });
 
 bot.command('track', async ctx => {
@@ -927,6 +989,35 @@ bot.on('text', async ctx => {
       `Error scanning <code>${ca}</code>: ${err.message}`,
       { parse_mode: 'HTML' }
     );
+  }
+});
+
+bot.action(/^forensics:([^:]+):?(\d+)?$/, async ctx => {
+  const ca = ctx.match[1];
+
+  try { await ctx.answerCbQuery('Running forensics…'); } catch (_) {}
+
+  try {
+    const sig = await fetchForensic(ca);
+    if (!sig) return ctx.reply('🔎 Forensics: 🟡 Unknown — no live data returned.');
+
+    const forensic = evaluateHolderCohort({
+      ca,
+      marketCap: sig.marketCap,
+      ageMinutes: sig.ageMinutes,
+      holders: {
+        holderCount: sig.holderCount,
+        top10Pct: sig.top10Pct,
+        top20Pct: sig.top20Pct,
+        top50Pct: sig.top50Pct,
+      },
+      topWallets: sig.topWallets || [],
+      bundle: null,
+    });
+
+    return ctx.reply(forensic.oneLine);
+  } catch (e) {
+    return ctx.reply(`🔎 Forensics: 🟡 Unknown — check failed: ${String(e.message).slice(0, 80)}`);
   }
 });
 
