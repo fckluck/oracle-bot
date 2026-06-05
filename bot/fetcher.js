@@ -1238,15 +1238,55 @@ async function fetchForensic(ca) {
 // Lightweight MC-only fetch used by audit loops and audit commands.
 // Priority: DexScreener -> Jupiter -> Birdeye (only when explicitly allowed).
 async function fetchMcOnly(ca, opts = {}) {
-  const dex = await fetchDexScreener(ca).catch(() => null);
-  const dexMc = dex?.marketCap ?? null;
-  if (dexMc != null && Number.isFinite(Number(dexMc)) && Number(dexMc) > 0) {
-    return { mc: Number(dexMc), source: 'dexscreener' };
+  const fetchedAt = Date.now();
+  const [dex, jup] = await Promise.all([
+    fetchDexScreener(ca).catch(() => null),
+    fetchJupiter(ca).catch(() => null),
+  ]);
+
+  const candidates = [];
+  const dexMc = Number(dex?.marketCap || 0);
+  if (Number.isFinite(dexMc) && dexMc > 0) {
+    candidates.push({
+      mc: dexMc,
+      source: `dexscreener${dex?.dexId ? ':' + dex.dexId : ''}`,
+      ageMinutes: dex?.ageMinutes ?? null,
+    });
   }
-  const jup = await fetchJupiter(ca).catch(() => null);
-  const jupMc = jup?.marketCap ?? null;
-  if (jupMc != null && Number.isFinite(Number(jupMc)) && Number(jupMc) > 0) {
-    return { mc: Number(jupMc), source: 'jupiter' };
+
+  const jupMc = Number(jup?.marketCap || 0);
+  if (Number.isFinite(jupMc) && jupMc > 0) {
+    candidates.push({
+      mc: jupMc,
+      source: 'jupiter',
+      ageMinutes: null,
+    });
+  }
+
+  if (candidates.length) {
+    candidates.sort((a, b) => b.mc - a.mc);
+    if (candidates.length >= 2) {
+      const high = candidates[0];
+      const low = candidates[candidates.length - 1];
+      const disagreementPct = high.mc > 0 ? ((high.mc - low.mc) / high.mc) * 100 : 0;
+      if (disagreementPct >= 25) {
+        return {
+          mc: low.mc,
+          source: `${low.source}|conservative; high=${high.source}`,
+          fetchedAt,
+          uncertain: true,
+          disagreementPct,
+        };
+      }
+    }
+    const primary = candidates[0];
+    return {
+      mc: primary.mc,
+      source: primary.source,
+      fetchedAt,
+      uncertain: false,
+      disagreementPct: 0,
+    };
   }
 
   const allowBirdeyeFallback = !!opts.allowBirdeye && birdeyeAllowed({ auditMode: true, deepMode: !!opts.deepMode });
@@ -1265,7 +1305,9 @@ async function fetchMcOnly(ca, opts = {}) {
     if (!res.ok) return null;
     const j = await res.json();
     const mc = j?.data?.mc ?? j?.data?.marketCap ?? null;
-    return mc != null ? { mc: Number(mc), source: 'birdeye' } : null;
+    return mc != null
+      ? { mc: Number(mc), source: 'birdeye', fetchedAt, uncertain: false, disagreementPct: 0 }
+      : null;
   } catch {
     return null;
   }
