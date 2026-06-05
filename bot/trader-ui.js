@@ -9,6 +9,23 @@ function toNum(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function cleanTelegramText(text) {
+  return String(text || '')
+    .replace(/\bPLUTO threshold met\b/gi, 'High-volume threshold met')
+    .replace(/\bPLUTO CANDIDATE\b/gi, 'High-volume candidate')
+    .replace(/\bSCRIBBLI\b/gi, 'Extreme runner')
+    .replace(/\bBASELINE_ENTRY\b/gi, 'Buy candidate')
+    .replace(/\bHIGH_CONVICTION\b/gi, 'High-conviction')
+    .replace(/\bORACLE_BUY\b/gi, 'Oracle Buy')
+    .replace(/\bDIRTY_RUNNER_WATCH\b/gi, 'Scout')
+    .replace(/\bWATCH_VOL\b/gi, 'Volume Watch')
+    .replace(/\bNO_GO\b/gi, 'Fail')
+    .replace(/watch only/gi, 'needs confirmation')
+    .replace(/\.\.+/g, '.')
+    .replace(/\s+\./g, '.')
+    .trim();
+}
+
 function friendlySetupLabel(rawName) {
   const key = String(rawName || '').toUpperCase();
   const map = {
@@ -138,13 +155,22 @@ function confidenceFromResult(result) {
 
 function shortRisk(result) {
   const signals = result?.signals || {};
-  if (signals.sybilFunded) return 'confirmed sybil-linked funding';
-  if (toNum(signals.washPct, 0) > 35) return 'wash-heavy flow with weak organic demand';
-  if (toNum(signals.top10Pct, 0) > 45) return 'high concentration can unwind fast';
-  if (toNum(signals.bundleCount, 0) >= 8) return 'bundle pressure from clustered entries';
-  if (signals.isSerialDeployer) return 'serial deployer risk profile';
-  const raw = result?.noGoReason || result?.watchReason || result?.headlineType || 'early structure still fragile';
-  return String(raw).replace(/watch only/gi, 'needs confirmation');
+  const rawRisk = String(result?.noGoReason || result?.watchReason || result?.headlineType || '');
+
+  if (signals.sybilFunded) return cleanTelegramText('confirmed sybil-linked funding');
+  if (toNum(signals.washPct, 0) > 35) return cleanTelegramText('wash-heavy flow with weak organic demand');
+  if (toNum(signals.top10Pct, 0) > 45) return cleanTelegramText('high concentration can unwind fast');
+  if (toNum(signals.bundleCount, 0) >= 8) return cleanTelegramText('bundle pressure from clustered entries');
+  if (signals.isSerialDeployer) return cleanTelegramText('serial deployer risk profile');
+
+  const cls = String(result?.oracleScore?.class || result?.verdict || '').toUpperCase();
+  const score = toNum(result?.oracleScore?.total, 0);
+  if ((cls === 'ORACLE_BUY' || score >= 84) && /safety failed/i.test(rawRisk)) {
+    const adj = toNum(signals.adjustedVolLiq, 0);
+    return cleanTelegramText(`High-risk continuation: ${adj.toFixed(1)}x organic flow, but safety stack needs confirmation`);
+  }
+
+  return cleanTelegramText(rawRisk || 'early structure still fragile');
 }
 
 function whyRunText(result) {
@@ -164,12 +190,22 @@ function whyRunText(result) {
 function whyFailText(result) {
   const s = result?.signals || {};
   const reasons = [];
-  if (s.isSerialDeployer) reasons.push('serial deployer');
+  if (s.sybilFunded) reasons.push('confirmed sybil funding');
+  if (toNum(s.washPct, 0) >= 25) reasons.push('wash risk');
   if (toNum(s.bundleCount, 0) >= 6) reasons.push('bundled entries');
   if (toNum(s.top10Pct, 0) >= 40) reasons.push('inflated holder concentration');
-  if (toNum(s.washPct, 0) >= 25) reasons.push('wash risk');
-  if (!reasons.length) reasons.push(shortRisk(result));
-  return `${reasons.slice(0, 3).join(', ')}.`;
+  if (s.isSerialDeployer) reasons.push('serial deployer');
+
+  const rawRisk = cleanTelegramText(result?.noGoReason || result?.watchReason || result?.headlineType || '');
+  const compactRisk = rawRisk
+    .replace(/^High-volume threshold met.*?safety failed\s*[—-]\s*/i, '')
+    .replace(/^High-volume threshold met.*?needs confirmation\.?$/i, '')
+    .trim();
+
+  if (!reasons.length && compactRisk) reasons.push(compactRisk);
+  if (!reasons.length) reasons.push('early structure still fragile');
+
+  return cleanTelegramText(`${reasons.slice(0, 3).join(', ')}.`);
 }
 
 function oracleReadText(traderClassKey) {
@@ -236,4 +272,5 @@ module.exports = {
   oracleReadText,
   setupTagsFromResult,
   friendlyBlueprintActionLabel,
+  cleanTelegramText,
 };
