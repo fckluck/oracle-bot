@@ -9,7 +9,7 @@ const { actionTimeLine } = require('./time');
 const { apiStatusHtml, markApi } = require('./telemetry');
 const config    = require('./config');
 const { probeXaiConnection, getSoulVerdict } = require('./reasoning');
-const { evaluateHolderCohort } = require('./forensics');
+const { evaluateHolderCohort, runDeepForensics } = require('./forensics');
 const {
   recordScan,
   startAuditLoop,
@@ -160,20 +160,6 @@ async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
   const holders = sig?.holderCount ?? null;
   const top10 = sig?.top10Pct ?? null;
   const top50 = sig?.top50Pct ?? null;
-  const forensic = evaluateHolderCohort({
-    ca,
-    marketCap: sig?.marketCap ?? entryMc,
-    ageMinutes: sig?.ageMinutes ?? null,
-    holders: {
-      holderCount: sig?.holderCount ?? null,
-      top10Pct: sig?.top10Pct ?? null,
-      top20Pct: sig?.top20Pct ?? null,
-      top50Pct: sig?.top50Pct ?? null,
-    },
-    topWallets: sig?.topWallets || [],
-    bundle: null,
-  });
-
   const added = tracker.track(ca, chatId, entryMc, 'MANUAL', 'DISCOVERY', null, holders, top10, top50, entryLp);
   if (!added) {
     const reason = tracker.list().length >= 10 ? 'max 10 positions reached' : 'already tracking this token';
@@ -190,7 +176,6 @@ async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
     `Holders: ${holders ?? 'N/A'}\n` +
     `Top 10: ${top10 != null ? top10.toFixed(1) + '%' : 'N/A'}\n` +
     `Top 50: ${top50 != null ? top50.toFixed(1) + '%' : 'N/A'}\n` +
-    `${forensic.oneLine}\n` +
     `Baseline: ${baseline}\n` +
     `Next poll: 60s`;
 
@@ -734,29 +719,38 @@ bot.command('watchlist', ctx => {
 
 bot.command('forensics', async ctx => {
   const ca = (ctx.message.text.split(/\s+/)[1] || '').trim();
-  if (!isSolanaCA(ca)) return ctx.reply('Usage: /forensics [CA]');
+  if (!isSolanaCA(ca)) return ctx.replyWithHTML('Usage: <code>/forensics [CA]</code>');
 
+  const wait = await ctx.replyWithHTML(`🔎 Running deep forensics on <code>${ca}</code>...`);
   try {
-    const sig = await fetchForensic(ca);
-    if (!sig) return ctx.reply('🔎 Forensics: 🟡 Unknown — no live data returned.');
-
-    const forensic = evaluateHolderCohort({
-      ca,
-      marketCap: sig.marketCap,
-      ageMinutes: sig.ageMinutes,
+    const sig = await fetchForensic(ca).catch(() => null);
+    const forensic = await runDeepForensics(ca, {
+      marketCap: sig?.marketCap ?? null,
+      ageMinutes: sig?.ageMinutes ?? null,
       holders: {
-        holderCount: sig.holderCount,
-        top10Pct: sig.top10Pct,
-        top20Pct: sig.top20Pct,
-        top50Pct: sig.top50Pct,
+        holderCount: sig?.holderCount ?? null,
+        top10Pct: sig?.top10Pct ?? null,
+        top20Pct: sig?.top20Pct ?? null,
+        top50Pct: sig?.top50Pct ?? null,
       },
-      topWallets: sig.topWallets || [],
-      bundle: null,
+      topWallets: sig?.topWallets || [],
     });
 
-    return ctx.reply(forensic.oneLine);
+    return ctx.telegram.editMessageText(
+      ctx.chat.id,
+      wait.message_id,
+      undefined,
+      forensic.oneLine,
+      { parse_mode: 'HTML' }
+    );
   } catch (e) {
-    return ctx.reply(`🔎 Forensics: 🟡 Unknown — check failed: ${String(e.message).slice(0, 80)}`);
+    return ctx.telegram.editMessageText(
+      ctx.chat.id,
+      wait.message_id,
+      undefined,
+      `🔎 Forensics: 🟡 Unknown — deep check failed: ${String(e.message).slice(0, 90)}`,
+      { parse_mode: 'HTML' }
+    );
   }
 });
 
@@ -995,29 +989,38 @@ bot.on('text', async ctx => {
 bot.action(/^forensics:([^:]+):?(\d+)?$/, async ctx => {
   const ca = ctx.match[1];
 
-  try { await ctx.answerCbQuery('Running forensics…'); } catch (_) {}
+  try { await ctx.answerCbQuery('Running deep forensics…'); } catch (_) {}
 
+  const wait = await ctx.replyWithHTML(`🔎 Running deep forensics on <code>${ca}</code>...`);
   try {
-    const sig = await fetchForensic(ca);
-    if (!sig) return ctx.reply('🔎 Forensics: 🟡 Unknown — no live data returned.');
-
-    const forensic = evaluateHolderCohort({
-      ca,
-      marketCap: sig.marketCap,
-      ageMinutes: sig.ageMinutes,
+    const sig = await fetchForensic(ca).catch(() => null);
+    const forensic = await runDeepForensics(ca, {
+      marketCap: sig?.marketCap ?? null,
+      ageMinutes: sig?.ageMinutes ?? null,
       holders: {
-        holderCount: sig.holderCount,
-        top10Pct: sig.top10Pct,
-        top20Pct: sig.top20Pct,
-        top50Pct: sig.top50Pct,
+        holderCount: sig?.holderCount ?? null,
+        top10Pct: sig?.top10Pct ?? null,
+        top20Pct: sig?.top20Pct ?? null,
+        top50Pct: sig?.top50Pct ?? null,
       },
-      topWallets: sig.topWallets || [],
-      bundle: null,
+      topWallets: sig?.topWallets || [],
     });
 
-    return ctx.reply(forensic.oneLine);
+    return ctx.telegram.editMessageText(
+      ctx.chat.id,
+      wait.message_id,
+      undefined,
+      forensic.oneLine,
+      { parse_mode: 'HTML' }
+    );
   } catch (e) {
-    return ctx.reply(`🔎 Forensics: 🟡 Unknown — check failed: ${String(e.message).slice(0, 80)}`);
+    return ctx.telegram.editMessageText(
+      ctx.chat.id,
+      wait.message_id,
+      undefined,
+      `🔎 Forensics: 🟡 Unknown — deep check failed: ${String(e.message).slice(0, 90)}`,
+      { parse_mode: 'HTML' }
+    );
   }
 });
 

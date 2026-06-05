@@ -5,7 +5,8 @@
 const fs   = require('fs');
 const path = require('path');
 const config = require('./config');
-const { resolveTraderClass } = require('./trader-ui');
+const { resolveTraderClass, cleanTelegramText } = require('./trader-ui');
+const { runDeepForensics } = require('./forensics');
 
 const DATA_DIR      = process.env.DATA_DIR || '/data';
 const AUDIT_FILE    = path.join(DATA_DIR, 'audit.json');
@@ -660,44 +661,41 @@ async function processBatch(bot, fetchMcFn) {
     try {
       const mcResult = await fetchMcFn(entry.ca, { auditMode: true });
       const fetchedMc = typeof mcResult === 'number' ? mcResult : mcResult?.mc ?? null;
+
       entry.lastChecked = Date.now();
-      if (mcResult && typeof mcResult === 'object') {
-        entry.lastMcSource = mcResult.source || null;
-        entry.lastMcCheckedAt = mcResult.fetchedAt || Date.now();
-        entry.mcUncertain = !!mcResult.uncertain;
-        entry.mcDisagreementPct = mcResult.disagreementPct ?? null;
-      }
+
       if (fetchedMc == null || !(Number(fetchedMc) > 0)) continue;
 
-      const nowMs = Date.now();
+      const now = Date.now();
       const observedMc = Number(entry.lastObservedMc || entry.currentMc || entry.scanMc || 0);
       const observedAt = Number(entry.lastObservedAt || entry.scanTime || 0);
-      const observedAgeMs = observedAt > 0 ? nowMs - observedAt : Infinity;
+      const observedAgeMs = observedAt > 0 ? now - observedAt : Infinity;
 
       entry.externalMc = Number(fetchedMc);
       entry.externalMcSource = typeof mcResult === 'object' ? (mcResult.source || null) : 'unknown';
-      entry.externalMcCheckedAt = typeof mcResult === 'object' ? (mcResult.fetchedAt || nowMs) : nowMs;
+      entry.externalMcCheckedAt = typeof mcResult === 'object' ? (mcResult.fetchedAt || now) : now;
 
       const disagreementPct = observedMc > 0
         ? Math.abs(Number(fetchedMc) - observedMc) / Math.max(observedMc, Number(fetchedMc)) * 100
         : 0;
+
       entry.mcDisagreementPct = disagreementPct;
 
       const recentObserved = observedMc > 0 && observedAgeMs <= 2 * 60 * 1000;
       const source = String(entry.externalMcSource || '').toLowerCase();
       const laggySource = source.includes('dexscreener') || source.includes('jupiter');
+
       if (recentObserved && laggySource && disagreementPct >= 25) {
         entry.mcUncertain = true;
         entry.currentMc = observedMc;
       } else {
-        entry.mcUncertain = disagreementPct >= 35 || !!(mcResult && typeof mcResult === 'object' && mcResult.uncertain);
+        entry.mcUncertain = disagreementPct >= 35;
         entry.currentMc = Number(fetchedMc);
       }
 
       if (entry.peakMc == null || entry.currentMc > entry.peakMc) entry.peakMc = entry.currentMc;
       if (entry.externalMc > entry.peakMc) entry.peakMc = Math.max(entry.peakMc, entry.externalMc);
       if (entry.trueAthMc == null || entry.currentMc > entry.trueAthMc) entry.trueAthMc = entry.currentMc;
-      if (entry.externalMc > (entry.trueAthMc || 0)) entry.trueAthMc = entry.externalMc;
       entry.guardianPeakMc = Math.max(entry.guardianPeakMc || 0, entry.peakMc || 0, entry.currentMc || 0);
       entry.multipleFromFirstSeen = entry.firstSeenMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.firstSeenMc : null;
       entry.multipleFromAlert = entry.alertMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.alertMc : null;
@@ -710,8 +708,8 @@ async function processBatch(bot, fetchMcFn) {
       const moveFromFirst = Number(entry.multipleFromFirstSeen || 0);
       const isHuntOrigin = String(entry.firstSeenSource || entry.source || '').toLowerCase().includes('hunt');
       const catastrophic = isCatastrophicRecord(entry);
-      const forensicsStatus = String(entry.forensicsStatus || '').toUpperCase();
-      const forensicsBlocked = forensicsStatus === 'SCAMMERS' || forensicsStatus === 'BOTTED';
+      let forensicsStatus = String(entry.forensicsStatus || '').toUpperCase();
+      let forensicsBlocked = forensicsStatus === 'SCAMMERS' || forensicsStatus === 'BOTTED';
       const firstSeen = Number(entry.firstSeenMc || entry.scanMc || 0);
       const peak = Number(entry.peakMc || 0);
       const displayCurrent = Number(entry.currentMc || entry.lastObservedMc || entry.externalMc || 0);
@@ -731,7 +729,7 @@ async function processBatch(bot, fetchMcFn) {
         drawdownFromPeak <= 0.35;
       const sourceUncertain = !!entry.mcUncertain || Number(entry.mcDisagreementPct || 0) >= 25;
       const safeToPromoteLive = livePearl && !sourceUncertain;
-      if (
+      const promotionCandidate =
         bot &&
         process.env.OWNER_TELEGRAM_ID &&
         !entry.promotionAlerted &&
@@ -741,25 +739,60 @@ async function processBatch(bot, fetchMcFn) {
         firstSeenMc <= 45_000 &&
         moveFromFirst >= 1.5 &&
         promotableOriginalClasses.has(firstSeenClass) &&
-        !catastrophic &&
+        !catastrophic;
+
+      if (promotionCandidate) {
+        let deepForensic = null;
+        try {
+          deepForensic = await runDeepForensics(entry.ca, {
+            marketCap: entry.currentMc,
+            ageMinutes: entry.ageMinutes,
+            holders: {
+              holderCount: entry.holderCount,
+              top10Pct: entry.top10Pct,
+              top50Pct: entry.top50Pct,
+            },
+            bundle: {
+              maxInSlot: entry.bundleCount,
+              sybilDetected: entry.sybilFunded,
+            },
+          });
+
+          entry.forensicsStatus = deepForensic.status;
+          entry.forensicsReason = deepForensic.reason;
+          entry.forensicsFeatures = deepForensic.features;
+        } catch (_) {}
+
+        forensicsStatus = String(entry.forensicsStatus || '').toUpperCase();
+        forensicsBlocked = forensicsStatus === 'SCAMMERS' || forensicsStatus === 'BOTTED';
+
+        if (forensicsBlocked) {
+          entry.outcome = 'FAILED_PEARL';
+          entry.failureReason = `forensics_blocked_${forensicsStatus.toLowerCase()}`;
+          entry.promotionAlerted = true;
+        }
+      }
+      if (
+        promotionCandidate &&
+        !entry.promotionAlerted &&
         !forensicsBlocked
       ) {
         const symbol = entry.ticker || entry.symbol || entry.ca.slice(0, 8);
-        const sourceLabel = entry.lastMcSource ? ` (${escHtml(entry.lastMcSource)})` : '';
+        const originalRead = resolveTraderClass(entry.firstSeenClass || entry.verdict, entry.oracleScoreTotal).label;
         const mcLineLabel = entry.mcUncertain ? 'Last Oracle MC' : 'Live Check MC';
-        const originalRead = friendlyClass(entry.firstSeenClass || entry.verdict, entry.oracleScoreTotal);
+        const sourceLabel = entry.externalMcSource ? ` (${escHtml(entry.externalMcSource)})` : '';
         if (safeToPromoteLive) {
           const msg =
-            `🦪 HUNT PEARL PROMOTED\n\n` +
+            `🦪 <b>HUNT PEARL PROMOTED</b>\n\n` +
             `Hunt saw this earlier.\n` +
-            `Token: ${escHtml(symbol)}\n` +
+            `Token: <b>${escHtml(symbol)}</b>\n` +
             `CA: ${codeHtml(entry.ca)}\n\n` +
-            `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n` +
-            `${mcLineLabel}: ${fmtUsdCompact(displayCurrent)}${sourceLabel}\n` +
-            `Peak Seen: ${fmtUsdCompact(entry.peakMc)}\n` +
-            `Move From First Seen: ${moveFromFirst.toFixed(2)}x\n` +
-            `Original Read: ${escHtml(originalRead)}\n` +
-            `Forensics: ${escHtml(entry.forensicsStatus || 'UNKNOWN')}${entry.forensicsReason ? ` — ${escHtml(entry.forensicsReason)}` : ''}\n\n` +
+            `First Seen MC: <b>${fmtUsdCompact(entry.firstSeenMc)}</b>\n` +
+            `${mcLineLabel}: <b>${fmtUsdCompact(displayCurrent)}</b>${sourceLabel}\n` +
+            `Peak Seen: <b>${fmtUsdCompact(entry.peakMc)}</b>\n` +
+            `Move From First Seen: <b>${moveFromFirst.toFixed(2)}x</b>\n` +
+            `Original Read: <b>${escHtml(originalRead)}</b>\n` +
+            `Forensics: <b>${escHtml(entry.forensicsStatus || 'UNKNOWN')}</b>${entry.forensicsReason ? ` — ${escHtml(entry.forensicsReason)}` : ''}\n\n` +
             `Action: chart/track now. Chase guard applies; no blind entry if already extended.`;
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg, {
             parse_mode: 'HTML',
@@ -778,7 +811,7 @@ async function processBatch(bot, fetchMcFn) {
             `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n` +
             `Oracle MC: ${fmtUsdCompact(displayCurrent)}\n` +
             `Peak Seen: ${fmtUsdCompact(entry.peakMc)}\n` +
-            `MC Source: ${escHtml(entry.lastMcSource || 'unknown')}\n` +
+            `MC Source: ${escHtml(entry.externalMcSource || 'unknown')}\n` +
             `Disagreement: ${Number(entry.mcDisagreementPct || 0).toFixed(0)}%\n\n` +
             `Action: chart only. No blind entry.`;
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, uncertainMsg, {
@@ -791,13 +824,13 @@ async function processBatch(bot, fetchMcFn) {
           entry.failureReason = 'moved then died before promotion';
           entry.promotionAlerted = true;
           const failMsg =
-            `🔴 FAILED PEARL\n\n` +
+            `🔴 <b>FAILED PEARL</b>\n\n` +
             `Hunt saw this earlier, but it died before promotion.\n` +
-            `Token: ${escHtml(entry.ticker || entry.symbol || entry.ca.slice(0, 8))}\n` +
+            `Token: <b>${escHtml(entry.ticker || entry.symbol || entry.ca.slice(0, 8))}</b>\n` +
             `CA: ${codeHtml(entry.ca)}\n\n` +
-            `First Seen MC: ${fmtUsdCompact(entry.firstSeenMc)}\n` +
-            `Peak MC: ${fmtUsdCompact(entry.peakMc)}\n` +
-            `Current MC: ${fmtUsdCompact(displayCurrent)}\n` +
+            `First Seen MC: <b>${fmtUsdCompact(entry.firstSeenMc)}</b>\n` +
+            `Peak MC: <b>${fmtUsdCompact(entry.peakMc)}</b>\n` +
+            `Current MC: <b>${fmtUsdCompact(displayCurrent)}</b>\n` +
             `Lesson saved. No entry.`;
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, failMsg, {
             parse_mode: 'HTML',
@@ -824,12 +857,12 @@ async function processBatch(bot, fetchMcFn) {
         if (wasMissedOrDowngraded && multiplier != null && multiplier >= 3 && bot && process.env.OWNER_TELEGRAM_ID) {
           const label = entry.ticker ?? entry.ca.slice(0, 8);
           const blueprintLine = `${entry.blueprintAction || 'N/A'} / ${(entry.blueprintMatches || []).length ? entry.blueprintMatches.join(', ') : 'N/A'}`;
-          const msg = `🚨 AUDIT ALERT: Missed ${label} — ${multiplier.toFixed(1)}x from scan verdict ${entry.verdict}`
+          const msg = cleanTelegramText(`🚨 AUDIT ALERT: Missed ${label} — ${multiplier.toFixed(1)}x from scan verdict ${entry.verdict}`
             + `${entry.entryTier ? ` / ${entry.entryTier}` : ''}\n`
             + `CA: ${entry.ca}\n`
             + `Scan MC: $${(entry.scanMc / 1000).toFixed(1)}K → Peak: $${(entry.peakMc / 1000).toFixed(1)}K\n`
             + `Blueprint: ${blueprintLine}\n`
-            + `Pattern memory updated.`;
+            + `Pattern memory updated.`);
           bot.telegram.sendMessage(process.env.OWNER_TELEGRAM_ID, msg).catch(() => {});
         }
         const resolvedEntry = { ...entry };

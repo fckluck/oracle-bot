@@ -10,6 +10,7 @@ const {
   oracleReadText,
   setupTagsFromResult,
   friendlyBlueprintActionLabel,
+  cleanTelegramText,
 } = require('./trader-ui');
 const { evaluateEntryValidity, entryLabel } = require('./entry-validity');
 
@@ -150,10 +151,14 @@ function formatShortCard(result, ca) {
   const confidence = `${confidenceFromResult(result).toFixed(1)}/10`;
   const setupTags = setupTagsFromResult(result);
   const ageMinutes = signals.ageMinutes != null ? `${Math.round(Number(signals.ageMinutes))}m` : 'N/A';
-  const mainRisk = shortRisk(result);
-  const runLine = whyRunText(result);
-  const failLine = whyFailText(result);
-  const oracleRead = oracleReadText(traderClass.key);
+  const mainRisk = cleanTelegramText(shortRisk(result));
+  const runLine = cleanTelegramText(whyRunText(result));
+  let failLine = cleanTelegramText(whyFailText(result));
+  const oracleRead = cleanTelegramText(oracleReadText(traderClass.key));
+
+  if (failLine.toLowerCase() === mainRisk.toLowerCase()) {
+    failLine = 'same risk stack as above; wait for confirmation or use track only.';
+  }
   const entryState = evaluateEntryValidity({
     firstSeenMc: result?.firstSeenMc ?? signals.marketCap,
     alertMc: result?.alertMc ?? signals.marketCap,
@@ -189,10 +194,6 @@ function formatShortCard(result, ca) {
   lines.push(`Top10: ${fmtPct(signals.top10Pct, 1)}`);
   lines.push(`Bundle: ${signals.bundleCount ?? 0}/slot`);
   lines.push(`Age: ${ageMinutes}`);
-  if (result.forensics?.oneLine) {
-    lines.push('');
-    lines.push(esc(result.forensics.oneLine));
-  }
   lines.push('');
   lines.push(b('Main Risk:'));
   lines.push(esc(mainRisk));
@@ -214,13 +215,11 @@ function formatShortCard(result, ca) {
 
 function tierName(t) {
   switch (t) {
-    case 'SCRIBBLI':        return 'SCRIBBLI (50x+ Adjusted)';
-    case 'PLUTO':           return 'PLUTO CANDIDATE (12x+ Adjusted)';
-    case 'HIGH_CONVICTION': return 'HIGH CONVICTION (8x+ Adjusted)';
-    case 'BASELINE_ENTRY':  return 'BUY CANDIDATE (5x+ Adjusted)';
-    case 'ELITE_DIP':       return 'ELITE DIP - BUY THE DIP';
-    case 'NANO_CAP':        return 'NANO-CAP SNIPE (8x+ Adjusted)';
-    default:                return '—';
+    case 'SCRIBBLI':        return 'Extreme Runner';
+    case 'PLUTO':           return 'High-Volume Candidate';
+    case 'HIGH_CONVICTION': return 'High-Conviction Candidate';
+    case 'BASELINE_ENTRY':  return 'Buy Candidate';
+    default:                return t || 'UNKNOWN';
   }
 }
 function tierPositionLabel(entryTier, _positionUnits, slippageWarn) {
@@ -311,7 +310,7 @@ function washQualityDisplay(washPct) {
 
 function formatVerdict(result, ca, options = {}) {
   const mode = String(options.mode || "full").toLowerCase();
-  if (mode === "short") return formatShortCard({ ...result, context: options.context }, ca);
+  if (mode === "short") return cleanTelegramText(formatShortCard({ ...result, context: options.context }, ca));
   const {
     verdict, entryTier, noGoReason, headlineType, watchReason, timeWindow,
     positionSizeSol, positionUnits, scribbliSlippageWarning,
@@ -669,11 +668,6 @@ function formatVerdict(result, ca, options = {}) {
   L.push(`API Integrity: ${apiIntegrity}`);
   L.push('');
 
-  if (result.forensics?.oneLine) {
-    L.push(esc(result.forensics.oneLine));
-    L.push('');
-  }
-
   // ── LIVE METRICS ──────────────────────────────────────────────────────────
 
   L.push(b('── LIVE METRICS ──'));
@@ -748,7 +742,7 @@ function formatVerdict(result, ca, options = {}) {
   }
 
   L.push(`CA: ${code(ca)}`);
-  return L.join('\n');
+  return cleanTelegramText(L.join('\n'));
 }
 
 module.exports = { formatVerdict };
