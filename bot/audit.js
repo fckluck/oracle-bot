@@ -177,6 +177,13 @@ function normalizeRecord(rec) {
     forensicsStatus: rec.forensicsStatus ?? null,
     forensicsReason: rec.forensicsReason ?? null,
     forensicsFeatures: rec.forensicsFeatures ?? null,
+    dataQuality: canonicalDataQuality(rec.dataQuality ?? 'PARTIAL'),
+    learningEligible: rec.learningEligible === true,
+    dataQualityReasons: normalizeStringArray(rec.dataQualityReasons),
+    failedPearlAt: rec.failedPearlAt ?? null,
+    failedPearlPeakMc: rec.failedPearlPeakMc ?? null,
+    failedPearlRecovered: !!rec.failedPearlRecovered,
+    failedPearlRecoveryAt: rec.failedPearlRecoveryAt ?? null,
     source: rec.source ?? null,
 
     resolved: rec.resolved ?? outcome !== 'UNRESOLVED',
@@ -222,6 +229,9 @@ function normalizeFingerprint(fp = {}) {
     blueprintConfidence: fp.blueprintConfidence ?? null,
     blueprintMatches: normalizeStringArray(fp.blueprintMatches),
     blueprintReason: fp.blueprintReason ?? null,
+    dataQuality: canonicalDataQuality(fp.dataQuality ?? 'PARTIAL'),
+    learningEligible: fp.learningEligible === true,
+    dataQualityReasons: normalizeStringArray(fp.dataQualityReasons),
     source: fp.source ?? null,
     learnedAt: fp.learnedAt ?? null,
     reason: fp.reason ?? null,
@@ -263,6 +273,26 @@ function isCatastrophicRecord(entry = {}) {
   if (!(Number(entry.scanMc || entry.firstSeenMc || 0) > 0)) return true;
   if (entry.lp != null && Number(entry.lp) < 0) return true;
   return false;
+}
+
+function canonicalDataQuality(value) {
+  const key = String(value || 'PARTIAL').toUpperCase();
+  if (key === 'FULL' || key === 'PARTIAL' || key === 'MC_UNCERTAIN' || key === 'INVALID') return key;
+  return 'PARTIAL';
+}
+
+function computeLearningEligibility(entry = {}, { matured = false } = {}) {
+  const q = canonicalDataQuality(entry.dataQuality);
+  if (q === 'INVALID' || q === 'MC_UNCERTAIN') return false;
+  if (String(entry.outcome || '').toUpperCase() === 'FAILED_PEARL') return false;
+  if (isCatastrophicRecord(entry)) return false;
+  if (q === 'FULL') return true;
+  if (!matured) return false;
+  // PARTIAL data can be admitted only after 6h maturity if MC/peak are coherent.
+  return Number(entry.scanMc || 0) > 0 &&
+    Number(entry.peakMc || 0) > 0 &&
+    !entry.mcUncertain &&
+    Number(entry.mcDisagreementPct || 0) < 25;
 }
 
 function archiveCorruptFile(filePath, reason) {
@@ -426,6 +456,13 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
       forensicsStatus: extra.forensicsStatus ?? existing.forensicsStatus ?? null,
       forensicsReason: extra.forensicsReason ?? existing.forensicsReason ?? null,
       forensicsFeatures: extra.forensicsFeatures ?? existing.forensicsFeatures ?? null,
+      dataQuality: canonicalDataQuality(extra.dataQuality ?? existing.dataQuality ?? 'PARTIAL'),
+      dataQualityReasons: extra.dataQualityReasons ?? existing.dataQualityReasons ?? [],
+      learningEligible: extra.learningEligible ?? existing.learningEligible ?? false,
+      failedPearlAt: extra.failedPearlAt ?? existing.failedPearlAt ?? null,
+      failedPearlPeakMc: extra.failedPearlPeakMc ?? existing.failedPearlPeakMc ?? null,
+      failedPearlRecovered: extra.failedPearlRecovered ?? existing.failedPearlRecovered ?? false,
+      failedPearlRecoveryAt: extra.failedPearlRecoveryAt ?? existing.failedPearlRecoveryAt ?? null,
       trackEntryMc: extra.trackEntryMc ?? existing.trackEntryMc,
       guardianPeakMc: extra.guardianPeakMc ?? existing.guardianPeakMc,
       trueAthMc: extra.trueAthMc ?? existing.trueAthMc,
@@ -508,6 +545,13 @@ function addToAudit(ca, ticker, verdict, entryTier, scanMc, extra = {}) {
     forensicsStatus: extra.forensicsStatus,
     forensicsReason: extra.forensicsReason,
     forensicsFeatures: extra.forensicsFeatures,
+    dataQuality: canonicalDataQuality(extra.dataQuality ?? 'PARTIAL'),
+    dataQualityReasons: extra.dataQualityReasons ?? [],
+    learningEligible: extra.learningEligible ?? false,
+    failedPearlAt: extra.failedPearlAt ?? null,
+    failedPearlPeakMc: extra.failedPearlPeakMc ?? null,
+    failedPearlRecovered: extra.failedPearlRecovered ?? false,
+    failedPearlRecoveryAt: extra.failedPearlRecoveryAt ?? null,
     source: extra.source,
     resolved: false,
     outcome: 'UNRESOLVED',
@@ -524,6 +568,7 @@ function recordScan({
   blueprintAction, blueprintConfidence, blueprintMatches, blueprintReason,
   trackEntryMc, guardianPeakMc, trueAthMc,
   forensicsStatus, forensicsReason, forensicsFeatures,
+  dataQuality, dataQualityReasons, learningEligible,
 }) {
   addToAudit(ca, symbol, verdict, entryTier, mc, {
     adjustedVolLiq,
@@ -559,6 +604,9 @@ function recordScan({
     forensicsStatus,
     forensicsReason,
     forensicsFeatures,
+    dataQuality,
+    dataQualityReasons,
+    learningEligible,
     trackEntryMc,
     guardianPeakMc,
     trueAthMc,
@@ -623,6 +671,9 @@ function buildFingerprint(entry, outcome) {
     blueprintConfidence: entry.blueprintConfidence,
     blueprintMatches: entry.blueprintMatches,
     blueprintReason: entry.blueprintReason,
+    dataQuality: canonicalDataQuality(entry.dataQuality),
+    learningEligible: entry.learningEligible === true,
+    dataQualityReasons: entry.dataQualityReasons || [],
     outcome,
     failureReason: outcome === 'WINNER' ? null : inferFailureReason(entry),
     resolvedAt: Date.now(),
@@ -631,6 +682,8 @@ function buildFingerprint(entry, outcome) {
 }
 
 function pushFingerprint(entry) {
+  const maturedEligible = computeLearningEligibility(entry, { matured: true });
+  if (!maturedEligible) return false;
   const outcome = entry.outcome || classify(entry);
   const fp = buildFingerprint(entry, outcome);
   if (outcome === 'WINNER') {
@@ -638,6 +691,7 @@ function pushFingerprint(entry) {
   } else {
     failedFingerprints.push(fp);
   }
+  return true;
 }
 
 async function processBatch(bot, fetchMcFn) {
@@ -663,6 +717,8 @@ async function processBatch(bot, fetchMcFn) {
       const fetchedMc = typeof mcResult === 'number' ? mcResult : mcResult?.mc ?? null;
 
       entry.lastChecked = Date.now();
+      entry.dataQuality = canonicalDataQuality(entry.dataQuality);
+      entry.learningEligible = computeLearningEligibility(entry, { matured: false });
 
       if (fetchedMc == null || !(Number(fetchedMc) > 0)) continue;
 
@@ -702,6 +758,14 @@ async function processBatch(bot, fetchMcFn) {
       entry.promotionDelayMinutes = entry.firstSeenAt > 0 && entry.alertAt > 0
         ? Math.max(0, Math.round((entry.alertAt - entry.firstSeenAt) / 60000))
         : null;
+      if (entry.failedPearlPeakMc != null && entry.peakMc > entry.failedPearlPeakMc) {
+        entry.failedPearlRecovered = true;
+        entry.failedPearlRecoveryAt = now;
+        if (entry.outcome === 'FAILED_PEARL') {
+          entry.outcome = 'RECOVERED_RUNNER';
+          entry.failureReason = null;
+        }
+      }
 
       const firstSeenClass = String(entry.firstSeenClass || entry.verdict || '').toUpperCase();
       const firstSeenMc = Number(entry.firstSeenMc || 0);
@@ -770,6 +834,8 @@ async function processBatch(bot, fetchMcFn) {
           entry.outcome = 'FAILED_PEARL';
           entry.failureReason = `forensics_blocked_${forensicsStatus.toLowerCase()}`;
           entry.promotionAlerted = true;
+          entry.failedPearlAt = Date.now();
+          entry.failedPearlPeakMc = Number(entry.peakMc || entry.currentMc || 0) || null;
         }
       }
       if (
@@ -823,6 +889,8 @@ async function processBatch(bot, fetchMcFn) {
           entry.outcome = 'FAILED_PEARL';
           entry.failureReason = 'moved then died before promotion';
           entry.promotionAlerted = true;
+          entry.failedPearlAt = Date.now();
+          entry.failedPearlPeakMc = Number(entry.peakMc || entry.currentMc || 0) || null;
           const failMsg =
             `🔴 <b>FAILED PEARL</b>\n\n` +
             `Hunt saw this earlier, but it died before promotion.\n` +
@@ -846,11 +914,15 @@ async function processBatch(bot, fetchMcFn) {
         entry.outcome = 'FAILED_PEARL';
         entry.failureReason = `forensics_blocked_${forensicsStatus.toLowerCase()}`;
         entry.promotionAlerted = true;
+        entry.failedPearlAt = Date.now();
+        entry.failedPearlPeakMc = Number(entry.peakMc || entry.currentMc || 0) || null;
       }
 
       if (Date.now() - entry.scanTime >= RESOLVE_MS) {
         entry.resolved = true;
         entry.outcome = classify(entry);
+        entry.dataQuality = canonicalDataQuality(entry.dataQuality);
+        entry.learningEligible = computeLearningEligibility(entry, { matured: true });
         const multiplier = entry.scanMc > 0 ? entry.peakMc / entry.scanMc : null;
         const wasMissedOrDowngraded = MISSED_REJECT_VERDICTS.has(entry.verdict);
 
@@ -897,42 +969,168 @@ function stopAuditLoop() {
   updateTimer = null;
 }
 
-function getAuditReport() {
+function median(values = []) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function materializeScoreEntry(entry = {}) {
+  const scan = Number(entry.scanMc || entry.firstSeenMc || 0);
+  const current = Number(entry.currentMc || entry.lastObservedMc || entry.externalMc || entry.scanMc || 0);
+  const peak = Math.max(Number(entry.peakMc || 0), current);
+  const peakMultiple = scan > 0 && peak > 0 ? peak / scan : 0;
+  const currentMultiple = scan > 0 && current > 0 ? current / scan : 0;
+  const sent = peakMultiple >= 1.5;
+  const rugged = sent && peak > 0 && current > 0 && current <= peak * 0.35;
+  const live = sent && !rugged;
+  const dud = !sent;
+  const recovered = !!entry.failedPearlRecovered;
+  return {
+    ...entry,
+    scan,
+    current,
+    peak,
+    peakMultiple,
+    currentMultiple,
+    sent,
+    rugged,
+    live,
+    dud,
+    recovered,
+  };
+}
+
+function statusLabelForScoreEntry(entry) {
+  const base = entry.sent
+    ? (entry.rugged ? '🚀 Sent → ☠️ Rugged' : '🟡 Live')
+    : '🔴 Dud';
+  if (entry.recovered) return `♻️ RECOVERED RUNNER | ${base}`;
+  return base;
+}
+
+function getScoreboardEntries(hours = 24) {
   loadAudit();
-  const recent = [...auditHistory].slice(-10).reverse();
-  const pendingSnapshot = auditQueue
-    .filter(e => !e.resolved)
-    .map(e => {
-      const current = e.currentMc ?? e.lastObservedMc ?? e.externalMc ?? e.peakMc ?? e.scanMc ?? 0;
-      const peak = Math.max(e.peakMc ?? 0, current);
-      const multiple = e.scanMc > 0 && peak > 0 ? peak / e.scanMc : 0;
-      return { ...e, current, peak, multiple };
-    })
-    .sort((a, b) => b.multiple - a.multiple)
-    .slice(0, 10);
+  const cutoff = Date.now() - hours * 60 * 60 * 1000;
+  return [...auditHistory, ...auditQueue]
+    .filter(e => Number(e.scanTime || 0) >= cutoff)
+    .map(materializeScoreEntry)
+    .sort((a, b) => b.peakMultiple - a.peakMultiple);
+}
 
-  const resolvedLines = recent.length
-    ? recent.map(e => {
-      const mult = e.scanMc > 0 && e.peakMc > 0 ? `${(e.peakMc / e.scanMc).toFixed(1)}x` : '?x';
-      const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
-      return `${e.outcome} ${e.ticker ?? e.ca.slice(0, 8)} | Scan: ${fmtUsdCompact(e.scanMc)} -> Peak: ${fmtUsdCompact(e.peakMc)} (${mult}) | ${classLabel}`;
-    })
-    : ['No resolved entries yet.'];
+function getAuditReport() {
+  const entries = getScoreboardEntries(24);
+  const tracked = entries.length;
+  const winners3x = entries.filter(e => e.peakMultiple >= 3).length;
+  const peakMultiples = entries.map(e => e.peakMultiple).filter(v => Number.isFinite(v) && v > 0);
+  const best = peakMultiples.length ? Math.max(...peakMultiples) : 0;
+  const avg = peakMultiples.length ? peakMultiples.reduce((a, b) => a + b, 0) / peakMultiples.length : 0;
+  const med = median(peakMultiples);
+  const lines = [];
+  lines.push('🟨 ORACLE SCOREBOARD | LAST 24H 🏆');
+  lines.push('');
+  lines.push(`Tracked: ${tracked} | Winners 3x+: ${winners3x} | Best: ${best > 0 ? best.toFixed(1) + 'x' : 'N/A'}`);
+  lines.push(`Avg Peak: ${avg > 0 ? avg.toFixed(1) + 'x' : 'N/A'} | Median: ${med > 0 ? med.toFixed(1) + 'x' : 'N/A'}`);
+  lines.push('');
 
-  const pendingLines = pendingSnapshot.length
-    ? pendingSnapshot.map(e => {
-      const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
-      const sourceParts = [];
-      if (e.mcUncertain) sourceParts.push('MC uncertain');
-      if (e.lastObservedSource) sourceParts.push(`seen:${e.lastObservedSource}`);
-      if (e.externalMcSource) sourceParts.push(`fetch:${e.externalMcSource}`);
-      const sourceNote = sourceParts.length ? ` | ${sourceParts.join(' / ')}` : '';
-      const shortCa = e.ca ? `${e.ca.slice(0, 6)}...${e.ca.slice(-4)}` : 'unknown';
-      return `PENDING ${e.ticker ?? shortCa} (${shortCa}) | Scan: ${fmtUsdCompact(e.scanMc)} -> Current/Peak: ${fmtUsdCompact(e.current)}/${fmtUsdCompact(e.peak)} (${e.multiple > 0 ? e.multiple.toFixed(1) : '0.0'}x) | age: ${formatAge(Date.now() - (e.scanTime || Date.now()))} | ${classLabel}${sourceNote}`;
-    })
-    : ['No pending entries.'];
+  if (!entries.length) {
+    lines.push('No tracked entries in the last 24h.');
+    return lines.join('\n');
+  }
 
-  return `AUDIT - Last 10 Resolved\n\n${resolvedLines.join('\n')}\n\nPENDING SNAPSHOT (Top 10 by current multiple)\n\n${pendingLines.join('\n')}\n\nPending means not old enough to finalize yet. Current/Peak are Oracle-seen values and may lag fast Pump/Axiom moves when sources disagree.`;
+  const podium = ['🥇', '🥈', '🥉'];
+  entries.slice(0, 10).forEach((e, idx) => {
+    const medal = podium[idx] || `#${idx + 1}`;
+    const symbol = escHtml(e.ticker || e.symbol || (e.ca ? e.ca.slice(0, 8) : 'UNKNOWN'));
+    const classLabel = resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel;
+    lines.push(`${medal} ${symbol}`);
+    lines.push(`${fmtUsdCompact(e.scan)} ➜ ${fmtUsdCompact(e.peak)} | ${e.peakMultiple > 0 ? e.peakMultiple.toFixed(1) + 'x' : 'N/A'}`);
+    lines.push(`Current: ${fmtUsdCompact(e.current)}`);
+    lines.push(`${classLabel} | ${statusLabelForScoreEntry(e)}`);
+    lines.push('');
+  });
+
+  lines.push('Status labels: 🚀 Sent | ☠️ Rugged | 🟡 Live | 🔴 Dud');
+  return lines.join('\n').trim();
+}
+
+function getAuditDetailsReport(limit = 5) {
+  const entries = getScoreboardEntries(24).slice(0, Math.max(1, limit));
+  if (!entries.length) return 'No scoreboard details available yet.';
+  const lines = ['🔎 SCOREBOARD DETAILS'];
+  lines.push('');
+  entries.forEach((e, idx) => {
+    const label = `${idx + 1}. ${escHtml(e.ticker || e.symbol || e.ca?.slice(0, 8) || 'UNKNOWN')}`;
+    lines.push(label);
+    lines.push(`CA: ${e.ca || 'N/A'}`);
+    lines.push(`Peak Rank: ${e.peakMultiple.toFixed(2)}x | Current: ${e.currentMultiple.toFixed(2)}x`);
+    lines.push(`Data: ${canonicalDataQuality(e.dataQuality)} | Learning Eligible: ${e.learningEligible ? 'true' : 'false'}`);
+    lines.push(`Status: ${statusLabelForScoreEntry(e)}`);
+    lines.push('');
+  });
+  return lines.join('\n').trim();
+}
+
+function formatRange(values = [], formatter = (v) => String(v)) {
+  const clean = values.filter(v => Number.isFinite(v));
+  if (!clean.length) return 'N/A';
+  const min = Math.min(...clean);
+  const max = Math.max(...clean);
+  if (min === max) return formatter(min);
+  return `${formatter(min)}–${formatter(max)}`;
+}
+
+function getSpeciesSummary() {
+  const entries = getScoreboardEntries(24).filter(e => e.peakMultiple >= 3);
+  if (!entries.length) {
+    return `🧠 TODAY'S WINNER SPECIES\n\nNo 3x+ winners matured yet in the last 24h.\nKeep tracking and rerun after more closes.`;
+  }
+  const mcRange = formatRange(entries.map(e => Number(e.scanMc || 0)).filter(v => v > 0), v => {
+    if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+    return `$${(v / 1_000).toFixed(0)}K`;
+  });
+  const volRange = formatRange(entries.map(e => Number(e.adjustedVolLiq || 0)).filter(v => v > 0), v => `${v.toFixed(1)}x`);
+  const top10Range = formatRange(entries.map(e => Number(e.top10Pct)).filter(v => Number.isFinite(v) && v >= 0), v => `${v.toFixed(0)}%`);
+  const bundleRange = formatRange(entries.map(e => Number(e.bundleCount || 0)).filter(v => v >= 0), v => `${Math.round(v)}/slot`);
+  const ruggedRatio = entries.filter(e => e.rugged).length / entries.length;
+  const behavior = ruggedRatio >= 0.5 ? 'fast send → violent rug' : 'send → pullback / mixed follow-through';
+  return [
+    `🧠 TODAY'S WINNER SPECIES`,
+    '',
+    `Most winners today looked like:`,
+    `MC: ${mcRange}`,
+    `Vol/Liq: ${volRange}`,
+    `Top10: ${top10Range}`,
+    `Bundle: ${bundleRange}`,
+    `Behavior: ${behavior}`,
+    '',
+    `Rule:`,
+    `Surface early as WATCH.`,
+    `Do not treat as long hold.`,
+    `Take profit fast.`,
+  ].join('\n');
+}
+
+function getLearnSummary() {
+  const entries = getScoreboardEntries(24)
+    .filter(e => e.learningEligible && e.peakMultiple >= 3);
+  if (!entries.length) {
+    return `📌 CLEAN LEARN SUMMARY\n\nNo clean (learning-eligible) 3x+ records in the last 24h yet.\nDirty/partial/uncertain records were intentionally quarantined.`;
+  }
+  const top = entries.slice(0, 5);
+  const lines = ['📌 CLEAN LEARN SUMMARY', ''];
+  lines.push(`Eligible records: ${entries.length}`);
+  lines.push('');
+  top.forEach((e, idx) => {
+    const symbol = escHtml(e.ticker || e.symbol || e.ca?.slice(0, 8) || 'UNKNOWN');
+    lines.push(`${idx + 1}. ${symbol} | ${e.peakMultiple.toFixed(1)}x | ${resolveTraderClass(e.oracleScoreClass || e.verdict, e.oracleScoreTotal).auditLabel}`);
+    lines.push(`   MC ${fmtUsdCompact(e.scan)} → ${fmtUsdCompact(e.peak)} | Top10 ${e.top10Pct != null ? e.top10Pct.toFixed(1) + '%' : 'N/A'} | Bundle ${e.bundleCount ?? 'N/A'}/slot`);
+  });
+  lines.push('');
+  lines.push('Only FULL or matured-clean PARTIAL records are included.');
+  return lines.join('\n');
 }
 
 function getAll() {
@@ -1038,6 +1236,8 @@ async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false,
     const mcResult = await fetchMcFn(entry.ca, { allowBirdeye, deepMode, auditMode: true });
     const fetchedMc = typeof mcResult === 'number' ? mcResult : mcResult?.mc ?? null;
     entry.lastChecked = Date.now();
+    entry.dataQuality = canonicalDataQuality(entry.dataQuality);
+    entry.learningEligible = computeLearningEligibility(entry, { matured: false });
     if (mcResult && typeof mcResult === 'object') {
       entry.lastMcSource = mcResult.source || null;
       entry.lastMcCheckedAt = mcResult.fetchedAt || Date.now();
@@ -1077,9 +1277,19 @@ async function processPendingOnce(fetchMcFn, { limit = 10, allowBirdeye = false,
     if (entry.externalMc > (entry.trueAthMc || 0)) entry.trueAthMc = entry.externalMc;
     entry.multipleFromFirstSeen = entry.firstSeenMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.firstSeenMc : null;
     entry.multipleFromAlert = entry.alertMc > 0 && entry.peakMc > 0 ? entry.peakMc / entry.alertMc : null;
+    if (entry.failedPearlPeakMc != null && entry.peakMc > entry.failedPearlPeakMc) {
+      entry.failedPearlRecovered = true;
+      entry.failedPearlRecoveryAt = Date.now();
+      if (entry.outcome === 'FAILED_PEARL') {
+        entry.outcome = 'RECOVERED_RUNNER';
+        entry.failureReason = null;
+      }
+    }
     if (Date.now() - entry.scanTime >= RESOLVE_MS) {
       entry.resolved = true;
       entry.outcome = classify(entry);
+      entry.dataQuality = canonicalDataQuality(entry.dataQuality);
+      entry.learningEligible = computeLearningEligibility(entry, { matured: true });
       resolved++;
       const resolvedEntry = { ...entry };
       auditHistory.push(resolvedEntry);
@@ -1296,6 +1506,9 @@ function saveForcedLearnRecord(record = {}) {
     ageMinutes: record.ageMinutes ?? null,
     narrativeType: record.narrativeType ?? 'NONE',
     narrativeStrength: record.narrativeStrength ?? 0,
+    dataQuality: canonicalDataQuality(record.dataQuality ?? 'PARTIAL'),
+    learningEligible: true,
+    dataQualityReasons: record.dataQualityReasons ?? [],
     source: record.source ?? 'manual_learn_button',
     learnedAt: record.learnedAt ?? Date.now(),
     reason: record.reason ?? 'user_forced_learn',
@@ -1365,4 +1578,7 @@ module.exports = {
   saveForcedLearnRecord,
   getLogReport,
   getLogForCa,
+  getAuditDetailsReport,
+  getSpeciesSummary,
+  getLearnSummary,
 };
