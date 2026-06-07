@@ -272,7 +272,17 @@ function scan(data) {
   const holderCount     = holders?.holderCount     ?? null;
   const topAccountCount = holders?.topAccountCount ?? null;
   const top10Pct        = holders?.top10Pct        ?? null;
+  const top50Pct        = holders?.top50Pct        ?? null;
   const holderSource    = holders?.source          ?? null;
+  const holderStatus    = holders?.holderStatus ?? (
+    holderCount != null && top10Pct != null && top50Pct != null
+      ? 'FULL'
+      : (top10Pct != null ? 'PARTIAL' : 'UNAVAILABLE')
+  );
+  const holderNote = holders?.holderNote ?? null;
+  const holderMathInvalid = holders?.concentrationValid === false;
+  const mcUncertain = !!data.mcUncertain;
+  const mcDisagreementPct = data.mcDisagreementPct ?? null;
 
   // v37.0: controlled-floor calibration.
   // Elite: 45%. Pro Pilot: 42%. Unknown sub-$100K: 40%. Post-$100K: 25%.
@@ -662,6 +672,11 @@ function scan(data) {
       earlyExpansionZone,
       narrativeType,
       narrativeStrength,
+      holderStatus,
+      holderNote,
+      holderMathInvalid,
+      mcUncertain,
+      mcDisagreementPct,
     },
     social,
   };
@@ -690,8 +705,11 @@ function scan(data) {
       uniqueWallets:  codex?.uniqueWallets ?? null,
       change1h:       codex?.change1h     ?? null,
       holderCount, topAccountCount, top10Pct, holderSource,
+      holderStatus, holderNote, holderMathInvalid,
       top3Pct:        holders?.top3Pct    ?? null,
       top50Pct:       holders?.top50Pct   ?? null,
+      mcUncertain,
+      mcDisagreementPct,
       curvePct, ctoDesc, timeWindow, bundle,
       earlyExpansionZone,
       narrativeType,

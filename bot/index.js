@@ -23,8 +23,12 @@ const {
   saveForcedLearnRecord,
   getLogReport,
   getLogForCa,
+  getAuditDetailsReport,
+  getSpeciesSummary,
+  getLearnSummary,
 } = require('./audit');
 const { resolveTraderClass } = require('./trader-ui');
+const { computeDataQuality } = require('./data-quality');
 
 function ensureDataDir() {
   const dataDir = process.env.DATA_DIR || '/data';
@@ -133,6 +137,21 @@ function buildKeyboard(ca, currentMc, verdict) {
   return { inline_keyboard: rows };
 }
 
+function buildAuditKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '♻️ REFRESH', callback_data: 'audit:refresh' },
+        { text: '🧠 SPECIES', callback_data: 'audit:species' },
+      ],
+      [
+        { text: '🔎 DETAILS', callback_data: 'audit:details' },
+        { text: '📌 LEARN', callback_data: 'audit:learn' },
+      ],
+    ],
+  };
+}
+
 function fmtUsd(n) {
   if (n == null || !Number.isFinite(Number(n)) || Number(n) <= 0) return 'N/A';
   const v = Number(n);
@@ -147,6 +166,18 @@ function summarizeBaseline(sig) {
   const haveCount = fields.filter(v => v != null).length;
   if (haveCount === 0) return 'pending';
   return haveCount === fields.length ? 'complete' : 'partial';
+}
+
+function buildPumpUsageStatus(data = {}) {
+  if (data?.pump) return { status: 'ok' };
+  const pumpStatus = data?.pumpStatus || {};
+  if (Number(pumpStatus.httpStatus || 0) === 530) {
+    return { status: 'skipped', reason: 'unavailable HTTP 530' };
+  }
+  if (pumpStatus.reason) {
+    return { status: 'failed', reason: pumpStatus.reason };
+  }
+  return { status: 'failed', reason: 'unavailable' };
 }
 
 async function beginTrackingAnyCa({ ca, chatId, preferredMc = null }) {
@@ -198,7 +229,7 @@ async function executeOracleScan(ca, {
     fetchSocialData(ca),
   ]);
 
-  if (!data.codex && !data.pump) {
+  if (!data || (!data.codex && !data.pump)) {
     return { ok: false, reason: 'NO_DATA' };
   }
 
@@ -277,11 +308,11 @@ async function executeOracleScan(ca, {
 
   result.dataUsed = {
     dex: { status: data.codex ? 'ok' : 'failed' },
-    pump: { status: data.pump ? 'ok' : 'failed' },
+    pump: buildPumpUsageStatus(data),
     birdeye: data.birdeye ? { status: 'ok' } : { status: 'skipped', reason: 'mode_or_context' },
     solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
     socialData: { status: social?.available ? 'ok' : 'failed' },
-    helius: { status: data.holders?.source === 'helius' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' ? null : 'not_primary_holder_source' },
+    helius: { status: data.holders?.source === 'helius' || data.holders?.source === 'helius-fallback' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' || data.holders?.source === 'helius-fallback' ? null : 'not_primary_holder_source' },
     codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
     deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason },
     grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || null },
@@ -291,6 +322,23 @@ async function executeOracleScan(ca, {
   result.dataUsed.forensics = result.forensics
     ? { status: result.forensics.status === 'UNKNOWN' ? 'skipped' : 'ok', reason: result.forensics.reason }
     : { status: 'skipped', reason: 'not_run' };
+
+  const quality = computeDataQuality(result, {
+    dataUsed: result.dataUsed,
+    pumpStatus: data.pumpStatus,
+    mcUncertain: data.mcUncertain,
+    mcDisagreementPct: data.mcDisagreementPct,
+    holderStatus: result.signals?.holderStatus,
+  });
+  result.dataQuality = quality.dataQuality;
+  result.learningEligible = quality.learningEligible;
+  result.dataQualityReasons = quality.reasons;
+  result.signals = {
+    ...(result.signals || {}),
+    dataQuality: quality.dataQuality,
+    learningEligible: quality.learningEligible,
+    holderStatus: result.signals?.holderStatus || data.holders?.holderStatus || 'UNAVAILABLE',
+  };
 
   if (recordAuditEntry) {
     recordScan({
@@ -328,6 +376,9 @@ async function executeOracleScan(ca, {
       forensicsStatus: result.forensics?.status,
       forensicsReason: result.forensics?.reason,
       forensicsFeatures: result.forensics?.features,
+      dataQuality: result.dataQuality,
+      dataQualityReasons: result.dataQualityReasons,
+      learningEligible: result.learningEligible,
       source,
     });
   }
@@ -346,6 +397,7 @@ const HELP_MENU =
   `• /status — API + Guardian health snapshot\n` +
   `• /apistatus — API truth panel (modes/calls/failures/skips)\n` +
   `• /audit — Run audit pass + report\n` +
+  `• /species — Winner-species summary (last 24h)\n` +
   `• /auditpending — Show unresolved audit entries\n` +
   `• /auditnow — Force one cheap pending-pass now\n` +
   `• /auditdeep — Deeper learning pass with larger caps\n` +
@@ -777,7 +829,17 @@ bot.command('audit', async ctx => {
     `${actionTimeLine('Audit Time')}\n\n` +
     `<b>/audit pass complete</b>\n` +
     `Checked: ${processed.checked} | Resolved: ${processed.resolved}\n\n` +
-    `${getAuditReport()}`
+    `${getAuditReport()}`,
+    {
+      reply_markup: buildAuditKeyboard(),
+    }
+  );
+});
+
+bot.command('species', async ctx => {
+  await ctx.replyWithHTML(
+    `${actionTimeLine('Species Time')}\n\n${getSpeciesSummary()}`,
+    { reply_markup: buildAuditKeyboard() }
   );
 });
 
@@ -1028,6 +1090,52 @@ bot.action(/^forensics:([^:]+):?(\d+)?$/, async ctx => {
 
 bot.on('callback_query', async ctx => {
   const data = ctx.callbackQuery?.data || '';
+
+  if (data === 'audit:refresh') {
+    try { await ctx.answerCbQuery('Refreshing scoreboard...'); } catch (_) {}
+    const processed = await processPendingOnce(fetchMcOnly, {
+      limit: config.AUDIT_BIRDEYE_MAX_PER_RUN,
+      allowBirdeye: true,
+      deepMode: false,
+    });
+    const body = `${actionTimeLine('Audit Time')}\n\n` +
+      `<b>/audit refresh complete</b>\n` +
+      `Checked: ${processed.checked} | Resolved: ${processed.resolved}\n\n` +
+      `${getAuditReport()}`;
+    try {
+      await ctx.editMessageText(body, {
+        parse_mode: 'HTML',
+        reply_markup: buildAuditKeyboard(),
+      });
+    } catch (_) {
+      await ctx.replyWithHTML(body, { reply_markup: buildAuditKeyboard() });
+    }
+    return;
+  }
+
+  if (data === 'audit:species') {
+    try { await ctx.answerCbQuery('Summarizing species...'); } catch (_) {}
+    await ctx.replyWithHTML(`${actionTimeLine('Species Time')}\n\n${getSpeciesSummary()}`, {
+      reply_markup: buildAuditKeyboard(),
+    });
+    return;
+  }
+
+  if (data === 'audit:details') {
+    try { await ctx.answerCbQuery('Opening details...'); } catch (_) {}
+    await ctx.replyWithHTML(`${actionTimeLine('Audit Details Time')}\n\n${getAuditDetailsReport(8)}`, {
+      reply_markup: buildAuditKeyboard(),
+    });
+    return;
+  }
+
+  if (data === 'audit:learn') {
+    try { await ctx.answerCbQuery('Compiling clean lessons...'); } catch (_) {}
+    await ctx.replyWithHTML(`${actionTimeLine('Audit Learn Time')}\n\n${getLearnSummary()}`, {
+      reply_markup: buildAuditKeyboard(),
+    });
+    return;
+  }
 
   if (data.startsWith('alert:')) {
     const parts  = data.split(':');

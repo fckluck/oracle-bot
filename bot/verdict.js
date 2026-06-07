@@ -49,6 +49,27 @@ function fmtMult(n) {
   return `${n.toFixed(2)}x`;
 }
 
+function dataQualityBadge(label) {
+  const key = String(label || '').toUpperCase();
+  if (key === 'FULL') return '🟢 FULL';
+  if (key === 'PARTIAL') return '🟡 PARTIAL';
+  if (key === 'MC_UNCERTAIN') return '🟠 MC UNCERTAIN';
+  if (key === 'INVALID') return '🔴 INVALID';
+  return '⚪ UNKNOWN';
+}
+
+function pumpFunStatusLine(dataUsed = {}) {
+  const pump = dataUsed?.pump;
+  if (!pump || typeof pump !== 'object') return null;
+  const status = String(pump.status || '').toLowerCase();
+  const reason = String(pump.reason || '');
+  if (status === 'skipped' && /530/.test(reason)) return 'PumpFun: skipped/unavailable HTTP 530';
+  if (status === 'ok') return 'PumpFun: OK';
+  if (status === 'failed' && reason) return `PumpFun: unavailable (${reason})`;
+  if (status === 'skipped' && reason) return `PumpFun: skipped (${reason})`;
+  return null;
+}
+
 function isPumpLikeToken(signals = {}, ca = '') {
   const caText = String(ca || signals.ca || '');
   const source = String(signals.source || signals.detectedSource || signals.huntSource || '').toLowerCase();
@@ -169,6 +190,9 @@ function formatShortCard(result, ca) {
     healthIntact: !signals.sybilFunded && (signals.washPct == null || signals.washPct <= 30),
   });
   const lines = [];
+  const dataQuality = result?.dataQuality || signals?.dataQuality || 'PARTIAL';
+  const holderStatus = String(signals?.holderStatus || 'UNAVAILABLE').toUpperCase();
+  const pumpLine = pumpFunStatusLine(result?.dataUsed || {});
   lines.push(actionTimeLine(result?.context === 'hunt' ? 'Hunt Time' : 'Scan Time', result?.scannedAt || Date.now()));
   lines.push('');
   lines.push('🎯 ' + b('ORACLE SIGNAL'));
@@ -177,6 +201,9 @@ function formatShortCard(result, ca) {
   lines.push(b('Score:') + ' ' + b(score));
   lines.push(b('Move Potential:') + ' ' + b(traderClass.movePotential));
   lines.push(b('Confidence:') + ' ' + b(confidence));
+  lines.push(b('Data:') + ' ' + b(dataQualityBadge(dataQuality)));
+  lines.push(b('Holder Status:') + ' ' + b(holderStatus));
+  if (pumpLine) lines.push(esc(pumpLine));
   lines.push(b(entryLabel(entryState)));
   lines.push('');
   lines.push(b('Setup:'));
@@ -192,6 +219,7 @@ function formatShortCard(result, ca) {
   lines.push(`Vol/Liq: ${fmt(signals.adjustedVolLiq, 2)}x`);
   lines.push(`Wash: ${fmtPct(signals.washPct, 0)}`);
   lines.push(`Top10: ${fmtPct(signals.top10Pct, 1)}`);
+  lines.push(`Top50: ${fmtPct(signals.top50Pct, 1)}`);
   lines.push(`Bundle: ${signals.bundleCount ?? 0}/slot`);
   lines.push(`Age: ${ageMinutes}`);
   lines.push('');
@@ -323,6 +351,9 @@ function formatVerdict(result, ca, options = {}) {
   const adjustedVolLiq= signals.adjustedVolLiq;
   const rawVolLiq     = signals.rawVolLiq;
   const L = [];
+  const dataQuality = result?.dataQuality || signals?.dataQuality || 'PARTIAL';
+  const holderStatus = String(signals?.holderStatus || 'UNAVAILABLE').toUpperCase();
+  const pumpLine = pumpFunStatusLine(result?.dataUsed || {});
 
   L.push(actionTimeLine('Scan Time', result.scannedAt || Date.now()));
   L.push('');
@@ -402,6 +433,8 @@ function formatVerdict(result, ca, options = {}) {
     L.push(`Adjusted Vol/Liq ${adjustedVolLiq.toFixed(2)}x below 5x minimum`);
   }
   L.push(`Mode: ${b(timeWindow)}${timeWindow === 'DEAD_ZONE' ? ' ' + i('(TP1 $50K | SL 25% | Min 5x Adjusted)') : ''}`);
+  L.push(`Data: ${b(dataQualityBadge(dataQuality))}`);
+  if (pumpLine) L.push(esc(pumpLine));
   if (result.oracleScore) {
     L.push(`Oracle Score: ${b(`${result.oracleScore.total}/100`)} | Class: ${b(result.oracleScore.class)}`);
     if (result.oracleScore.hardBlocks?.length) {
@@ -578,6 +611,7 @@ function formatVerdict(result, ca, options = {}) {
         signals.top10Pct <= top10Threshold   ? 'ELEVATED' : 'FAIL'
       )})`
     : `UNVERIFIED`;
+  const top50Display = signals.top50Pct != null ? fmtPct(signals.top50Pct) : 'N/A';
 
   let curveDisplay;
   if (signals.curvePct !== null) {
@@ -589,8 +623,21 @@ function formatVerdict(result, ca, options = {}) {
   }
 
   L.push(b('── SAFETY ──'));
-  L.push(`• ${b('Holders:')} ${holderDisplay}`);
-  L.push(`• ${b('Top 10:')} ${top10Display}`);
+  if (holderStatus === 'UNAVAILABLE') {
+    L.push(`• ${b('Holders:')} N/A`);
+    L.push(`• ${b('Top 10:')} N/A`);
+    L.push(`• ${b('Top 50:')} N/A`);
+  } else if (holderStatus === 'PARTIAL' && (signals.holderCount == null || !Number.isFinite(Number(signals.holderCount)))) {
+    const top10Partial = signals.top10Pct != null ? `${fmtPct(signals.top10Pct)}${signals.holderNote ? ` (${esc(signals.holderNote)})` : ''}` : 'N/A';
+    L.push(`• ${b('Holders:')} N/A`);
+    L.push(`• ${b('Top 10:')} ${top10Partial}`);
+    L.push(`• ${b('Top 50:')} N/A`);
+  } else {
+    L.push(`• ${b('Holders:')} ${holderDisplay}`);
+    L.push(`• ${b('Top 10:')} ${top10Display}`);
+    L.push(`• ${b('Top 50:')} ${top50Display}`);
+  }
+  L.push(`• ${b('Holder Status:')} ${holderStatus}${signals.holderNote ? ` (${esc(signals.holderNote)})` : ''}`);
   L.push(`• ${b('Curve:')} ${curveDisplay}`);
   L.push('');
 

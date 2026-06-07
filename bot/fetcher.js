@@ -48,6 +48,74 @@ function heliusRpc() {
   return key ? `https://mainnet.helius-rpc.com/?api-key=${key}` : null;
 }
 
+function asFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function isValidPct(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+function normalizeHolderAccounts(accounts = []) {
+  const normalized = [];
+  let malformed = false;
+  let pctSum = 0;
+
+  for (const a of accounts) {
+    const rawPct = a?.percentage;
+    const pct = rawPct == null ? null : asFiniteNumber(rawPct);
+    if (rawPct != null && pct == null) malformed = true;
+    if (pct != null && !isValidPct(pct)) malformed = true;
+    if (pct != null && isValidPct(pct)) pctSum += pct;
+
+    normalized.push({
+      address: a?.address || a?.wallet || a?.owner || null,
+      owner: a?.owner || a?.wallet || a?.address || null,
+      uiAmount: a?.uiAmount ?? a?.amount ?? a?.balance ?? null,
+      percentage: pct,
+    });
+  }
+
+  const top3Pct = normalized.slice(0, 3).reduce((s, a) => s + (a.percentage || 0), 0);
+  const top10Pct = normalized.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0);
+  const top20Pct = normalized.slice(0, 20).reduce((s, a) => s + (a.percentage || 0), 0);
+  const top50Pct = normalized.slice(0, 50).reduce((s, a) => s + (a.percentage || 0), 0);
+  const sumInvalid = pctSum > 100.0001;
+  const topInvalid = !isValidPct(top10Pct) || !isValidPct(top50Pct);
+  const concentrationValid = normalized.length > 0 && !malformed && !sumInvalid && !topInvalid;
+
+  let concentrationError = null;
+  if (!normalized.length) concentrationError = 'no_holder_accounts';
+  else if (malformed) concentrationError = 'malformed_holder_percentages';
+  else if (sumInvalid) concentrationError = 'holder_percentage_sum_over_100';
+  else if (topInvalid) concentrationError = 'top_holder_concentration_out_of_range';
+
+  return {
+    topWallets: normalized,
+    top3Pct: concentrationValid ? top3Pct : null,
+    top10Pct: concentrationValid ? top10Pct : null,
+    top20Pct: concentrationValid ? top20Pct : null,
+    top50Pct: concentrationValid ? top50Pct : null,
+    concentrationValid,
+    concentrationError,
+  };
+}
+
+function buildUnavailableHolderSnapshot(reason) {
+  return {
+    holderCount: null,
+    top3Pct: null,
+    top10Pct: null,
+    top20Pct: null,
+    top50Pct: null,
+    topWallets: [],
+    source: 'holder-unavailable',
+    holderStatus: 'UNAVAILABLE',
+    holderNote: reason || 'holder_data_unavailable',
+  };
+}
+
 // ── DexScreener ──────────────────────────────────────────────────────────────
 
 async function fetchDexScreener(ca) {
@@ -140,22 +208,51 @@ async function fetchSolanaTrackerHolders(ca) {
     });
     if (!res.ok) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: `HTTP ${res.status}` }); console.log(`[fetchSolanaTrackerHolders] HTTP ${res.status}`); return null; }
     const data = await res.json();
-    const total = typeof data?.total === 'number' ? data.total : null;
-    if (!total) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: 'no total holders' }); return null; }
+    const totalRaw = data?.total;
+    const total = Number.isFinite(Number(totalRaw)) && Number(totalRaw) >= 0 ? Number(totalRaw) : null;
     const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
-    const top20Pct = accounts.slice(0, 20).reduce((s, a) => s + (a.percentage || 0), 0) || null;
-    const topWallets = accounts.slice(0, 50).map(a => ({
-      address: a.address || a.wallet || a.owner || null,
-      owner: a.owner || a.wallet || a.address || null,
-      uiAmount: a.uiAmount ?? a.amount ?? a.balance ?? null,
-      percentage: a.percentage ?? null,
-    }));
-    const top3Pct  = accounts.slice(0, 3).reduce((s, a)  => s + (a.percentage || 0), 0) || null;
-    const top10Pct = accounts.slice(0, 10).reduce((s, a) => s + (a.percentage || 0), 0) || null;
-    const top50Pct = accounts.slice(0, 50).reduce((s, a) => s + (a.percentage || 0), 0) || null;
-    console.log(`[fetchSolanaTrackerHolders] total=${total} top10=${top10Pct?.toFixed(1)}% top50=${top50Pct?.toFixed(1)}%`);
-    markApi('SolanaTracker', { ok: true, meta: { endpoint: 'holders', holders: total, top10Pct } });
-    return { holderCount: total, top3Pct, top10Pct, top20Pct, top50Pct, topWallets, source: 'solanatracker-holders' };
+    const normalized = normalizeHolderAccounts(accounts);
+    if (!normalized.concentrationValid) {
+      markApi('SolanaTracker', {
+        ok: false,
+        meta: { endpoint: 'holders', holders: total, reason: normalized.concentrationError },
+        error: normalized.concentrationError || 'invalid concentration',
+      });
+      console.log(`[fetchSolanaTrackerHolders] invalid concentration (${normalized.concentrationError || 'unknown'}) total=${total ?? 'null'}`);
+      return {
+        holderCount: total,
+        top3Pct: null,
+        top10Pct: null,
+        top20Pct: null,
+        top50Pct: null,
+        topWallets: normalized.topWallets,
+        source: 'solanatracker-holders',
+        concentrationValid: false,
+        concentrationError: normalized.concentrationError || 'invalid_concentration',
+      };
+    }
+
+    const holderStatus = total != null ? 'FULL' : 'PARTIAL';
+    console.log(`[fetchSolanaTrackerHolders] total=${total ?? 'null'} top10=${normalized.top10Pct?.toFixed(1)}% top50=${normalized.top50Pct?.toFixed(1)}% status=${holderStatus}`);
+    markApi('SolanaTracker', {
+      ok: true,
+      meta: { endpoint: 'holders', holders: total, top10Pct: normalized.top10Pct, holderStatus },
+    });
+    return {
+      holderCount: total,
+      top3Pct: normalized.top3Pct,
+      top10Pct: normalized.top10Pct,
+      top20Pct: normalized.top20Pct,
+      top50Pct: normalized.top50Pct,
+      topWallets: normalized.topWallets,
+      source: 'solanatracker-holders',
+      concentrationValid: true,
+      concentrationError: null,
+      holderStatus,
+      holderNote: total == null
+        ? 'SolanaTracker partial concentration (holder count unavailable)'
+        : 'SolanaTracker full holder data',
+    };
   } catch (e) { markApi('SolanaTracker', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchSolanaTrackerHolders] error:', e.message); return null; }
 }
 
@@ -397,10 +494,20 @@ const PUMPFUN_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
 };
 
-async function fetchPumpPortal(ca) {
+async function fetchPumpPortal(ca, statusRef = null) {
   try {
     const res = await fetch(`${PUMPFUN_URL}${ca}`, { headers: PUMPFUN_HEADERS, timeout: 6000 });
-    if (!res.ok) { markApi('PumpFun', { ok: false, error: `HTTP ${res.status}` }); console.log(`[fetchPumpPortal] HTTP ${res.status}`); return null; }
+    if (!res.ok) {
+      if (statusRef) {
+        statusRef.ok = false;
+        statusRef.httpStatus = res.status;
+        statusRef.reason = `HTTP ${res.status}`;
+        statusRef.unavailable = true;
+      }
+      markApi('PumpFun', { ok: false, error: `HTTP ${res.status}` });
+      console.log(`[fetchPumpPortal] HTTP ${res.status}`);
+      return null;
+    }
     const data = await res.json();
     const migrated = data.complete === true || !!data.raydium_pool;
     // Approximate bonding-curve progress from virtual reserves.
@@ -413,6 +520,12 @@ async function fetchPumpPortal(ca) {
     })();
     console.log(`[fetchPumpPortal] migrated=${migrated} curvePct=${curvePct} mc=$${data.usd_market_cap || data.market_cap || 0}`);
     markApi('PumpFun', { ok: true, meta: { migrated, curvePct, mc: data.usd_market_cap || data.market_cap || 0 } });
+    if (statusRef) {
+      statusRef.ok = true;
+      statusRef.httpStatus = 200;
+      statusRef.reason = null;
+      statusRef.unavailable = false;
+    }
     return {
       name:           data.name        || 'UNKNOWN',
       symbol:         data.symbol      || '???',
@@ -428,21 +541,40 @@ async function fetchPumpPortal(ca) {
       telegram:       data.telegram    || null,
       website:        data.website     || null,
     };
-  } catch (e) { markApi('PumpFun', { ok: false, error: e.message }); console.error('[fetchPumpPortal] error:', e.message); return null; }
+  } catch (e) {
+    if (statusRef) {
+      statusRef.ok = false;
+      statusRef.httpStatus = null;
+      statusRef.reason = e.message;
+      statusRef.unavailable = true;
+    }
+    markApi('PumpFun', { ok: false, error: e.message });
+    console.error('[fetchPumpPortal] error:', e.message);
+    return null;
+  }
 }
 
 // ── pump.fun dev stats (replaces dead PumpPortal user-stats endpoint) ─────────
 // GET https://frontend-api.pump.fun/coins/user-created-coins/{wallet}?offset=0&limit=200
 // Returns array of coin objects; complete=true / raydium_pool!=null = graduated.
 
-async function fetchDevStats(devWallet) {
+async function fetchDevStats(devWallet, statusRef = null) {
   if (!devWallet) { markApi('PumpFun', { skipped: true, meta: { endpoint: 'devStats', reason: 'no_wallet' } }); return null; }
   try {
     const res = await fetch(
       `${PUMPFUN_USER}${devWallet}?offset=0&limit=200`,
       { headers: PUMPFUN_HEADERS, timeout: 8000 }
     );
-    if (!res.ok) { markApi('PumpFun', { ok: false, meta: { endpoint: 'devStats' }, error: `HTTP ${res.status}` }); console.log(`[fetchDevStats] HTTP ${res.status}`); return null; }
+    if (!res.ok) {
+      if (statusRef) {
+        statusRef.ok = false;
+        statusRef.httpStatus = res.status;
+        statusRef.reason = `HTTP ${res.status}`;
+      }
+      markApi('PumpFun', { ok: false, meta: { endpoint: 'devStats' }, error: `HTTP ${res.status}` });
+      console.log(`[fetchDevStats] HTTP ${res.status}`);
+      return null;
+    }
     const data = await res.json();
     if (!Array.isArray(data)) { console.log('[fetchDevStats] unexpected shape'); return null; }
     const totalLaunches = data.length;
@@ -450,8 +582,22 @@ async function fetchDevStats(devWallet) {
     const winRate       = totalLaunches > 0 ? +(migratedCount / totalLaunches * 100).toFixed(2) : null;
     console.log(`[fetchDevStats] launches=${totalLaunches} migrated=${migratedCount} winRate=${winRate}%`);
     markApi('PumpFun', { ok: true, meta: { endpoint: 'devStats', totalLaunches, migratedCount, winRate } });
+    if (statusRef) {
+      statusRef.ok = true;
+      statusRef.httpStatus = 200;
+      statusRef.reason = null;
+    }
     return { totalLaunches, migratedCount, winRate };
-  } catch (e) { markApi('PumpFun', { ok: false, meta: { endpoint: 'devStats' }, error: e.message }); console.error('[fetchDevStats] error:', e.message); return null; }
+  } catch (e) {
+    if (statusRef) {
+      statusRef.ok = false;
+      statusRef.httpStatus = null;
+      statusRef.reason = e.message;
+    }
+    markApi('PumpFun', { ok: false, meta: { endpoint: 'devStats' }, error: e.message });
+    console.error('[fetchDevStats] error:', e.message);
+    return null;
+  }
 }
 
 // ── Helius — Token Creator fallback ──────────────────────────────────────────
@@ -893,6 +1039,96 @@ async function fetchCodexHolders(ca) {
   } catch (e) { markApi('Codex', { ok: false, meta: { endpoint: 'holders' }, error: e.message }); console.error('[fetchCodexHolders] error:', e.message); return null; }
 }
 
+function sanitizeConcentrationField(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function concentrationLooksValid(holderPayload = {}, { requireTop50 = false } = {}) {
+  const top10 = sanitizeConcentrationField(holderPayload.top10Pct);
+  const top50 = sanitizeConcentrationField(holderPayload.top50Pct);
+  if (top10 == null) return false;
+  if (!isValidPct(top10)) return false;
+  if (requireTop50) {
+    if (top50 == null) return false;
+    if (!isValidPct(top50)) return false;
+  } else if (top50 != null && !isValidPct(top50)) {
+    return false;
+  }
+  return true;
+}
+
+async function resolveHolderSnapshot(ca, {
+  allowCodex = true,
+  context = 'manual',
+  beOverview = null,
+  pump = null,
+} = {}) {
+  if (allowCodex) {
+    const codex = await fetchCodexHolders(ca);
+    if (codex && concentrationLooksValid(codex, { requireTop50: false })) {
+      const holderCount = Number.isFinite(Number(codex.holderCount)) ? Number(codex.holderCount) : null;
+      console.log(`[resolveHolderSnapshot] holders: Codex count=${holderCount ?? 'null'} top10=${codex.top10Pct?.toFixed(1)}%`);
+      return {
+        ...codex,
+        holderCount,
+        holderStatus: holderCount != null ? 'FULL' : 'PARTIAL',
+        holderNote: holderCount != null ? 'Codex holder snapshot' : 'Codex partial concentration',
+      };
+    }
+  } else {
+    markApi('Codex', { skipped: true, meta: { reason: 'mode_disabled', mode: config.CODEX_MODE, context } });
+  }
+
+  const stHolders = await fetchSolanaTrackerHolders(ca);
+  const stHasValidConcentration = !!(stHolders && stHolders.concentrationValid === true && concentrationLooksValid(stHolders, { requireTop50: true }));
+  if (stHasValidConcentration) {
+    const holderCount = Number.isFinite(Number(stHolders.holderCount)) ? Number(stHolders.holderCount) : null;
+    const holderStatus = holderCount != null ? 'FULL' : 'PARTIAL';
+    console.log(`[resolveHolderSnapshot] holders: SolanaTracker count=${holderCount ?? 'null'} top10=${stHolders.top10Pct?.toFixed(1)}% status=${holderStatus}`);
+    return {
+      ...stHolders,
+      holderCount,
+      holderStatus,
+      holderNote: holderCount == null
+        ? 'Top10 via SolanaTracker partial'
+        : 'Top10/Top50 via SolanaTracker',
+    };
+  }
+
+  const stInvalid = stHolders && stHolders.concentrationValid === false;
+  if (stInvalid) {
+    console.log(`[resolveHolderSnapshot] SolanaTracker concentration invalid (${stHolders.concentrationError || 'unknown'}) — trying Helius fallback`);
+  }
+
+  const helius = await fetchHeliusHolders(ca);
+  if (helius && concentrationLooksValid(helius, { requireTop50: false })) {
+    // Helius provides largest-account concentration; holder count may still be unavailable.
+    const holderCount = Number.isFinite(Number(beOverview?.holderCount))
+      ? Number(beOverview.holderCount)
+      : (Number.isFinite(Number(pump?.holderCount)) ? Number(pump.holderCount) : null);
+    const holderStatus = holderCount == null ? 'PARTIAL' : 'PARTIAL';
+    console.log(`[resolveHolderSnapshot] holders: Helius fallback top10=${helius.top10Pct?.toFixed(1)}% holderCount=${holderCount ?? 'null'}`);
+    return {
+      ...helius,
+      holderCount,
+      top50Pct: null,
+      holderStatus,
+      holderNote: holderCount == null
+        ? 'Top10 via Helius/SolanaTracker partial'
+        : 'Top10 via Helius fallback (count partial)',
+      source: stInvalid ? 'helius-fallback' : 'helius',
+    };
+  }
+
+  if (stInvalid) {
+    return buildUnavailableHolderSnapshot(`SolanaTracker invalid (${stHolders.concentrationError || 'malformed'}), Helius fallback unavailable`);
+  }
+  return buildUnavailableHolderSnapshot('SolanaTracker/Helius holder concentration unavailable');
+}
+
 // ── fetchAll ──────────────────────────────────────────────────────────────────
 
 // opts.quickFilter = true → skip Birdeye + SolanaTracker when raw vol/liq is
@@ -904,6 +1140,17 @@ async function fetchAll(ca, opts = {}) {
   const context = getFetchContext(opts);
   const allowBirdeye = birdeyeAllowed(opts);
   const allowCodex = !(opts.skipCodex || config.CODEX_MODE === 'off');
+  const pumpStatus = {
+    ok: false,
+    unavailable: false,
+    httpStatus: null,
+    reason: null,
+  };
+  const pumpDevStatus = {
+    ok: false,
+    httpStatus: null,
+    reason: null,
+  };
   if (opts.skipGMGN || config.GMGN_MODE === 'audit_only') {
     markApi('GMGN', { skipped: true, meta: { reason: opts.skipGMGN ? 'skip_flag' : 'audit_only_mode', context } });
   }
@@ -913,13 +1160,17 @@ async function fetchAll(ca, opts = {}) {
 
   // Phase 1a: cheap market data only (DexScreener + PumpPortal are free)
   const [pump, dex] = await Promise.all([
-    fetchPumpPortal(ca),
+    fetchPumpPortal(ca, pumpStatus),
     fetchDexScreener(ca),
   ]);
+  if (!pump && !pumpStatus.reason) {
+    pumpStatus.unavailable = true;
+    pumpStatus.reason = 'unavailable';
+  }
 
   console.log(`[fetchAll] PumpPortal: ${pump
     ? `OK — migrated=${pump.migrated} curve=${pump.curvePct}% holders=${pump.holderCount}`
-    : 'null'}`);
+    : `null (${pumpStatus.reason || 'unavailable'})`}`);
   console.log(`[fetchAll] DexScreener: ${dex
     ? `OK — lp=$${dex.lp} vol1h=$${dex.volume1h} volLiq=${dex.volLiq.toFixed(2)}x`
     : 'null'}`);
@@ -1020,51 +1271,9 @@ async function fetchAll(ca, opts = {}) {
   // regardless of which holder source wins (Bug 6 fix: Birdeye wash signals were
   // previously skipped whenever Codex or SolanaTracker holder data succeeded).
   const [holders, bundle, devStats, devPeak, walletAge, stDeployer] = await Promise.all([
-    (async () => {
-      // Holder source precedence (richest → cheapest):
-      //   1. Codex               — full list, best concentration data
-      //   2. SolanaTracker       — full count + top10/top3 from percentage field
-      //   3. Helius              — accurate top10 concentration, only top-20 wallets
-      //      → augmented with Birdeye/PumpPortal full count when possible
-      //   4. Birdeye-only        — count only, no concentration
-      //   5. PumpPortal-only     — count only, no concentration
-      let h = null;
-      if (allowCodex) {
-        h = await fetchCodexHolders(ca);
-      } else {
-        markApi('Codex', { skipped: true, meta: { reason: 'mode_disabled', mode: config.CODEX_MODE, context } });
-      }
-      if (h) { console.log(`[fetchAll] holders: Codex — count=${h.holderCount} top10=${h.top10Pct?.toFixed(1)}%`); return h; }
-
-      // SolanaTracker holders: full count + concentration in one call — use if available
-      const stHolders = await fetchSolanaTrackerHolders(ca);
-      if (stHolders) { console.log(`[fetchAll] holders: SolanaTracker — count=${stHolders.holderCount} top10=${stHolders.top10Pct?.toFixed(1)}%`); return stHolders; }
-
-      // Helius (top10) — beOverview already fetched in Phase 1b (in scope via closure)
-      const helius = await fetchHeliusHolders(ca);
-
-      if (helius) {
-        // Prefer Birdeye full count over PumpPortal; both override Helius's top-20 floor
-        helius.holderCount = beOverview?.holderCount ?? pump?.holderCount ?? helius.holderCount;
-        const src = beOverview?.holderCount ? 'Helius+Birdeye' : pump?.holderCount ? 'Helius+PumpPortal' : 'Helius (floor)';
-        console.log(`[fetchAll] holders: ${src} — count=${helius.holderCount || `${helius.topAccountCount}+`} top10=${helius.top10Pct.toFixed(1)}%`);
-        return helius;
-      }
-
-      if (beOverview?.holderCount) {
-        console.log(`[fetchAll] holders: Birdeye count=${beOverview.holderCount} (no concentration)`);
-        return { holderCount: beOverview.holderCount, top10Pct: null, top20Pct: null, top3Pct: null, topWallets: [], source: 'birdeye' };
-      }
-      if (pump?.holderCount) {
-        console.log(`[fetchAll] holders: PumpPortal count=${pump.holderCount} (no concentration)`);
-        return { holderCount: pump.holderCount, top10Pct: null, top20Pct: null, top3Pct: null, topWallets: [], source: 'pumpportal' };
-      }
-
-      console.log('[fetchAll] holders: null — UNVERIFIED');
-      return null;
-    })(),
+    resolveHolderSnapshot(ca, { allowCodex, context, beOverview, pump }),
     fetchBundleAndFunding(pairAddress),
-    fetchDevStats(devWallet),
+    fetchDevStats(devWallet, pumpDevStatus),
     fetchDevPeak(devWallet),
     fetchWalletAge(devWallet),
     fetchSolanaTrackerDeployer(devWallet),
@@ -1109,7 +1318,41 @@ async function fetchAll(ca, opts = {}) {
 
   // deFadeScore stays null pre-scan; verifyWithDeFade is called post-scan
   // only on BUY candidates (respects 100 req/day free-plan quota).
-  return { codex, pump, holders, bundle, devStats, devPeak, walletAge, devWallet, birdeye, deFadeScore: null, stToken, stDeployer, washPct, washVolumeUsd, washSource, snipersPct, insidersPct, stRiskScore };
+  let mcUncertain = false;
+  let mcDisagreementPct = null;
+  const dexMc = asFiniteNumber(dex?.marketCap);
+  const pumpMc = asFiniteNumber(pump?.marketCap);
+  if (dexMc != null && pumpMc != null && dexMc > 0 && pumpMc > 0) {
+    const high = Math.max(dexMc, pumpMc);
+    const low = Math.min(dexMc, pumpMc);
+    mcDisagreementPct = ((high - low) / high) * 100;
+    mcUncertain = mcDisagreementPct >= 25;
+  }
+
+  return {
+    codex,
+    pump,
+    holders,
+    bundle,
+    devStats,
+    devPeak,
+    walletAge,
+    devWallet,
+    birdeye,
+    deFadeScore: null,
+    stToken,
+    stDeployer,
+    washPct,
+    washVolumeUsd,
+    washSource,
+    snipersPct,
+    insidersPct,
+    stRiskScore,
+    pumpStatus,
+    pumpDevStatus,
+    mcUncertain,
+    mcDisagreementPct,
+  };
 }
 
 // ── SocialData — X/Twitter CA mention velocity (15m window) ──────────────────
@@ -1202,11 +1445,17 @@ async function fetchSocialData(ca) {
 // > adjusted always, so alerts fire conservatively (slightly later, never
 // earlier).
 async function fetchForensic(ca) {
-  const [dex, holders, birdeye] = await Promise.all([
+  const [dex, birdeye] = await Promise.all([
     fetchDexScreener(ca),
-    fetchSolanaTrackerHolders(ca),
     fetchBirdeye(ca).catch(() => null),
   ]);
+
+  const holders = await resolveHolderSnapshot(ca, {
+    allowCodex: false,
+    context: 'forensic',
+    beOverview: null,
+    pump: null,
+  });
 
   if (!dex) return null;
 
@@ -1230,6 +1479,8 @@ async function fetchForensic(ca) {
     top50Pct:       holders?.top50Pct    ?? null,
     topWallets:     holders?.topWallets  ?? [],
     holderSource:   holders?.source      ?? null,
+    holderStatus:   holders?.holderStatus ?? 'UNAVAILABLE',
+    holderNote:     holders?.holderNote ?? null,
     ageMinutes:     dex.ageMinutes       ?? null,
     priceChange5m:  birdeye?.priceChange5m ?? null,
   };

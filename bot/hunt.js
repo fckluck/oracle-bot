@@ -30,6 +30,7 @@ const { actionTimeLine } = require('./time');
 const { getApiStats, markApi } = require('./telemetry');
 const config               = require('./config');
 const { resolveTraderClass } = require('./trader-ui');
+const { computeDataQuality } = require('./data-quality');
 
 const WS_BASE_URL      = 'wss://pumpportal.fun/api/data';
 const DEX_PROFILES_URL = 'https://api.dexscreener.com/token-profiles/latest/v1';
@@ -134,6 +135,16 @@ function markSuppressed(ca, result, reason) {
 }
 
 function isSolanaCA(text) { return typeof text === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,50}$/.test(text.trim()); }
+
+function buildPumpUsageStatus(data = {}) {
+  if (data?.pump) return { status: 'ok' };
+  const pumpStatus = data?.pumpStatus || {};
+  if (Number(pumpStatus.httpStatus || 0) === 530) {
+    return { status: 'skipped', reason: 'unavailable HTTP 530' };
+  }
+  if (pumpStatus.reason) return { status: 'failed', reason: pumpStatus.reason };
+  return { status: 'failed', reason: 'unavailable' };
+}
 
 // ── Hunter registry (persisted) ─────────────────────────────────────────────
 
@@ -409,6 +420,39 @@ async function runScan(job, broadcaster) {
       };
     }
 
+    const preDataUsed = {
+      dex: { status: data.codex ? 'ok' : 'failed' },
+      pump: buildPumpUsageStatus(data),
+      birdeye: { status: 'skipped', reason: 'hunt_hard_block' },
+      solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
+      socialData: { status: social?.available ? 'ok' : 'skipped', reason: social?.available ? null : 'candidate_threshold_or_unavailable' },
+      helius: { status: data.holders?.source === 'helius' || data.holders?.source === 'helius-fallback' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' || data.holders?.source === 'helius-fallback' ? null : 'not_primary_holder_source' },
+      codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
+      deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason || 'optional' },
+      grok: { status: 'skipped', reason: 'post_gate_only' },
+      gmgn: { status: 'skipped', reason: 'audit_only' },
+      rugcheck: { status: 'skipped', reason: 'pre_alert_optional_not_run' },
+      forensics: result.forensics
+        ? { status: result.forensics.status === 'UNKNOWN' ? 'skipped' : 'ok', reason: result.forensics.reason }
+        : { status: 'skipped', reason: 'not_run' },
+    };
+    const quality = computeDataQuality(result, {
+      dataUsed: preDataUsed,
+      pumpStatus: data.pumpStatus,
+      mcUncertain: data.mcUncertain,
+      mcDisagreementPct: data.mcDisagreementPct,
+      holderStatus: result.signals?.holderStatus,
+    });
+    result.dataQuality = quality.dataQuality;
+    result.learningEligible = quality.learningEligible;
+    result.dataQualityReasons = quality.reasons;
+    result.signals = {
+      ...(result.signals || {}),
+      dataQuality: quality.dataQuality,
+      learningEligible: quality.learningEligible,
+      holderStatus: result.signals?.holderStatus || data.holders?.holderStatus || 'UNAVAILABLE',
+    };
+
     // Audit every candidate that clears the Hunt vol floor, even when Telegram is suppressed.
     recordScan({
       ca,
@@ -449,6 +493,9 @@ async function runScan(job, broadcaster) {
       forensicsStatus: result.forensics?.status,
       forensicsReason: result.forensics?.reason,
       forensicsFeatures: result.forensics?.features,
+      dataQuality: result.dataQuality,
+      dataQualityReasons: result.dataQualityReasons,
+      learningEligible: result.learningEligible,
       source:         'hunt',
     });
 
@@ -528,11 +575,11 @@ async function runScan(job, broadcaster) {
 
     result.dataUsed = {
       dex: { status: data.codex ? 'ok' : 'failed' },
-      pump: { status: data.pump ? 'ok' : 'failed' },
+      pump: buildPumpUsageStatus(data),
       birdeye: { status: 'skipped', reason: 'hunt_hard_block' },
       solanaTracker: { status: (!!data.stToken || !!data.stDeployer || data.holders?.source === 'solanatracker-holders') ? 'ok' : 'failed' },
       socialData: { status: social?.available ? 'ok' : 'skipped', reason: social?.available ? null : 'candidate_threshold_or_unavailable' },
-      helius: { status: data.holders?.source === 'helius' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' ? null : 'not_primary_holder_source' },
+      helius: { status: data.holders?.source === 'helius' || data.holders?.source === 'helius-fallback' ? 'ok' : 'skipped', reason: data.holders?.source === 'helius' || data.holders?.source === 'helius-fallback' ? null : 'not_primary_holder_source' },
       codex: { status: data.holders?.source === 'codex' ? 'ok' : (config.CODEX_MODE === 'off' ? 'skipped' : 'failed'), reason: config.CODEX_MODE === 'off' ? 'codex_off' : null },
       deFade: { status: ['PASS', 'FLAG', 'HARD_SKIP'].includes(result.deFadeVerification?.action) ? 'ok' : 'skipped', reason: result.deFadeVerification?.reason || 'optional' },
       grok: { status: result.soulVerdict?.available ? 'ok' : (config.GROK_REQUIRED_FOR_BUY ? 'failed' : 'skipped'), reason: result.soulVerdict?.reasoning || (config.GROK_REQUIRED_FOR_BUY ? 'required_missing' : 'not_required') },
